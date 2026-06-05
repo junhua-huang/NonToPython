@@ -1,0 +1,375 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "NanTuPy WebSocket API",
+    "description": "NanTuPy 即时通讯 WebSocket 协议文档。涵盖聊天消息、通知推送、在线状态等实时通信场景。",
+    "version": "1.0.0",
+    "contact": {
+      "name": "NanTuPy Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "ws://localhost:5000",
+      "description": "本地开发环境"
+    }
+  ],
+  "paths": {
+    "/ws": {
+      "x-websocket": true,
+      "summary": "WebSocket 主端点",
+      "description": "客户端与服务端之间唯一的 WebSocket 端点，负责聊天消息收发、通知推送、在线状态维护等所有实时通信。",
+      "parameters": [
+        {
+          "name": "token",
+          "in": "query",
+          "required": true,
+          "description": "JWT 认证令牌（HS256 签名）。连接时作为查询参数传递，服务端验证通过后建立长连接。",
+          "schema": {
+            "type": "string"
+          },
+          "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        }
+      ],
+      "x-connection": {
+        "auth": {
+          "type": "jwt_query_param",
+          "algorithm": "HS256",
+          "param": "token",
+          "description": "JWT payload 中需包含 sub 字段（user_id）。验证失败时服务端以 code 4001 关闭连接。"
+        },
+        "heartbeat": {
+          "type": "ping_pong",
+          "direction": "bidirectional",
+          "client_send": { "type": "ping" },
+          "server_respond": { "type": "pong" },
+          "recommended_interval_seconds": 30
+        },
+        "close_codes": {
+          "4001": "Invalid or expired token — JWT 无效、过期或用户不存在",
+          "1000": "duplicate_connection — 同一用户的新连接替换旧连接时，旧连接被关闭"
+        }
+      },
+      "x-upstream": {
+        "description": "客户端 → 服务端：上行消息类型",
+        "messages": {
+          "ping": {
+            "summary": "心跳 Ping",
+            "description": "客户端定期发送以保持连接活跃。服务端立即回复 pong。",
+            "payload": { "type": "ping" },
+            "example": "{\"type\": \"ping\"}"
+          },
+          "join": {
+            "summary": "加入会话房间",
+            "description": "客户端订阅指定会话的实时消息推送。加入后，该会话的新消息、输入状态等事件将推送给此客户端。",
+            "payload": {
+              "type": "join",
+              "conversation_id": 0
+            },
+            "example": "{\"type\": \"join\", \"conversation_id\": 42}"
+          },
+          "leave": {
+            "summary": "离开会话房间",
+            "description": "客户端取消订阅指定会话的推送。",
+            "payload": {
+              "type": "leave",
+              "conversation_id": 0
+            },
+            "example": "{\"type\": \"leave\", \"conversation_id\": 42}"
+          },
+          "typing": {
+            "summary": "输入中状态",
+            "description": "通知会话内其他用户'正在输入'。服务端广播给房间内除发送者外的所有人。",
+            "payload": {
+              "type": "typing",
+              "conversation_id": 0
+            },
+            "example": "{\"type\": \"typing\", \"conversation_id\": 42}"
+          },
+          "stop_typing": {
+            "summary": "停止输入状态",
+            "description": "通知会话内其他用户输入已停止。",
+            "payload": {
+              "type": "stop_typing",
+              "conversation_id": 0
+            },
+            "example": "{\"type\": \"stop_typing\", \"conversation_id\": 42}"
+          },
+          "send_message": {
+            "summary": "发送聊天消息",
+            "description": "通过 WebSocket 发送聊天消息。服务端验证参与者身份后写入数据库，并广播 new_message 事件给会话所有成员（包括发送者自身，用于多端同步）。",
+            "payload": {
+              "type": "send_message",
+              "conversation_id": 0,
+              "content": ""
+            },
+            "example": "{\"type\": \"send_message\", \"conversation_id\": 42, \"content\": \"你好，明天几点见面？\"}",
+            "validation": {
+              "rules": [
+                "conversation_id 必须存在且发送者属于该会话的参与者",
+                "content 不能为空或纯空白",
+                "消息类型固定为 text"
+              ]
+            }
+          },
+          "conversation_read": {
+            "summary": "标记会话已读（预留）",
+            "description": "当前版本在 WebSocket 层不做处理（pass），已读标记通过 HTTP PUT /api/chat/conversations/{id}/read 完成，完成后通过 WebSocket 推送 conversation_read 事件。",
+            "payload": {
+              "type": "conversation_read"
+            },
+            "example": "{\"type\": \"conversation_read\"}"
+          },
+          "notifications_read": {
+            "summary": "标记通知已读（预留）",
+            "description": "当前版本在 WebSocket 层不做处理（pass）。",
+            "payload": {
+              "type": "notifications_read"
+            },
+            "example": "{\"type\": \"notifications_read\"}"
+          }
+        }
+      },
+      "x-downstream": {
+        "description": "服务端 → 客户端：下行推送事件",
+        "events": {
+          "connected": {
+            "summary": "连接成功确认",
+            "description": "WebSocket 握手成功后服务端发送的第一条消息，确认用户身份。",
+            "source": "ws.py — websocket_endpoint()",
+            "payload": {
+              "type": "connected",
+              "user_id": 0
+            },
+            "example": "{\"type\": \"connected\", \"user_id\": 7}"
+          },
+          "pong": {
+            "summary": "心跳 Pong",
+            "description": "响应客户端 ping 的心跳回复。",
+            "source": "ws.py — ping handler",
+            "payload": { "type": "pong" },
+            "example": "{\"type\": \"pong\"}"
+          },
+          "typing": {
+            "summary": "输入中广播",
+            "description": "广播给会话房间内除发送者外的所有在线用户。",
+            "source": "ws.py — typing handler → ws_manager.broadcast_to_conversation()",
+            "payload": {
+              "type": "typing",
+              "conversation_id": 0,
+              "sender_id": 0
+            },
+            "example": "{\"type\": \"typing\", \"conversation_id\": 42, \"sender_id\": 7}"
+          },
+          "stop_typing": {
+            "summary": "停止输入广播",
+            "description": "广播给会话房间内除发送者外的所有在线用户。",
+            "source": "ws.py — stop_typing handler → ws_manager.broadcast_to_conversation()",
+            "payload": {
+              "type": "stop_typing",
+              "conversation_id": 0,
+              "sender_id": 0
+            },
+            "example": "{\"type\": \"stop_typing\", \"conversation_id\": 42, \"sender_id\": 7}"
+          },
+          "new_message_ws": {
+            "summary": "新消息推送（WebSocket 通道）",
+            "description": "通过 WebSocket send_message 发送的消息，服务端写入数据库后广播。消息字段平铺在事件根级。广播给会话内所有人（含发送者自身）。",
+            "source": "ws.py — _handle_send_message() → ws_manager.broadcast_to_conversation() + ws_manager.send()",
+            "payload": {
+              "type": "new_message",
+              "id": 0,
+              "conversation_id": 0,
+              "sender_id": 0,
+              "content": "",
+              "message_type": "text",
+              "created_at": ""
+            },
+            "example": "{\"type\":\"new_message\",\"id\":128,\"conversation_id\":42,\"sender_id\":7,\"content\":\"你好，明天几点见面？\",\"message_type\":\"text\",\"created_at\":\"2026-06-04T10:30:00\"}"
+          },
+          "new_message_http": {
+            "summary": "新消息推送（HTTP 通道）",
+            "description": "通过 HTTP POST /api/chat/conversations/{id}/messages 发送的消息，服务端入库后分别推送给接收方和发送方。消息体嵌套在 message 字段中，额外包含未读计数。",
+            "source": "chat.py — send_message() → ws_manager.send()",
+            "payload": {
+              "type": "new_message",
+              "conversation_id": 0,
+              "message": {
+                "id": 0,
+                "conversation_id": 0,
+                "sender_id": 0,
+                "content": "",
+                "message_type": "",
+                "media_url": null,
+                "related_id": null,
+                "is_read": false,
+                "created_at": ""
+              },
+              "unread_count": 0
+            },
+            "example": "{\"type\":\"new_message\",\"conversation_id\":42,\"message\":{\"id\":128,\"conversation_id\":42,\"sender_id\":7,\"content\":\"你好\",\"message_type\":\"text\",\"media_url\":null,\"related_id\":null,\"is_read\":false,\"created_at\":\"2026-06-04T10:30:00\"},\"unread_count\":3}"
+          },
+          "conversation_read": {
+            "summary": "会话已读确认",
+            "description": "用户通过 HTTP PUT 标记会话已读后，服务端计算全局未读总数并推送。",
+            "source": "chat.py — mark_conversation_as_read() → ws_manager.send()",
+            "payload": {
+              "type": "conversation_read",
+              "conversation_id": 0,
+              "unread_count": 0
+            },
+            "example": "{\"type\":\"conversation_read\",\"conversation_id\":42,\"unread_count\":0}"
+          },
+          "new_notification": {
+            "summary": "新通知推送",
+            "description": "系统产生新通知时推送给目标用户。通知类型包括：like / comment / friend_request / friend_accepted / message / mention。",
+            "source": "notification_service.py — _push_new_notification() → ws_manager.send()",
+            "payload": {
+              "type": "new_notification",
+              "notification": {
+                "id": 0,
+                "user_id": 0,
+                "sender_id": 0,
+                "notification_type": "",
+                "title": "",
+                "content": "",
+                "related_id": 0,
+                "related_type": "",
+                "is_read": false,
+                "created_at": ""
+              },
+              "unread_count": 0
+            },
+            "example": "{\"type\":\"new_notification\",\"notification\":{\"id\":56,\"user_id\":7,\"sender_id\":12,\"notification_type\":\"like\",\"title\":\"Alice 赞了你的帖子\",\"content\":\"Alice 赞了你的帖子\",\"related_id\":99,\"related_type\":\"post\",\"is_read\":false,\"created_at\":\"2026-06-04T10:30:00\"},\"unread_count\":5}"
+          }
+        }
+      },
+      "x-flows": {
+        "description": "完整交互流程示例",
+        "connect_and_chat": {
+          "title": "连接、加入房间并收发消息",
+          "steps": [
+            { "step": 1, "direction": "C→S", "message": "{\"type\":\"ping\"}", "note": "可选：心跳保持连接" },
+            { "step": 2, "direction": "S→C", "message": "{\"type\":\"pong\"}" },
+            { "step": 3, "direction": "C→S", "message": "{\"type\":\"join\",\"conversation_id\":42}", "note": "订阅会话 42" },
+            { "step": 4, "direction": "C→S", "message": "{\"type\":\"typing\",\"conversation_id\":42}", "note": "输入中..." },
+            { "step": 5, "direction": "S→C(others)", "message": "{\"type\":\"typing\",\"conversation_id\":42,\"sender_id\":7}", "note": "广播给房间其他人" },
+            { "step": 6, "direction": "C→S", "message": "{\"type\":\"stop_typing\",\"conversation_id\":42}" },
+            { "step": 7, "direction": "S→C(others)", "message": "{\"type\":\"stop_typing\",\"conversation_id\":42,\"sender_id\":7}" },
+            { "step": 8, "direction": "C→S", "message": "{\"type\":\"send_message\",\"conversation_id\":42,\"content\":\"你好！\"}", "note": "发送消息" },
+            { "step": 9, "direction": "S→C(all)", "message": "{\"type\":\"new_message\",\"id\":128,\"conversation_id\":42,\"sender_id\":7,\"content\":\"你好！\",\"message_type\":\"text\",\"created_at\":\"...\"}", "note": "广播给所有人（含发送者）" },
+            { "step": 10, "direction": "C→S", "message": "{\"type\":\"leave\",\"conversation_id\":42}", "note": "取消订阅" }
+          ]
+        },
+        "notification_push": {
+          "title": "通知推送流程",
+          "steps": [
+            { "step": 1, "direction": "S→C", "message": "{\"type\":\"new_notification\",\"notification\":{\"id\":56,\"user_id\":7,\"sender_id\":12,\"notification_type\":\"like\",\"title\":\"Alice 赞了你的帖子\",...},\"unread_count\":5}", "note": "他人点赞帖子时服务端主动推送" }
+          ]
+        },
+        "http_message_with_ws_push": {
+          "title": "HTTP 发消息 + WebSocket 推送",
+          "steps": [
+            { "step": 1, "direction": "C→S(HTTP)", "message": "POST /api/chat/conversations/42/messages\n{\"content\":\"你好\",\"message_type\":\"text\"}", "note": "HTTP 方式发送消息" },
+            { "step": 2, "direction": "S→C(receiver via WS)", "message": "{\"type\":\"new_message\",\"conversation_id\":42,\"message\":{...},\"unread_count\":3}", "note": "推送给接收方" },
+            { "step": 3, "direction": "S→C(sender via WS)", "message": "{\"type\":\"new_message\",\"conversation_id\":42,\"message\":{...},\"unread_count\":0}", "note": "推送给发送方" }
+          ]
+        },
+        "mark_read": {
+          "title": "标记已读流程",
+          "steps": [
+            { "step": 1, "direction": "C→S(HTTP)", "message": "PUT /api/chat/conversations/42/read", "note": "HTTP 方式标记已读" },
+            { "step": 2, "direction": "S→C(via WS)", "message": "{\"type\":\"conversation_read\",\"conversation_id\":42,\"unread_count\":0}", "note": "推送全局未读数" }
+          ]
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "UpstreamEnvelope": {
+        "type": "object",
+        "description": "所有上行消息的通用外层结构",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["ping", "join", "leave", "typing", "stop_typing", "send_message", "conversation_read", "notifications_read"],
+            "description": "上行消息类型标识"
+          }
+        }
+      },
+      "DownstreamEnvelope": {
+        "type": "object",
+        "description": "所有下行事件的通用外层结构",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["connected", "pong", "typing", "stop_typing", "new_message", "conversation_read", "new_notification"],
+            "description": "下行事件类型标识"
+          }
+        }
+      },
+      "NotificationObject": {
+        "type": "object",
+        "description": "通知对象结构",
+        "properties": {
+          "id": { "type": "integer", "description": "通知 ID" },
+          "user_id": { "type": "integer", "description": "接收通知的用户 ID" },
+          "sender_id": { "type": "integer", "description": "触发通知的用户 ID" },
+          "notification_type": {
+            "type": "string",
+            "enum": ["like", "comment", "friend_request", "friend_accepted", "message", "mention"],
+            "description": "通知类型"
+          },
+          "title": { "type": "string", "description": "通知标题" },
+          "content": { "type": "string", "description": "通知内容" },
+          "related_id": { "type": "integer", "description": "关联实体 ID" },
+          "related_type": {
+            "type": "string",
+            "enum": ["post", "friendship", "conversation"],
+            "description": "关联实体类型"
+          },
+          "is_read": { "type": "boolean", "description": "是否已读" },
+          "created_at": { "type": "string", "format": "date-time", "description": "创建时间" }
+        }
+      },
+      "MessageObject": {
+        "type": "object",
+        "description": "聊天消息对象结构",
+        "properties": {
+          "id": { "type": "integer", "description": "消息 ID" },
+          "conversation_id": { "type": "integer", "description": "所属会话 ID" },
+          "sender_id": { "type": "integer", "description": "发送者 ID" },
+          "content": { "type": "string", "description": "消息内容" },
+          "message_type": { "type": "string", "description": "消息类型（text / image / file 等）" },
+          "media_url": { "type": "string", "nullable": true, "description": "媒体文件 URL" },
+          "related_id": { "type": "integer", "nullable": true, "description": "关联消息 ID（回复/引用）" },
+          "is_read": { "type": "boolean", "description": "是否已读" },
+          "created_at": { "type": "string", "format": "date-time", "description": "发送时间" }
+        }
+      }
+    }
+  },
+  "x-summary": {
+    "endpoint": "ws://host:5000/ws?token=<jwt_token>",
+    "auth": "JWT (HS256) → Query Param token",
+    "heartbeat": "Client ping / Server pong (建议 30s 间隔)",
+    "close_codes": {
+      "4001": "JWT 无效或过期",
+      "1000": "同用户新连接替换旧连接"
+    },
+    "statistics": {
+      "upstream_types": 8,
+      "downstream_types": 7,
+      "notification_types": 6,
+      "source_files": [
+        "app/routers/ws.py",
+        "app/ws_manager.py",
+        "app/services/notification_service.py",
+        "app/routers/chat.py"
+      ]
+    }
+  }
+}

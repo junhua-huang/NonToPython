@@ -1,0 +1,3336 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Facebook Clone API",
+    "description": "基于 Flask 的 Facebook 克隆版后端服务 API 文档 - v2.6.0\n\n## 主要功能\n- 用户认证与资料管理\n- 帖子管理（支持可见性控制、图片自动优化）\n- 好友系统与社交互动\n- 实时聊天（6种消息类型：文本/图片/视频/文件/帖子卡片/评论卡片）\n- 推荐算法系统（个性化动态v2、热门帖子v2、智能好友推荐v3）\n- 通知系统与@提及功能\n- 全站搜索与话题系统（含搜索历史、@提及建议）\n- 无限滚动加载支持\n- WebSocket实时通信（包含通知标记已读）\n- 屏蔽与举报系统\n- 敏感词管理\n\n## v2.6.0 最新状态 (2026-06-01)\n- ✅ 新增认证模块7个端点（修改密码、删除账户、密码重置、隐私设置、Token刷新）\n- ✅ 新增帖子模块3个端点（点赞过的帖子、浏览记录、帖子统计）\n- ✅ 新增互动模块4个端点（评论点赞/取消点赞、回复列表）\n- ✅ 新增好友模块2个端点（好友计数、好友推荐）\n- ✅ 上传模块迁移至腾讯云COS预签名URL模式\n- ✅ 通知设置字段更新（notify_push/notify_message/notify_sound）\n- ✅ 新增屏蔽模块、举报模块、管理模块、数据库健康检查\n\n## API统计\n- 总计: 100+ API接口\n- 认证模块: 12个\n- 帖子模块: 9个\n- 互动模块: 12个\n- 好友模块: 10个\n- 聊天模块: 7个HTTP + WebSocket\n- 通知模块: 8个\n- 搜索模块: 10个（含搜索历史和@提及建议）\n- 话题模块: 12个\n- 上传模块: 7个（COS预签名URL模式）\n- 推荐模块: 5个\n- 屏蔽模块: 3个\n- 举报模块: 3个\n- 管理模块: 3个\n- 健康检查: 2个",
+    "version": "2.6.0",
+    "contact": {
+      "name": "API Support",
+      "email": "support@example.com"
+    },
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000",
+      "description": "本地开发服务器"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "健康检查",
+        "description": "检查 API 服务是否正常运行",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "服务正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "healthy"
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Facebook Clone API is running"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/register": {
+      "post": {
+        "summary": "用户注册",
+        "description": "创建新用户账号",
+        "tags": ["Authentication"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "email", "password"],
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "example": "john_doe",
+                    "description": "用户名（唯一）"
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "example": "john@example.com",
+                    "description": "邮箱（唯一）"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password",
+                    "example": "securepassword123",
+                    "description": "密码"
+                  },
+                  "first_name": {
+                    "type": "string",
+                    "example": "John",
+                    "description": "名字"
+                  },
+                  "last_name": {
+                    "type": "string",
+                    "example": "Doe",
+                    "description": "姓氏"
+                  },
+                  "bio": {
+                    "type": "string",
+                    "example": "Hello World!",
+                    "description": "个人简介"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "注册成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "缺少必填字段",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "用户名或邮箱已存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "summary": "用户登录",
+        "description": "使用邮箱和密码登录，获取 JWT Token",
+        "tags": ["Authentication"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "example": "john@example.com"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password",
+                    "example": "securepassword123"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Login successful"
+                    },
+                    "access_token": {
+                      "type": "string",
+                      "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    },
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "邮箱或密码错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/profile": {
+      "get": {
+        "summary": "获取当前用户资料",
+        "description": "获取当前登录用户的详细信息",
+        "tags": ["User Profile"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "未授权",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "更新用户资料",
+        "description": "更新当前登录用户的个人信息",
+        "tags": ["User Profile"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "first_name": {
+                    "type": "string",
+                    "example": "John"
+                  },
+                  "last_name": {
+                    "type": "string",
+                    "example": "Doe"
+                  },
+                  "bio": {
+                    "type": "string",
+                    "example": "Updated bio"
+                  },
+                  "avatar_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "example": "https://example.com/avatar.jpg"
+                  },
+                  "cover_photo_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "example": "https://example.com/cover.jpg"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/users/{user_id}": {
+      "get": {
+        "summary": "获取指定用户资料",
+        "description": "根据用户ID获取用户的公开信息",
+        "tags": ["User Profile"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "用户ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "用户不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/posts/": {
+      "post": {
+        "summary": "创建帖子",
+        "description": "创建新的帖子（支持文本、图片、视频）",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "example": "Hello, this is my first post!",
+                    "description": "帖子内容"
+                  },
+                  "image_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "example": "https://example.com/image.jpg",
+                    "description": "图片URL（可选）"
+                  },
+                  "video_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "example": "https://example.com/video.mp4",
+                    "description": "视频URL（可选）"
+                  },
+                  "post_type": {
+                    "type": "string",
+                    "enum": ["text", "image", "video"],
+                    "example": "text",
+                    "description": "帖子类型"
+                  },
+                  "is_public": {
+                    "type": "boolean",
+                    "example": true,
+                    "description": "是否公开（已废弃，使用visibility）"
+                  },
+                  "visibility": {
+                    "type": "string",
+                    "enum": ["public", "friends", "private", "custom"],
+                    "example": "public",
+                    "description": "可见性类型：public(公开)/friends(好友)/private(私密)/custom(自定义)"
+                  },
+                  "visible_user_ids": {
+                    "type": "string",
+                    "example": "1,2,3",
+                    "description": "自定义可见用户ID列表（仅visibility=custom时需要，逗号分隔）"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Post created successfully"
+                    },
+                    "post": {
+                      "$ref": "#/components/schemas/Post"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "获取动态消息",
+        "description": "获取好友和自己的帖子列表（分页）",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "页码"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            },
+            "description": "每页数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "posts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      }
+                    },
+                    "total": {
+                      "type": "integer",
+                      "example": 100
+                    },
+                    "pages": {
+                      "type": "integer",
+                      "example": 5
+                    },
+                    "current_page": {
+                      "type": "integer",
+                      "example": 1
+                    },
+                    "per_page": {
+                      "type": "integer",
+                      "example": 20
+                    },
+                    "has_more": {
+                      "type": "boolean",
+                      "example": true,
+                      "description": "是否还有更多数据（用于无限滚动）"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/posts/user/{user_id}": {
+      "get": {
+        "summary": "获取用户帖子",
+        "description": "获取指定用户的帖子列表（分页）",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "用户ID"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "posts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      }
+                    },
+                    "total": {"type": "integer"},
+                    "pages": {"type": "integer"},
+                    "current_page": {"type": "integer"},
+                    "per_page": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/posts/{post_id}": {
+      "get": {
+        "summary": "获取单个帖子",
+        "description": "根据ID获取帖子详情",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "post": {
+                      "$ref": "#/components/schemas/Post"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "帖子不存在"
+          }
+        }
+      },
+      "put": {
+        "summary": "更新帖子",
+        "description": "更新自己的帖子内容",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "example": "Updated content"
+                  },
+                  "image_url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "video_url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "is_public": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功"
+          },
+          "403": {
+            "description": "无权限"
+          }
+        }
+      },
+      "delete": {
+        "summary": "删除帖子",
+        "description": "删除自己的帖子",
+        "tags": ["Posts"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "403": {
+            "description": "无权限"
+          }
+        }
+      }
+    },
+    "/api/friends/request": {
+      "post": {
+        "summary": "发送好友请求",
+        "description": "向指定用户发送好友请求",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["receiver_id"],
+                "properties": {
+                  "receiver_id": {
+                    "type": "integer",
+                    "example": 2,
+                    "description": "接收者用户ID"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "请求发送成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Friend request sent successfully"
+                    },
+                    "friendship": {
+                      "$ref": "#/components/schemas/Friendship"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "请求已存在或已是好友"
+          }
+        }
+      }
+    },
+    "/api/friends/request/{request_id}/accept": {
+      "post": {
+        "summary": "接受好友请求",
+        "description": "接受收到的好友请求",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "好友请求ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "接受成功"
+          },
+          "403": {
+            "description": "无权限"
+          }
+        }
+      }
+    },
+    "/api/friends/request/{request_id}/reject": {
+      "post": {
+        "summary": "拒绝好友请求",
+        "description": "拒绝收到的好友请求",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "拒绝成功"
+          }
+        }
+      }
+    },
+    "/api/friends/request/{request_id}": {
+      "delete": {
+        "summary": "取消好友请求",
+        "description": "取消已发送的好友请求",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "取消成功"
+          }
+        }
+      }
+    },
+    "/api/friends/": {
+      "get": {
+        "summary": "获取好友列表",
+        "description": "获取当前用户的所有好友",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "friends": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/User"
+                      }
+                    },
+                    "total": {
+                      "type": "integer",
+                      "example": 10
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/friends/requests/pending": {
+      "get": {
+        "summary": "获取待处理请求",
+        "description": "获取收到和发送的待处理好友请求",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "received": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Friendship"
+                      },
+                      "description": "收到的请求"
+                    },
+                    "sent": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Friendship"
+                      },
+                      "description": "发送的请求"
+                    },
+                    "received_count": {
+                      "type": "integer"
+                    },
+                    "sent_count": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/friends/{user_id}": {
+      "delete": {
+        "summary": "删除好友",
+        "description": "移除好友关系",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "好友用户ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          }
+        }
+      }
+    },
+    "/api/friends/status/{user_id}": {
+      "get": {
+        "summary": "检查好友关系状态",
+        "description": "检查与指定用户的好友关系状态",
+        "tags": ["Friends"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["none", "pending", "accepted", "rejected"],
+                      "example": "accepted"
+                    },
+                    "friendship": {
+                      "$ref": "#/components/schemas/Friendship"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/posts/{post_id}/like": {
+      "post": {
+        "summary": "点赞帖子",
+        "description": "对指定帖子点赞",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "点赞成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Post liked successfully"
+                    },
+                    "like_count": {
+                      "type": "integer",
+                      "example": 5
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "已经点赞过"
+          }
+        }
+      },
+      "delete": {
+        "summary": "取消点赞",
+        "description": "取消对帖子的点赞",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "取消成功"
+          }
+        }
+      }
+    },
+    "/api/posts/{post_id}/likes": {
+      "get": {
+        "summary": "获取点赞列表",
+        "description": "获取帖子的所有点赞",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "likes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Like"
+                      }
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/posts/{post_id}/comments": {
+      "post": {
+        "summary": "创建评论",
+        "description": "对帖子创建评论或回复",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "example": "Great post!",
+                    "description": "评论内容"
+                  },
+                  "parent_id": {
+                    "type": "integer",
+                    "example": null,
+                    "description": "父评论ID（回复时使用）"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Comment created successfully"
+                    },
+                    "comment": {
+                      "$ref": "#/components/schemas/Comment"
+                    },
+                    "comment_count": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "获取评论列表",
+        "description": "获取帖子的评论列表（分页）",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "comments": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Comment"
+                      }
+                    },
+                    "total": {"type": "integer"},
+                    "pages": {"type": "integer"},
+                    "current_page": {"type": "integer"},
+                    "per_page": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/comments/{comment_id}": {
+      "get": {
+        "summary": "获取评论回复",
+        "description": "获取指定评论的回复列表",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replies": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Comment"
+                      }
+                    },
+                    "total": {"type": "integer"},
+                    "pages": {"type": "integer"},
+                    "current_page": {"type": "integer"},
+                    "per_page": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "更新评论",
+        "description": "更新自己的评论内容",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "example": "Updated comment"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功"
+          },
+          "403": {
+            "description": "无权限"
+          }
+        }
+      },
+      "delete": {
+        "summary": "删除评论",
+        "description": "删除评论（作者或帖子所有者）",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "403": {
+            "description": "无权限"
+          }
+        }
+      }
+    },
+    "/api/chat/conversations": {
+      "get": {
+        "summary": "获取会话列表",
+        "description": "获取当前用户的所有聊天会话",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "conversations": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "conversation": {
+                            "$ref": "#/components/schemas/Conversation"
+                          },
+                          "other_user": {
+                            "$ref": "#/components/schemas/User"
+                          },
+                          "last_message": {
+                            "$ref": "#/components/schemas/Message"
+                          },
+                          "unread_count": {
+                            "type": "integer",
+                            "example": 3
+                          },
+                          "is_online": {
+                            "type": "boolean",
+                            "example": true
+                          }
+                        }
+                      }
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/conversations/{user_id}": {
+      "get": {
+        "summary": "获取与特定用户的会话",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/chat/conversations/{conversation_id}/messages": {
+      "get": {
+        "summary": "获取消息历史（分页）",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 50}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/chat/conversations/{conversation_id}/mark-read": {
+      "post": {
+        "summary": "标记会话为已读",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/chat/users/online": {
+      "get": {
+        "summary": "获取在线用户列表",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/chat/users/{user_id}/status": {
+      "get": {
+        "summary": "获取用户在线状态",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/chat/unread-count": {
+      "get": {
+        "summary": "获取未读消息总数",
+        "tags": ["Chat"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/recommendations/feed": {
+      "get": {
+        "summary": "获取个性化推荐动态",
+        "description": "基于多维度算法的个性化帖子推荐（好友关系、互动频率、话题匹配、时间衰减）",
+        "tags": ["Recommendations"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "页码"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            },
+            "description": "每页数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "posts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      }
+                    },
+                    "total": {"type": "integer"},
+                    "pages": {"type": "integer"},
+                    "current_page": {"type": "integer"},
+                    "per_page": {"type": "integer"},
+                    "algorithm": {
+                      "type": "string",
+                      "example": "personalized_v2",
+                      "description": "使用的推荐算法版本（v2: 包含互动频率、话题匹配、时间衰减）"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/recommendations/trending": {
+      "get": {
+        "summary": "获取热门帖子",
+        "description": "基于时间窗口和互动量的热门帖子排行",
+        "tags": ["Recommendations"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            },
+            "description": "返回数量"
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 24
+            },
+            "description": "时间窗口（小时）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "posts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      }
+                    },
+                    "time_window": {
+                      "type": "string",
+                      "example": "last 24 hours"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/recommendations/users/suggest": {
+      "get": {
+        "summary": "推荐可能认识的人（基础版）",
+        "description": "基于二度人脉、共同兴趣的推荐用户",
+        "tags": ["Recommendations"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            },
+            "description": "返回数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "suggestions": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {"$ref": "#/components/schemas/User"},
+                          {
+                            "type": "object",
+                            "properties": {
+                              "mutual_friends_count": {
+                                "type": "integer",
+                                "description": "共同好友数量"
+                              },
+                              "common_topics_count": {
+                                "type": "integer",
+                                "description": "共同话题数量"
+                              },
+                              "recommendation_reason": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "推荐理由列表"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "algorithm": {
+                      "type": "string",
+                      "example": "social_graph_v1"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/recommendations/friends/recommend": {
+      "get": {
+        "summary": "智能推荐好友（增强版）✨ v2.3.0",
+        "description": "基于多维度算法的智能好友推荐，包括二度人脉、共同话题、活跃度匹配等",
+        "tags": ["Recommendations"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            },
+            "description": "返回数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "recommendations": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {"$ref": "#/components/schemas/User"},
+                          {
+                            "type": "object",
+                            "properties": {
+                              "recommendation_score": {
+                                "type": "number",
+                                "description": "推荐分数（综合评分）"
+                              },
+                              "match_percentage": {
+                                "type": "integer",
+                                "description": "匹配度百分比（0-99%）"
+                              },
+                              "mutual_friends_count": {
+                                "type": "integer",
+                                "description": "共同好友数量"
+                              },
+                              "common_topics_count": {
+                                "type": "integer",
+                                "description": "共同话题数量"
+                              },
+                              "recommendation_reasons": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "推荐理由列表"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "total_candidates": {
+                      "type": "integer",
+                      "description": "候选用户总数"
+                    },
+                    "algorithm": {
+                      "type": "string",
+                      "example": "smart_friend_recommendation_v3",
+                      "description": "智能好友推荐算法版本（v3: 增强权重、活跃度分析、探索机制）"
+                    },
+                    "factors": {
+                      "type": "array",
+                      "items": {"type": "string"},
+                      "description": "算法考虑因素及权重"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/recommendations/posts/{post_id}/related": {
+      "get": {
+        "summary": "获取相关帖子推荐",
+        "description": "基于相同话题、作者、内容的相似帖子推荐",
+        "tags": ["Recommendations"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 5
+            },
+            "description": "返回数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "posts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/": {
+      "get": {
+        "summary": "获取通知列表",
+        "description": "获取当前用户的通知列表，支持分页和未读过滤",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1},
+            "description": "页码"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20},
+            "description": "每页数量"
+          },
+          {
+            "name": "unread_only",
+            "in": "query",
+            "schema": {"type": "boolean", "default": false},
+            "description": "是否仅显示未读通知"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "notifications": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/Notification"}
+                    },
+                    "total": {"type": "integer"},
+                    "pages": {"type": "integer"},
+                    "current_page": {"type": "integer"},
+                    "per_page": {"type": "integer"},
+                    "unread_count": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/unread-count": {
+      "get": {
+        "summary": "获取未读通知数量",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "unread_count": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/{notification_id}/read": {
+      "post": {
+        "summary": "标记通知为已读",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "notification_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/notifications/mark-all-read": {
+      "post": {
+        "summary": "标记所有通知为已读",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/notifications/{notification_id}": {
+      "delete": {
+        "summary": "删除通知",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "notification_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/notifications/clear-all": {
+      "delete": {
+        "summary": "清空所有通知",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/notifications/settings": {
+      "get": {
+        "summary": "获取通知设置",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "put": {
+        "summary": "更新通知设置",
+        "tags": ["Notifications"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email_notifications": {"type": "boolean"},
+                  "push_notifications": {"type": "boolean"},
+                  "like_notifications": {"type": "boolean"},
+                  "comment_notifications": {"type": "boolean"},
+                  "friend_request_notifications": {"type": "boolean"},
+                  "message_notifications": {"type": "boolean"},
+                  "mention_notifications": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/users": {
+      "get": {
+        "summary": "搜索用户",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"},
+            "description": "搜索关键词"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/posts": {
+      "get": {
+        "summary": "搜索帖子",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "schema": {"type": "integer"},
+            "description": "可选，限定用户ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/global": {
+      "get": {
+        "summary": "全局综合搜索",
+        "description": "同时搜索用户、帖子、话题等",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 10}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/hashtag/{hashtag}": {
+      "get": {
+        "summary": "按标签搜索帖子",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "hashtag",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/trending-hashtags": {
+      "get": {
+        "summary": "获取热门标签",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "default": 10}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/suggest/users": {
+      "get": {
+        "summary": "用户自动补全建议",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "default": 5}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/history": {
+      "get": {
+        "summary": "获取搜索历史",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "summary": "保存搜索历史",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                  "query": {"type": "string"},
+                  "type": {"type": "string", "enum": ["users", "posts", "global"]}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "成功"
+          }
+        }
+      },
+      "delete": {
+        "summary": "清空搜索历史",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/search/mention-suggestions": {
+      "get": {
+        "summary": "获取@提及用户建议",
+        "description": "用于输入框自动补全，好友优先",
+        "tags": ["Search"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "default": 5}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/": {
+      "get": {
+        "summary": "获取所有话题列表",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {"type": "string"},
+            "description": "搜索关键词"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "summary": "创建新话题",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": {"type": "string"},
+                  "description": {"type": "string"},
+                  "icon_url": {"type": "string"},
+                  "color": {"type": "string", "example": "#3b82f6"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/trending": {
+      "get": {
+        "summary": "获取热门话题",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "default": 10}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/followed": {
+      "get": {
+        "summary": "获取用户关注的话题列表",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/suggest": {
+      "get": {
+        "summary": "话题自动补全建议",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "default": 5}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/{topic_id}": {
+      "get": {
+        "summary": "获取单个话题详情",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "put": {
+        "summary": "更新话题信息（管理员）",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "description": {"type": "string"},
+                  "icon_url": {"type": "string"},
+                  "color": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "delete": {
+        "summary": "删除话题（管理员）",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/name/{topic_name}": {
+      "get": {
+        "summary": "根据名称获取话题",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/{topic_id}/posts": {
+      "get": {
+        "summary": "获取话题下的帖子",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/{topic_id}/follow": {
+      "post": {
+        "summary": "关注话题",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/topics/{topic_id}/unfollow": {
+      "post": {
+        "summary": "取消关注话题",
+        "tags": ["Topics"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/upload/presign": {
+      "post": {
+        "summary": "生成COS预签名上传URL",
+        "description": "生成腾讯云COS预签名URL供客户端直传文件",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file_type": {"type": "string", "enum": ["image", "video", "any"], "example": "image"},
+                  "subfolder": {"type": "string", "example": "posts/47"},
+                  "count": {"type": "integer", "minimum": 1, "maximum": 20, "example": 1}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {"type": "string"},
+                    "url": {"type": "string", "format": "uri"},
+                    "upload_url": {"type": "string", "format": "uri"},
+                    "access_url": {"type": "string", "format": "uri"},
+                    "cos_key": {"type": "string"},
+                    "items": {"type": "array"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/upload/confirm": {
+      "post": {
+        "summary": "确认COS上传完成",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["cos_key", "final_filename"],
+                "properties": {
+                  "cos_key": {"type": "string", "example": "uploads/temp/xxx.jpg"},
+                  "final_filename": {"type": "string", "example": "my_photo.jpg"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "确认成功"}
+        }
+      }
+    },
+    "/api/upload/avatar/confirm": {
+      "post": {
+        "summary": "确认头像上传并更新用户资料",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                  "url": {"type": "string", "format": "uri"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "成功"}
+        }
+      }
+    },
+    "/api/upload/cover/confirm": {
+      "post": {
+        "summary": "确认封面上传并更新用户资料",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                  "url": {"type": "string", "format": "uri"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "成功"}
+        }
+      }
+    },
+    "/api/upload/delete": {
+      "post": {
+        "summary": "删除COS文件",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                  "url": {"type": "string", "format": "uri"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "删除成功"}
+        }
+      }
+    },
+    "/api/upload/info": {
+      "get": {
+        "summary": "获取COS文件信息",
+        "tags": ["Upload"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string", "format": "uri"}
+          }
+        ],
+        "responses": {
+          "200": {"description": "成功"}
+        }
+      }
+    },
+    "/api/upload/uploads/{filename}": {
+      "get": {
+        "summary": "访问文件（302重定向到COS）",
+        "tags": ["Upload"],
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "302": {"description": "重定向到COS"}
+        }
+      }
+    },
+    "/api/comments/{comment_id}": {
+      "get": {
+        "summary": "获取评论的回复列表",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "put": {
+        "summary": "更新评论",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "content": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      },
+      "delete": {
+        "summary": "删除评论",
+        "tags": ["Interactions"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "comment_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/health/db": {
+      "get": {
+        "summary": "数据库健康检查",
+        "description": "检查数据库连接状态和连接池信息",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "数据库状态",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {"type": "string", "example": "connected"},
+                    "connection_pool": {
+                      "type": "object",
+                      "properties": {
+                        "size": {"type": "integer"},
+                        "checked_in_connections": {"type": "integer"},
+                        "overflow": {"type": "integer"},
+                        "total": {"type": "integer"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/blocks": {
+      "post": {
+        "summary": "屏蔽用户",
+        "tags": ["Blocks"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["blocked_id"],
+                "properties": {
+                  "blocked_id": {"type": "integer", "example": 99}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "屏蔽成功"},
+          "409": {"description": "已经屏蔽过"}
+        }
+      },
+      "get": {
+        "summary": "获取屏蔽列表",
+        "tags": ["Blocks"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
+          {"name": "per_page", "in": "query", "schema": {"type": "integer", "default": 20}}
+        ],
+        "responses": {
+          "200": {"description": "成功"}
+        }
+      }
+    },
+    "/api/blocks/{blocked_id}": {
+      "delete": {
+        "summary": "取消屏蔽",
+        "tags": ["Blocks"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {"name": "blocked_id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {"description": "取消成功"}
+        }
+      }
+    },
+    "/api/reports/post": {
+      "post": {
+        "summary": "举报帖子",
+        "tags": ["Reports"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["post_id", "reason"],
+                "properties": {
+                  "post_id": {"type": "integer", "example": 456},
+                  "reason": {"type": "string", "example": "spam"},
+                  "description": {"type": "string", "example": "垃圾广告内容"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "举报成功"}
+        }
+      }
+    },
+    "/api/reports/comment": {
+      "post": {
+        "summary": "举报评论",
+        "tags": ["Reports"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["comment_id", "reason"],
+                "properties": {
+                  "comment_id": {"type": "integer", "example": 789},
+                  "reason": {"type": "string", "example": "harassment"},
+                  "description": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "举报成功"}
+        }
+      }
+    },
+    "/api/reports/user": {
+      "post": {
+        "summary": "举报用户",
+        "tags": ["Reports"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["user_id", "reason"],
+                "properties": {
+                  "user_id": {"type": "integer", "example": 321},
+                  "reason": {"type": "string", "example": "impersonation"},
+                  "description": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "举报成功"}
+        }
+      }
+    },
+    "/api/admin/blocked_words": {
+      "get": {
+        "summary": "获取敏感词列表",
+        "tags": ["Admin"],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": {"type": "integer"},
+                    "words": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "添加敏感词",
+        "tags": ["Admin"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["word"],
+                "properties": {
+                  "word": {"type": "string", "example": "敏感词"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "添加成功"}
+        }
+      },
+      "delete": {
+        "summary": "删除敏感词",
+        "tags": ["Admin"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["word"],
+                "properties": {
+                  "word": {"type": "string", "example": "敏感词"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "删除成功"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "username": {
+            "type": "string",
+            "example": "john_doe"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "example": "john@example.com"
+          },
+          "first_name": {
+            "type": "string",
+            "example": "John"
+          },
+          "last_name": {
+            "type": "string",
+            "example": "Doe"
+          },
+          "full_name": {
+            "type": "string",
+            "example": "John Doe"
+          },
+          "bio": {
+            "type": "string",
+            "example": "Hello World!"
+          },
+          "avatar_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://example.com/avatar.jpg"
+          },
+          "cover_photo_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://example.com/cover.jpg"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-04-21T12:00:00"
+          }
+        }
+      },
+      "UserResponse": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "example": "User registered successfully"
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          }
+        }
+      },
+      "Post": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "content": {
+            "type": "string",
+            "example": "Hello, this is my post!"
+          },
+          "image_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://example.com/image.jpg"
+          },
+          "video_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://example.com/video.mp4"
+          },
+          "post_type": {
+            "type": "string",
+            "enum": ["text", "image", "video"],
+            "example": "text"
+          },
+          "user_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "author": {
+            "$ref": "#/components/schemas/User"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["public", "friends", "private", "custom"],
+            "example": "public",
+            "description": "可见性类型"
+          },
+          "like_count": {
+            "type": "integer",
+            "example": 10
+          },
+          "comment_count": {
+            "type": "integer",
+            "example": 5
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Comment": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "content": {
+            "type": "string",
+            "example": "Great post!"
+          },
+          "user_id": {
+            "type": "integer",
+            "example": 2
+          },
+          "post_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "parent_id": {
+            "type": "integer",
+            "nullable": true,
+            "example": null,
+            "description": "父评论ID（用于将回复分组到同一条评论下）"
+          },
+          "reply_to_user_id": {
+            "type": "integer",
+            "nullable": true,
+            "example": 3,
+            "description": "回复的目标用户ID（v2.5.0新增）✨"
+          },
+          "reply_to_user": {
+            "$ref": "#/components/schemas/User",
+            "nullable": true,
+            "description": "回复的目标用户信息（v2.5.0新增）✨"
+          },
+          "author": {
+            "$ref": "#/components/schemas/User"
+          },
+          "reply_count": {
+            "type": "integer",
+            "example": 2
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Like": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "user_id": {
+            "type": "integer",
+            "example": 2
+          },
+          "post_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Friendship": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "sender_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "receiver_id": {
+            "type": "integer",
+            "example": 2
+          },
+          "sender": {
+            "$ref": "#/components/schemas/User"
+          },
+          "receiver": {
+            "$ref": "#/components/schemas/User"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "accepted", "rejected"],
+            "example": "accepted"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "example": "Error message"
+          }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "user1_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "user2_id": {
+            "type": "integer",
+            "example": 2
+          },
+          "user1": {
+            "$ref": "#/components/schemas/User"
+          },
+          "user2": {
+            "$ref": "#/components/schemas/User"
+          },
+          "last_message_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "conversation_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "sender_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "sender": {
+            "$ref": "#/components/schemas/User"
+          },
+          "content": {
+            "type": "string",
+            "example": "Hello!"
+          },
+          "message_type": {
+            "type": "string",
+            "enum": ["text", "image", "video", "file", "post", "comment"],
+            "example": "text",
+            "description": "消息类型：text(文本)/image(图片)/video(视频)/file(文件)/post(帖子卡片)/comment(评论卡片)"
+          },
+          "media_url": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true,
+            "description": "媒体文件URL（image/video/file类型使用）"
+          },
+          "related_id": {
+            "type": "integer",
+            "nullable": true,
+            "example": 123,
+            "description": "相关对象ID（post/comment类型使用，指向帖子ID或评论ID）"
+          },
+          "post": {
+            "$ref": "#/components/schemas/Post",
+            "description": "帖子信息（仅message_type=post时返回）"
+          },
+          "comment": {
+            "$ref": "#/components/schemas/Comment",
+            "description": "评论信息（仅message_type=comment时返回）"
+          },
+          "is_read": {
+            "type": "boolean",
+            "example": false
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Notification": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 1
+          },
+          "user_id": {
+            "type": "integer",
+            "example": 2,
+            "description": "接收通知的用户ID"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["like", "comment", "friend_request", "friend_accepted", "mention"],
+            "example": "like",
+            "description": "通知类型"
+          },
+          "actor_id": {
+            "type": "integer",
+            "example": 1,
+            "description": "触发通知的用户ID"
+          },
+          "actor": {
+            "$ref": "#/components/schemas/User",
+            "description": "触发通知的用户"
+          },
+          "post_id": {
+            "type": "integer",
+            "nullable": true,
+            "example": 5,
+            "description": "相关帖子ID（如果适用）"
+          },
+          "comment_id": {
+            "type": "integer",
+            "nullable": true,
+            "example": 10,
+            "description": "相关评论ID（如果适用）"
+          },
+          "content": {
+            "type": "string",
+            "example": "John liked your post",
+            "description": "通知内容摘要"
+          },
+          "is_read": {
+            "type": "boolean",
+            "example": false,
+            "description": "是否已读"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "System",
+      "description": "系统相关接口"
+    },
+    {
+      "name": "Authentication",
+      "description": "用户认证相关接口"
+    },
+    {
+      "name": "User Profile",
+      "description": "用户资料管理接口"
+    },
+    {
+      "name": "Posts",
+      "description": "帖子管理接口（支持可见性控制、图片自动优化）"
+    },
+    {
+      "name": "Friends",
+      "description": "好友系统接口"
+    },
+    {
+      "name": "Interactions",
+      "description": "互动功能接口（点赞、评论、@提及）"
+    },
+    {
+      "name": "Chat",
+      "description": "实时聊天系统接口（HTTP API + WebSocket，支持6种消息类型）"
+    },
+    {
+      "name": "Notifications",
+      "description": "通知系统接口"
+    },
+    {
+      "name": "Search",
+      "description": "搜索功能接口"
+    },
+    {
+      "name": "Topics",
+      "description": "话题系统接口"
+    },
+    {
+      "name": "Upload",
+      "description": "文件上传接口（图片自动压缩优化）"
+    },
+    {
+      "name": "Recommendations",
+      "description": "推荐算法系统（个性化动态、热门帖子、推荐用户、相关帖子）"
+    }
+  ]
+}

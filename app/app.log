@@ -1,0 +1,38 @@
+2026-06-02 21:29:22,784 - asyncio - DEBUG - Using selector: SelectSelector
+2026-06-02 21:29:22,902 - app.main - INFO - Starting NanTuPy server...
+2026-06-02 21:29:24,961 - app.main - INFO - Database tables initialized
+2026-06-02 21:29:42,656 - app.main - INFO - Shutting down NanTuPy server...
+2026-06-02 21:31:57,630 - asyncio - DEBUG - Using selector: SelectSelector
+2026-06-02 21:31:57,743 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:31:57,812 - app.main - INFO - Starting NanTuPy server...
+2026-06-02 21:31:58,106 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:31:59,591 - app.main - INFO - Database tables initialized
+2026-06-02 21:32:00,522 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:01,842 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:03,210 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:04,568 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:05,979 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:07,337 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:08,698 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:10,062 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:11,421 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:12,781 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:14,142 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:15,501 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:16,865 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:18,223 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:19,581 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:20,940 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:22,306 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:23,665 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:25,024 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:26,431 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:27,744 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:29,108 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:30,473 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:31,833 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:33,197 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:34,557 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:35,920 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:37,282 - watchfiles.main - DEBUG - 1 change detected: {(<Change.modified: 2>, 'D:\\NanTuPy\\app\\app.log')}
+2026-06-02 21:32:38,361 - app.main - INFO - Shutting down NanTuPy server...

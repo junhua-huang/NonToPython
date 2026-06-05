@@ -1,0 +1,199 @@
+{
+  "websocket_events": {
+    "description": "WebSocket 实时通信事件说明 - v2.5.0",
+    "version": "2.5.0",
+    "last_updated": "2026-04-26",
+    "connection": {
+      "url": "ws://localhost:5000",
+      "authentication": "通过查询参数传递 JWT Token",
+      "example": "ws://localhost:5000?token=YOUR_JWT_TOKEN",
+      "note": "支持匿名连接（不提供token时）"
+    },
+    "client_to_server": {
+      "send_message": {
+        "event": "send_message",
+        "description": "发送消息（支持6种消息类型）",
+        "payload": {
+          "token": "JWT Token",
+          "receiver_id": "接收者用户ID",
+          "content": "消息内容",
+          "message_type": "消息类型 (text/image/video/file/post/comment)",
+          "media_url": "媒体文件URL（可选，用于image/video/file类型）",
+          "related_id": "相关对象ID（可选，用于post/comment类型，指向帖子ID或评论ID）"
+        },
+        "message_types": {
+          "text": "文本消息",
+          "image": "图片消息（需要media_url）",
+          "video": "视频消息（需要media_url）",
+          "file": "文件消息（需要media_url）",
+          "post": "帖子卡片（需要related_id指向帖子ID）",
+          "comment": "评论卡片（需要related_id指向评论ID）"
+        },
+        "example": {
+          "token": "eyJhbGciOiJIUzI1NiIs...",
+          "receiver_id": 2,
+          "content": "Hello!",
+          "message_type": "text"
+        },
+        "examples": {
+          "text_message": {
+            "token": "eyJhbGciOiJIUzI1NiIs...",
+            "receiver_id": 2,
+            "content": "你好！",
+            "message_type": "text"
+          },
+          "post_card": {
+            "token": "eyJhbGciOiJIUzI1NiIs...",
+            "receiver_id": 2,
+            "content": "看看这个帖子",
+            "message_type": "post",
+            "related_id": 123
+          },
+          "comment_card": {
+            "token": "eyJhbGciOiJIUzI1NiIs...",
+            "receiver_id": 2,
+            "content": "这条评论很有趣",
+            "message_type": "comment",
+            "related_id": 456
+          }
+        }
+      },
+      "mark_as_read": {
+        "event": "mark_as_read",
+        "description": "标记消息为已读",
+        "payload": {
+          "token": "JWT Token",
+          "message_id": "消息ID"
+        },
+        "example": {
+          "token": "eyJhbGciOiJIUzI1NiIs...",
+          "message_id": 123
+        }
+      },
+      "typing": {
+        "event": "typing",
+        "description": "正在输入状态",
+        "payload": {
+          "token": "JWT Token",
+          "receiver_id": "接收者用户ID",
+          "is_typing": "是否正在输入 (boolean)"
+        },
+        "example": {
+          "token": "eyJhbGciOiJIUzI1NiIs...",
+          "receiver_id": 2,
+          "is_typing": true
+        }
+      },
+      "mark_notification_read": {
+        "event": "mark_notification_read",
+        "description": "通过WebSocket标记通知为已读",
+        "payload": {
+          "token": "JWT Token",
+          "notification_id": "通知ID"
+        },
+        "example": {
+          "token": "eyJhbGciOiJIUzI1NiIs...",
+          "notification_id": 456
+        }
+      }
+    },
+    "server_to_client": {
+      "connected": {
+        "event": "connected",
+        "description": "连接成功",
+        "payload": {
+          "message": "Connected successfully",
+          "user_id": "当前用户ID"
+        }
+      },
+      "error": {
+        "event": "error",
+        "description": "错误信息",
+        "payload": {
+          "message": "错误描述"
+        }
+      },
+      "receive_message": {
+        "event": "receive_message",
+        "description": "收到新消息（发送给接收者）",
+        "payload": {
+          "id": "消息ID",
+          "conversation_id": "会话ID",
+          "sender_id": "发送者ID",
+          "sender": "发送者用户对象",
+          "content": "消息内容",
+          "message_type": "消息类型 (text/image/video/file/post/comment)",
+          "media_url": "媒体URL（image/video/file类型）",
+          "related_id": "相关对象ID（post/comment类型）",
+          "post": "帖子对象（仅message_type=post时返回）",
+          "comment": "评论对象（仅message_type=comment时返回）",
+          "is_read": "是否已读",
+          "created_at": "创建时间"
+        }
+      },
+      "message_sent": {
+        "event": "message_sent",
+        "description": "消息发送确认（发送给发送者）",
+        "payload": "与 receive_message 相同"
+      },
+      "message_read": {
+        "event": "message_read",
+        "description": "消息已读通知",
+        "payload": {
+          "message_id": "消息ID",
+          "conversation_id": "会话ID"
+        }
+      },
+      "user_status": {
+        "event": "user_status",
+        "description": "用户在线状态变化",
+        "payload": {
+          "user_id": "用户ID",
+          "status": "online 或 offline"
+        }
+      },
+      "user_typing": {
+        "event": "user_typing",
+        "description": "用户正在输入",
+        "payload": {
+          "user_id": "用户ID",
+          "is_typing": "是否正在输入"
+        }
+      }
+    },
+    "javascript_example": {
+      "description": "JavaScript WebSocket 使用示例",
+      "code": "const socket = io('http://localhost:5000', {\n  query: { token: 'YOUR_JWT_TOKEN' }\n});\n\n// 连接成功\nsocket.on('connected', (data) => {\n  console.log('Connected:', data);\n});\n\n// 接收消息\nsocket.on('receive_message', (message) => {\n  console.log('New message:', message.content);\n  console.log('Message type:', message.message_type);\n  \n  // 处理帖子卡片\n  if (message.message_type === 'post' && message.post) {\n    console.log('Post card:', message.post);\n  }\n  \n  // 处理评论卡片\n  if (message.message_type === 'comment' && message.comment) {\n    console.log('Comment card:', message.comment);\n  }\n});\n\n// 发送文本消息\nsocket.emit('send_message', {\n  token: 'YOUR_JWT_TOKEN',\n  receiver_id: 2,\n  content: 'Hello!',\n  message_type: 'text'\n});\n\n// 发送帖子卡片\nsocket.emit('send_message', {\n  token: 'YOUR_JWT_TOKEN',\n  receiver_id: 2,\n  content: '看看这个帖子',\n  message_type: 'post',\n  related_id: 123  // 帖子ID\n});\n\n// 正在输入\nsocket.emit('typing', {\n  token: 'YOUR_JWT_TOKEN',\n  receiver_id: 2,\n  is_typing: true\n});\n\n// 标记已读\nsocket.emit('mark_as_read', {\n  token: 'YOUR_JWT_TOKEN',\n  message_id: 123\n});\n\n// 标记通知已读\nsocket.emit('mark_notification_read', {\n  token: 'YOUR_JWT_TOKEN',\n  notification_id: 456\n});"
+    },
+    "python_example": {
+      "description": "Python WebSocket 使用示例",
+      "code": "import socketio\n\nsio = socketio.Client()\n\n@sio.event\ndef connect():\n    print('Connected')\n\n@sio.on('receive_message')\ndef on_message(message):\n    print(f\"From {message['sender']['username']}: {message['content']}\")\n    print(f\"Message type: {message['message_type']}\")\n    \n    # 处理帖子卡片\n    if message['message_type'] == 'post' and 'post' in message:\n        print(f\"Post card: {message['post']}\")\n\n# 连接时通过URL Query参数传递Token\nbase_url = 'http://localhost:5000'\ntoken = 'YOUR_JWT_TOKEN'\nsio.connect(f'{base_url}?token={token}')\n\n# 发送文本消息\nsio.emit('send_message', {\n    'token': 'YOUR_JWT_TOKEN',\n    'receiver_id': 2,\n    'content': 'Hello!',\n    'message_type': 'text'\n})\n\n# 发送帖子卡片\nsio.emit('send_message', {\n    'token': 'YOUR_JWT_TOKEN',\n    'receiver_id': 2,\n    'content': '看看这个帖子',\n    'message_type': 'post',\n    'related_id': 123\n})\n\nsio.wait()"
+    },
+    "event_summary": {
+      "description": "WebSocket事件总结",
+      "client_to_server_events": [
+        "send_message - 发送消息（支持6种类型）",
+        "mark_as_read - 标记消息已读",
+        "typing - 正在输入状态",
+        "mark_notification_read - 标记通知已读"
+      ],
+      "server_to_client_events": [
+        "connected - 连接成功",
+        "error - 错误信息",
+        "receive_message - 接收新消息",
+        "message_sent - 消息发送确认",
+        "message_read - 消息已读通知",
+        "user_status - 用户在线状态变化",
+        "user_typing - 对方正在输入"
+      ],
+      "supported_message_types": [
+        "text - 文本消息",
+        "image - 图片消息",
+        "video - 视频消息",
+        "file - 文件消息",
+        "post - 帖子卡片",
+        "comment - 评论卡片"
+      ]
+    }
+  }
+}
