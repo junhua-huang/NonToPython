@@ -15,18 +15,16 @@ router = APIRouter()
 
 
 def _enrich_comment_dict(comment: Comment, db: Session, current_user_id: int) -> dict:
-    """给评论 dict 附加 is_liked（reply_count/like_count 优先读取模型冗余字段）"""
+    """给评论 dict 附加 is_liked（reply_count/like_count/reply_to_user 优先读取模型字段）"""
     d = comment.to_dict(current_user_id=current_user_id)
     d['is_liked'] = db.query(Like).filter(
         Like.user_id == current_user_id, Like.comment_id == comment.id
     ).first() is not None
-    if comment.reply_to_user:
-        d['reply_to_user'] = comment.reply_to_user.to_dict()
     return d
 
 
 def _batch_enrich_comments(db: Session, comments: list, current_user_id: int) -> list:
-    """批量 enrichment：1 次 IN 查询 is_liked，reply_count/like_count 直接读模型冗余字段"""
+    """批量 enrichment：1 次 IN 查询 is_liked，reply_count/like_count/reply_to_user 直接读模型字段"""
     if not comments:
         return []
 
@@ -46,8 +44,6 @@ def _batch_enrich_comments(db: Session, comments: list, current_user_id: int) ->
     for c in comments:
         d = c.to_dict(current_user_id=current_user_id)
         d['is_liked'] = c.id in liked_set
-        if c.reply_to_user:
-            d['reply_to_user'] = c.reply_to_user.to_dict()
         result.append(d)
     return result
 
@@ -255,40 +251,92 @@ def get_comments(
 ):
     """获取帖子的评论列表
 
-    当传入 parent_id 时，查询该父评论的子回复；否则查询顶级评论。
+    不传 parent_id：返回顶级评论（分页），每条内嵌第一页回复（默认10条/页）。
+    传入 parent_id：返回该父评论的子回复（分页）。
     """
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
     if parent_id is not None:
-        # 查询指定 parent 的子回复
+        # ========== 获取指定父评论的回复（分页） ==========
         parent_comment = db.query(Comment).filter(Comment.id == parent_id).first()
         if not parent_comment:
             raise HTTPException(status_code=404, detail="Parent comment not found")
-        comments_query = (
+
+        replies_query = (
             db.query(Comment)
             .filter(Comment.parent_id == parent_id)
             .order_by(Comment.created_at.asc())
         )
-    else:
-        # 查询顶级评论
-        comments_query = (
-            db.query(Comment)
-            .filter(Comment.post_id == post_id, Comment.parent_id == None)
-            .order_by(Comment.created_at.desc())
-        )
+        total = replies_query.count()
+        replies = replies_query.offset((page - 1) * per_page).limit(per_page).all()
+        has_more = (page * per_page) < total
 
+        return {
+            "comments": _batch_enrich_comments(db, replies, user.id),
+            "has_more": has_more,
+        }
+
+    # ========== 获取顶级评论（分页），每条内嵌第一页回复 ==========
+    REPLY_PAGE_SIZE = 10
+
+    comments_query = (
+        db.query(Comment)
+        .filter(Comment.post_id == post_id, Comment.parent_id == None)
+        .order_by(Comment.created_at.desc())
+    )
     total = comments_query.count()
     comments = comments_query.offset((page - 1) * per_page).limit(per_page).all()
-    pages = (total + per_page - 1) // per_page if total > 0 else 0
+
+    # 批量查询所有主评论的回复
+    parent_ids = [c.id for c in comments]
+    replies_by_parent: dict = {}
+    if parent_ids:
+        all_replies = (
+            db.query(Comment)
+            .filter(Comment.parent_id.in_(parent_ids))
+            .order_by(Comment.parent_id, Comment.created_at.asc())
+            .all()
+        )
+        for reply in all_replies:
+            replies_by_parent.setdefault(reply.parent_id, []).append(reply)
+
+    # 收集所有需要 enrichment 的评论对象（主评论 + 回复）
+    all_comment_objects = list(comments)
+    for replies in replies_by_parent.values():
+        all_comment_objects.extend(replies)
+
+    # 批量 enrichment
+    enriched_map = {}
+    for c in all_comment_objects:
+        enriched_map[c.id] = c.to_dict(current_user_id=user.id)
+
+    # 批量设置 is_liked
+    if all_comment_objects:
+        comment_ids = [c.id for c in all_comment_objects]
+        liked_set = set(
+            row[0] for row in db.query(Like.comment_id).filter(
+                Like.comment_id.in_(comment_ids), Like.user_id == user.id
+            ).all()
+        )
+        for cid, d in enriched_map.items():
+            d['is_liked'] = cid in liked_set
+
+    # 组装结果：每条主评论内嵌第一页回复
+    result_comments = []
+    for c in comments:
+        d = enriched_map[c.id]
+        replies = replies_by_parent.get(c.id, [])
+        reply_page = replies[:REPLY_PAGE_SIZE]
+        d['replies'] = [enriched_map[r.id] for r in reply_page]
+        d['replies_has_more'] = len(replies) > REPLY_PAGE_SIZE
+        d['replies_page'] = 1
+        result_comments.append(d)
 
     return {
-        "comments": _batch_enrich_comments(db, comments, user.id),
         "total": total,
-        "pages": pages,
-        "current_page": page,
-        "per_page": per_page,
+        "comments": result_comments,
     }
 
 

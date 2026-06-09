@@ -79,11 +79,21 @@ def presign_upload(
     if count < 1 or count > 20:
         raise HTTPException(status_code=400, detail="count must be between 1 and 20")
 
-    if not Config.COS_BUCKET_NAME:
+    if not Config.COS_BUCKET:
         raise HTTPException(status_code=503, detail="COS service not configured")
 
     results = FileUploader.generate_presigned_urls(subfolder, file_type, count)
     first = results[0] if results else {}
+
+    # 检查是否有错误
+    if "error" in first:
+        logger.error(f"[presign] COS error: {first['error']}")
+        raise HTTPException(status_code=503, detail=f"预签名生成失败: {first['error']}")
+
+    presigned_url = first.get("upload_url", "")
+    if not presigned_url:
+        logger.error(f"[presign] pre-signed URL is empty, results={results}")
+        raise HTTPException(status_code=503, detail="预签名 URL 为空，请检查 COS 配置")
 
     logger.info(f"[presign] generated {len(results)} URL(s) for user_id={user.id}, cos_key={first.get('cos_key', 'N/A')}")
 

@@ -33,8 +33,7 @@ class NotificationService:
                     )
                     .count()
                 )
-                await ws_manager.send(user_id, {
-                    "type": "new_notification",
+                await ws_manager.send_with_seq(user_id, "new_notification", {
                     "notification": notification.to_dict() if hasattr(notification, "to_dict") else {},
                     "unread_count": unread_count,
                 })

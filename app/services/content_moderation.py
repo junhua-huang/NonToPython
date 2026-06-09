@@ -26,7 +26,7 @@ class ContentModeration:
         # 大量 URL 链接（3个以上）
         (re.compile(r'(https?://[^\s]+)', re.IGNORECASE), 3, "spam"),
         # 连续重复字符超过 8 次（如 aaaaaaaa）
-        (re.compile(r'(.)\1{7,}'), 1, "spam"),
+        (re.compile(r'(.)\1{11,}'), 1, "spam"),  # 12+ 连续相同字符（避免中文正常重复表达被误判）
         # 纯符号/表情刷屏（连续5个以上非文字字符组）
         (re.compile(r'[!！?？~～]{5,}'), 1, "spam"),
         # 全大写字母超过80%（至少20字符）

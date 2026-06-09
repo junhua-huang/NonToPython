@@ -5,7 +5,7 @@ FastAPI 版本 - 数据模型定义
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime, Float, ForeignKey,
-    Table, Index, func
+    Table, Index, func, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -90,6 +90,7 @@ class User(Base):
             'email': self.email,
             'display_name': self.username,
             'bio': self.bio,
+            'avatar': self.avatar_url,
             'avatar_url': self.avatar_url,
             'cover_photo_url': self.cover_photo_url,
             'created_at': self.created_at.isoformat() if self.created_at else None,
@@ -123,9 +124,13 @@ class Post(Base):
     def get_comment_count(self):
         return self.comments.count()
     
-    def get_topics(self):
-        from app.database import SessionLocal
-        db = SessionLocal()
+    def get_topics(self, db=None):
+        if db is None:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            own_db = True
+        else:
+            own_db = False
         try:
             from sqlalchemy import text
             result = db.execute(
@@ -141,9 +146,10 @@ class Post(Base):
                 })
             return topics
         finally:
-            db.close()
+            if own_db:
+                db.close()
     
-    def to_dict(self, current_user_id=None, like_count=None, comment_count=None, topics=None, is_liked=None):
+    def to_dict(self, current_user_id=None, like_count=None, comment_count=None, topics=None, is_liked=None, db=None):
         import json
         images_list = None
         if self.images:
@@ -172,7 +178,7 @@ class Post(Base):
             'like_count': like_count if like_count is not None else self.get_like_count(),
             'comment_count': comment_count if comment_count is not None else self.get_comment_count(),
             'view_count': self.view_count,
-            'topics': topics if topics is not None else self.get_topics(),
+            'topics': topics if topics is not None else self.get_topics(db=db),
             'is_liked': is_liked if is_liked is not None else False,
         }
         return result
@@ -203,6 +209,7 @@ class Comment(Base):
     reply_to_user = relationship('User', foreign_keys=[reply_to_user_id])
     
     def to_dict(self, current_user_id=None):
+        author_dict = self.author.to_dict() if self.author else None
         result = {
             'id': self.id,
             'content': self.content,
@@ -210,11 +217,16 @@ class Comment(Base):
             'post_id': self.post_id,
             'parent_id': self.parent_id,
             'reply_to_user_id': self.reply_to_user_id,
+            'reply_to_user': self.reply_to_user.to_dict() if self.reply_to_user else None,
+            'author': author_dict,
+            'user': author_dict,  # 前端兼容
             'like_count': self.like_count,
             'reply_count': self.reply_count,
-            'author': self.author.to_dict() if self.author else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'replies': [],
+            'replies_has_more': False,
+            'replies_page': 1,
         }
         return result
 
@@ -316,6 +328,9 @@ class ConversationParticipant(Base):
 class Message(Base):
     """消息模型"""
     __tablename__ = 'messages'
+    __table_args__ = (
+        Index('idx_messages_conv_time', 'conversation_id', 'created_at'),
+    )
     
     id = Column(Integer, primary_key=True)
     conversation_id = Column(Integer, ForeignKey('conversations.id'), nullable=False, index=True)
@@ -604,3 +619,39 @@ class ComicEventFollow(Base):
 
     event = relationship('ComicEvent', back_populates='follows')
     user = relationship('User')
+
+
+# ============================================================
+# WebSocket 协议表（序号机制 + 断线补发 + ACK 去重）
+# ============================================================
+
+class WSMessageLog(Base):
+    """消息日志 — 支持断线补发"""
+    __tablename__ = 'ws_message_log'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'seq', name='uq_ws_msg_user_seq'),
+        Index('idx_ws_msg_user_seq', 'user_id', 'seq'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    payload = Column(Text, nullable=False)  # JSON string
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class WSUserSeq(Base):
+    """每用户序号计数器"""
+    __tablename__ = 'ws_user_seq'
+
+    user_id = Column(Integer, ForeignKey('users.id'), primary_key=True)
+    current_seq = Column(Integer, nullable=False, default=0)
+
+
+class WSAckDedup(Base):
+    """ACK 去重表（clientMsgId 幂等，定期清理 24h 前记录）"""
+    __tablename__ = 'ws_ack_dedup'
+
+    client_msg_id = Column(String(36), primary_key=True)  # UUID
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)

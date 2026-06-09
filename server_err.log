@@ -1,7 +1,0 @@
-2026-06-02 15:18:28,883 - asyncio - DEBUG - Using proactor: IocpProactor
-INFO:     Started server process [44056]
-INFO:     Waiting for application startup.
-2026-06-02 15:18:28,903 - app.main - INFO - Starting NanTuPy server...
-2026-06-02 15:18:30,567 - app.main - INFO - Database tables initialized
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8898 (Press CTRL+C to quit)

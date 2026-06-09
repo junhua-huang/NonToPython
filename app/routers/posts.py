@@ -8,8 +8,8 @@ import logging
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Post, Like, Comment, Friendship, post_visibility
-from sqlalchemy import or_
+from app.models.models import User, Post, Like, Comment, Friendship, PostView, Notification, post_visibility
+from sqlalchemy import or_, select
 from app.core.config import Config
 from app.utils import FileUploader
 from app.services.topic_service import TopicService
@@ -273,7 +273,7 @@ def delete_post(post_id: int, user: User = Depends(get_current_user), db: Sessio
     try:
         # Delete related data in correct order to avoid FK constraint violations
         # 1. Delete likes on comments of this post (FK: likes.comment_id → comments.id)
-        comment_ids_subq = db.query(Comment.id).filter(Comment.post_id == post_id).subquery()
+        comment_ids_subq = select(Comment.id).where(Comment.post_id == post_id)
         db.query(Like).filter(Like.comment_id.in_(comment_ids_subq)).delete(synchronize_session=False)
         # 2. Delete likes on the post itself (FK: likes.post_id → posts.id)
         db.query(Like).filter(Like.post_id == post_id).delete(synchronize_session=False)
@@ -286,6 +286,15 @@ def delete_post(post_id: int, user: User = Depends(get_current_user), db: Sessio
         db.query(Comment).filter(
             Comment.post_id == post_id,
             Comment.parent_id.is_(None)
+        ).delete(synchronize_session=False)
+        # 5. Delete post views (FK: post_views.post_id → posts.id)
+        db.query(PostView).filter(PostView.post_id == post_id).delete(synchronize_session=False)
+        # 6. Delete notifications referencing this post
+        db.query(Notification).filter(
+            Notification.related_id == post_id,
+            Notification.notification_type.in_([
+                'like', 'comment', 'post_mention',
+            ]),
         ).delete(synchronize_session=False)
         if post.images:
             import json as _json

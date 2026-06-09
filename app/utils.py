@@ -18,11 +18,11 @@ class FileUploader:
 
     @classmethod
     def _get_cos_client(cls):
-        if cls._cos_client is None and Config.COS_BUCKET_NAME:
+        if cls._cos_client is None and Config.COS_BUCKET:
             cos_config = CosConfig(
                 Region=Config.COS_REGION,
-                SecretId=Config.COS_SECRET_ID,
-                SecretKey=Config.COS_SECRET_KEY,
+                SecretId=Config.COS_ID,
+                SecretKey=Config.COS_KEY,
             )
             cls._cos_client = CosS3Client(cos_config)
         return cls._cos_client
