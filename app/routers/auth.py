@@ -16,7 +16,7 @@ import bcrypt as bcrypt_lib
 from jose import jwt, JWTError
 
 from app.database import get_db
-from app.models.models import User
+from app.models.models import User, Role, UserRole
 from app.core.config import Config
 from werkzeug.security import check_password_hash
 from app.dependencies import get_current_user, get_optional_user
@@ -153,6 +153,8 @@ class PrivacySettingsUpdateRequest(BaseModel):
 # ============================================================
 
 def _build_user_response(user: User) -> dict:
+    roles = user.get_role_names() if hasattr(user, 'get_role_names') else []
+    role_labels = user.get_role_labels() if hasattr(user, 'get_role_labels') else []
     return {
         "id": user.id,
         "username": user.username,
@@ -162,6 +164,8 @@ def _build_user_response(user: User) -> dict:
         "avatar_url": user.avatar_url,
         "cover_photo_url": user.cover_photo_url,
         "created_at": user.created_at.isoformat() if user.created_at else None,
+        "roles": roles,
+        "role_labels": role_labels,
     }
 
 
@@ -183,7 +187,7 @@ def _build_public_user_response(user: User) -> dict:
 
 @router.post("/register", response_model=AuthResponse)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
-    """用户注册"""
+    """用户注册（自动分配 user 角色）"""
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
     if db.query(User).filter(User.email == data.email).first():
@@ -198,10 +202,17 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         cover_photo_url="",
     )
     db.add(user)
+    db.flush()  # 获取 user.id
+
+    # 自动分配 "user" 角色
+    default_role = db.query(Role).filter(Role.name == "user").first()
+    if default_role:
+        db.add(UserRole(user_id=user.id, role_id=default_role.id))
+
     db.commit()
     db.refresh(user)
 
-    access_token = _create_token(user)
+    access_token = _create_token(user, db)
     logger.info(f"New user registered: {user.username} (ID: {user.id})")
     return AuthResponse(
         message="Registration successful",
@@ -235,7 +246,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         if not bcrypt_lib.checkpw(data.password.encode('utf-8'), user.password_hash.encode('utf-8')):
             raise HTTPException(status_code=401, detail="Invalid username/email or password")
 
-    access_token = _create_token(user)
+    access_token = _create_token(user, db)
     logger.info(f"User logged in: {user.username} (ID: {user.id})")
     return AuthResponse(
         message="Login successful",
@@ -463,9 +474,9 @@ def update_privacy_settings(
 # ============================================================
 
 @router.post("/refresh")
-def refresh_token(user: User = Depends(get_current_user)):
+def refresh_token(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """刷新 Token"""
-    access_token = _create_token(user)
+    access_token = _create_token(user, db)
     return {"access_token": access_token, "token_type": "bearer"}
 
 
@@ -473,12 +484,22 @@ def refresh_token(user: User = Depends(get_current_user)):
 # Helpers
 # ============================================================
 
-def _create_token(user: User) -> str:
-    """创建 JWT access token"""
+def _create_token(user: User, db: Session = None) -> str:
+    """创建 JWT access token（含角色列表）"""
     expires = timedelta(days=7)
+    if db:
+        user_roles = db.query(UserRole).filter(UserRole.user_id == user.id).all()
+        role_names = []
+        for ur in user_roles:
+            role = db.query(Role).filter(Role.id == ur.role_id).first()
+            if role:
+                role_names.append(role.name)
+    else:
+        role_names = user.get_role_names() if hasattr(user, 'get_role_names') else []
     payload = {
         "sub": str(user.id),
         "username": user.username,
+        "roles": role_names,
         "iat": datetime.utcnow(),
         "exp": datetime.utcnow() + expires,
     }

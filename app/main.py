@@ -12,7 +12,7 @@ import logging
 
 from app.database import init_db
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
-from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic
+from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
 
 # 配置日志
 logging.basicConfig(
@@ -24,7 +24,7 @@ logging.basicConfig(
     ]
 )
 
-# 确保 WS 相关 logger 在 INFO 级别输出（uvicorn 可能覆盖 root logger）
+# WS 日志保持 INFO 级别（连接/断开/认证可见，收发详细内容仅 DEBUG）
 for _ws_logger_name in ['app.routers.ws', 'app.ws_manager']:
     _l = logging.getLogger(_ws_logger_name)
     _l.setLevel(logging.INFO)
@@ -58,7 +58,6 @@ app = FastAPI(
 # 用 allow_origin_regex=".*" 替代 — Starlette 会正确回显请求 Origin。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
     allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
@@ -67,11 +66,18 @@ app.add_middleware(
 )
 
 # COOP / COEP 安全头 — Flutter Web (CanvasKit + WASM) 需要 SharedArrayBuffer
+# 注意：只应在静态 HTML 页面响应上设置，API 和 OPTIONS 预检不需要
 @app.middleware("http")
 async def add_security_headers(request, call_next):
     response = await call_next(request)
+    # 跳过 API 路由和 OPTIONS 预检
+    path = request.url.path
+    if request.method == "OPTIONS" or path.startswith("/api/") or path.startswith("/ws"):
+        return response
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+    # 配合 COEP 需要的 CORP 头
+    response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
     return response
 
 # 注册路由
@@ -90,6 +96,7 @@ app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
 app.include_router(health.router, prefix="", tags=["Health"])
 app.include_router(admin.router, prefix="", tags=["Admin"])
 app.include_router(comic.router, prefix="/api/comic", tags=["Comic"])
+app.include_router(roles.router, tags=["Roles"])
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 

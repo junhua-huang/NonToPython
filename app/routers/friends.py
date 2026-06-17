@@ -60,7 +60,55 @@ def send_friend_request(
         | ((Friendship.sender_id == receiver_id) & (Friendship.receiver_id == current_user_id))
     ).first()
     if existing:
-        return {"message": "Friend request already sent or you are already friends", "status": existing.status, "friendship": existing.to_dict()}
+        if existing.status == "accepted":
+            return {"message": "You are already friends", "status": existing.status, "friendship": existing.to_dict()}
+
+        # 对方已发来 pending → 双向确认，直接通过为好友
+        if existing.sender_id != current_user_id and existing.status == "pending":
+            existing.status = "accepted"
+            existing.updated_at = datetime.utcnow()
+
+            # 创建 1v1 会话 + 发送 Hi
+            uid1, uid2 = min(existing.sender_id, existing.receiver_id), max(existing.sender_id, existing.receiver_id)
+            conversation = db.query(Conversation).filter(
+                Conversation.user1_id == uid1, Conversation.user2_id == uid2
+            ).first()
+            if not conversation:
+                conversation = Conversation(user1_id=uid1, user2_id=uid2)
+                db.add(conversation)
+                db.flush()
+                db.add_all([
+                    ConversationParticipant(conversation_id=conversation.id, user_id=uid1),
+                    ConversationParticipant(conversation_id=conversation.id, user_id=uid2),
+                ])
+
+            now = datetime.utcnow()
+            hi_sender = Message(conversation_id=conversation.id, sender_id=existing.sender_id, content="Hi", created_at=now)
+            hi_receiver = Message(conversation_id=conversation.id, sender_id=existing.receiver_id, content="Hi", created_at=now)
+            db.add_all([hi_sender, hi_receiver])
+            conversation.last_message_at = now
+
+            db.commit()
+            db.refresh(conversation)
+            db.refresh(hi_sender)
+            db.refresh(hi_receiver)
+
+            NotificationService.notify_friend_accepted(existing.sender_id, existing.receiver_id)
+
+            _schedule_hi_push(
+                existing.sender_id, existing.receiver_id,
+                conversation.id, conversation.to_dict(),
+                hi_sender.to_dict(), hi_receiver.to_dict()
+            )
+
+            return {"message": "Friend request accepted (mutual)", "status": existing.status, "friendship": existing.to_dict()}
+
+        # 我已发过（pending 或 rejected）→ 重置为 pending，重新发通知
+        existing.status = "pending"
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        NotificationService.notify_friend_request(receiver_id, current_user_id)
+        return {"message": "Friend request re-sent", "status": existing.status, "friendship": existing.to_dict()}
 
     friendship = Friendship(sender_id=current_user_id, receiver_id=receiver_id, status="pending")
     try:
@@ -359,26 +407,17 @@ def get_friend_recommendations(
 def _schedule_hi_push(sender_id: int, receiver_id: int, conv_id: int, conv_dict: dict, hi_sender_dict: dict, hi_receiver_dict: dict):
     """调度异步 WebSocket 推送：向双方推送新会话 + Hi 消息"""
     async def _push():
-        # 向 Sender 推送（会话中包含 receiver 的信息，有 receiver 发的 Hi）
         conv_for_sender = {**conv_dict, "other_user_id": receiver_id}
-        await ws_manager.send(sender_id, {
+        await ws_manager.send_raw(sender_id, {
             "type": "friend_accepted_chat",
             "conversation": conv_for_sender,
-            "message": hi_receiver_dict,  # Sender 看到的是 Receiver 发的 Hi
+            "message": hi_receiver_dict,
         })
-        # 向 Receiver 推送（会话中包含 sender 的信息，有 sender 发的 Hi）
         conv_for_receiver = {**conv_dict, "other_user_id": sender_id}
-        await ws_manager.send(receiver_id, {
+        await ws_manager.send_raw(receiver_id, {
             "type": "friend_accepted_chat",
             "conversation": conv_for_receiver,
-            "message": hi_sender_dict,  # Receiver 看到的是 Sender 发的 Hi
+            "message": hi_sender_dict,
         })
 
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(_push())
-        else:
-            asyncio.run(_push())
-    except RuntimeError:
-        asyncio.run(_push())
+    ws_manager.schedule_push(_push())

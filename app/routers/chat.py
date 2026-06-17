@@ -40,6 +40,16 @@ def get_sessions(
     if not conversations:
         return {"sessions": [], "total": 0}
 
+    # 过滤已屏蔽用户的会话
+    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+    if blocked_ids:
+        conversations = [
+            c for c in conversations
+            if (c.user2_id if c.user1_id == user.id else c.user1_id) not in blocked_ids
+        ]
+        if not conversations:
+            return {"sessions": [], "total": 0}
+
     conv_ids = [c.id for c in conversations]
 
     # 获取每个会话的最后一条消息
@@ -350,34 +360,27 @@ def get_messages_batch(
             raise HTTPException(status_code=403, detail=f"Unauthorized for conversation {cid}")
 
     # 合并为单次 UNION ALL 查询：每个会话独立 LIMIT，一次往返
-    from sqlalchemy import union_all
+    from sqlalchemy import text
     from collections import OrderedDict
 
-    subqueries = []
+    # 构建原生 UNION ALL SQL，规避 sqlalchemy union_all() 的 subquery 类型兼容问题
+    union_parts = []
     for cid in conv_id_list:
-        subq = (
-            db.query(Message)
-            .filter(Message.conversation_id == cid)
-            .order_by(Message.created_at.desc())
-            .limit(per_page)
+        union_parts.append(
+            "(SELECT id, conversation_id, sender_id, content, message_type, "
+            "media_url, is_read, related_id, created_at "
+            f"FROM messages WHERE conversation_id = {cid} "
+            "ORDER BY created_at DESC LIMIT :limit)"
         )
-        subqueries.append(subq)
+    union_sql = " UNION ALL ".join(union_parts)
+    union_sql += " ORDER BY conversation_id, created_at DESC"
 
     messages_by_conv: dict = OrderedDict()
     for cid in conv_id_list:
         messages_by_conv[cid] = []
 
-    if subqueries:
-        if len(subqueries) == 1:
-            union_stmt = subqueries[0].subquery()
-        else:
-            union_stmt = union_all(*[sq.subquery() for sq in subqueries])
-        # 查询所有消息，按 conv_id + 时间降序分组
-        all_rows = db.query(
-            union_stmt.c.id, union_stmt.c.conversation_id, union_stmt.c.sender_id,
-            union_stmt.c.content, union_stmt.c.message_type, union_stmt.c.media_url,
-            union_stmt.c.is_read, union_stmt.c.related_id, union_stmt.c.created_at,
-        ).order_by(union_stmt.c.conversation_id, union_stmt.c.created_at.desc()).all()
+    if union_parts:
+        all_rows = db.execute(text(union_sql), {"limit": per_page}).fetchall()
 
         for row in all_rows:
             bucket = messages_by_conv.get(row.conversation_id)
@@ -475,6 +478,13 @@ async def send_message(
     if conversation.user1_id != user.id and conversation.user2_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
+    # 屏蔽检查（使用缓存）
+    receiver_id = conversation.user2_id if conversation.user1_id == user.id else conversation.user1_id
+    blocked_by_receiver = ws_manager.get_blocked_user_ids(receiver_id)
+    blocked_by_sender = ws_manager.get_blocked_user_ids(user.id)
+    if user.id in blocked_by_receiver or receiver_id in blocked_by_sender:
+        raise HTTPException(status_code=403, detail="Cannot send message to this user")
+
     content = payload.get("content", "")
     message_type = payload.get("message_type", "text")
     media_url = payload.get("media_url")
@@ -533,6 +543,16 @@ async def send_message(
             "unread_count": sender_unread,
         })
 
+        # --- 离线通知中心 ---
+        # HTTP 路径也需要为离线用户写入通知记录（与 WS 路径 _handle_send_message 对齐）
+        if not ws_manager.is_connected(receiver_id):
+            from app.services.notification_service import NotificationService
+            preview = content[:50] + '...' if len(content) > 50 else content
+            NotificationService.notify_message(receiver_id, user.id, preview, conversation_id)
+
+        # 失效缓存（新消息导致 last_message / unread_count 变化）
+        ws_manager.invalidate_participant_caches([user.id, receiver_id])
+
         return {"message": "Message sent", "data": message.to_dict()}
     except Exception as e:
         db.rollback()
@@ -585,6 +605,9 @@ async def mark_conversation_as_read(
             "unread_count": total_unread,
         })
 
+        # 失效缓存（已读导致 unread_count 变化）
+        ws_manager.invalidate_session_cache(user.id)
+
         return {"message": "All messages marked as read", "marked_count": len(unread)}
     except Exception as e:
         db.rollback()
@@ -611,10 +634,19 @@ def get_user_status(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取用户在线状态"""
+    """获取用户在线状态（仅好友可查）"""
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # 隐私保护：非好友不允许查看在线状态
+    is_friend = db.query(Friendship).filter(
+        Friendship.status == 'accepted',
+        ((Friendship.sender_id == user.id) & (Friendship.receiver_id == user_id))
+        | ((Friendship.sender_id == user_id) & (Friendship.receiver_id == user.id))
+    ).first()
+    if not is_friend:
+        raise HTTPException(status_code=403, detail="Only friends can view online status")
 
     return {"user_id": user_id, "is_online": ws_manager.is_connected(user_id), "user": target.to_dict()}
 
@@ -646,4 +678,60 @@ def get_unread_count(
     )
 
     return {"total_unread": total_unread}
+
+
+# ============================================================
+# 消息撤回
+# ============================================================
+
+@router.post("/messages/{message_id}/recall")
+def recall_message(
+    message_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """撤回一条消息（2分钟内，仅限发送者）"""
+    from datetime import timedelta
+
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != user.id:
+        raise HTTPException(status_code=403, detail="Cannot recall other's message")
+    if msg.is_recalled:
+        raise HTTPException(status_code=400, detail="Message already recalled")
+
+    # 2分钟时间限制
+    if msg.created_at and datetime.utcnow() - msg.created_at > timedelta(minutes=2):
+        raise HTTPException(status_code=400, detail="Recall time limit exceeded (2 min)")
+
+    msg.is_recalled = True
+    msg.recalled_at = datetime.utcnow()
+    db.commit()
+    db.refresh(msg)
+
+    # 通过 WS 推送撤回事件给会话参与者
+    participant_ids = [
+        r.user_id
+        for r in db.query(ConversationParticipant)
+        .filter(ConversationParticipant.conversation_id == msg.conversation_id)
+        .all()
+    ]
+    recall_data = {
+        "message_id": msg.id,
+        "conversation_id": msg.conversation_id,
+        "is_recalled": True,
+        "recalled_at": msg.recalled_at.isoformat() if msg.recalled_at else None,
+    }
+    for pid in participant_ids:
+        ws_manager.enqueue_push(pid, "message_recalled", recall_data)
+
+    ws_manager.invalidate_participant_caches(participant_ids)
+
+    return {
+        "success": True,
+        "message_id": msg.id,
+        "is_recalled": True,
+        "recalled_at": msg.recalled_at.isoformat() if msg.recalled_at else None,
+    }
 

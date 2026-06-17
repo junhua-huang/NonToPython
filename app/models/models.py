@@ -11,6 +11,12 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+def _get_ws_manager():
+    """延迟导入，避免循环依赖"""
+    from app.ws_manager import ws_manager
+    return ws_manager
+
+
 # ============================================================
 # 关联表
 # ============================================================
@@ -82,8 +88,23 @@ class User(Base):
         'Friendship', foreign_keys='Friendship.receiver_id',
         back_populates='receiver', lazy='dynamic', cascade='all, delete-orphan'
     )
+    user_roles = relationship('UserRole', back_populates='user', lazy='joined', cascade='all, delete-orphan')
     
+    def get_role_names(self):
+        """返回当前用户的角色名列表"""
+        return [ur.role.name for ur in self.user_roles if ur.role]
+
+    def get_role_labels(self):
+        """返回当前用户的角色标签列表"""
+        return [ur.role.label for ur in self.user_roles if ur.role]
+
+    def has_role(self, role_name: str) -> bool:
+        """检查用户是否拥有某个角色"""
+        return role_name in self.get_role_names()
+
     def to_dict(self):
+        ws_manager = _get_ws_manager()
+        is_online = ws_manager.is_connected(self.id) if self.id else False
         return {
             'id': self.id,
             'username': self.username,
@@ -93,7 +114,10 @@ class User(Base):
             'avatar': self.avatar_url,
             'avatar_url': self.avatar_url,
             'cover_photo_url': self.cover_photo_url,
+            'is_online': is_online,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'roles': self.get_role_names(),
+            'role_labels': self.get_role_labels(),
         }
 
 
@@ -339,7 +363,11 @@ class Message(Base):
     message_type = Column(String(20), default='text')  # text, image, system
     media_url = Column(String(255))
     related_id = Column(Integer)
+    quote_message_id = Column(Integer, nullable=True)
+    quote_preview = Column(Text, nullable=True)
     is_read = Column(Boolean, default=False)
+    is_recalled = Column(Boolean, default=False)
+    recalled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     conversation = relationship('Conversation', back_populates='messages')
@@ -354,7 +382,11 @@ class Message(Base):
             'message_type': self.message_type,
             'media_url': self.media_url,
             'related_id': self.related_id,
+            'quote_message_id': self.quote_message_id,
+            'quote_preview': self.quote_preview,
             'is_read': self.is_read,
+            'is_recalled': self.is_recalled,
+            'recalled_at': self.recalled_at.isoformat() if self.recalled_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -571,6 +603,8 @@ class ComicEvent(Base):
     website = Column(String(512), default='')
     intro = Column(Text)
     status = Column(Integer, default=0)  # 0=即将开始, 1=进行中, 2=已结束
+    like_count = Column(Integer, default=0)
+    comment_count = Column(Integer, default=0)
     creator_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -581,6 +615,8 @@ class ComicEvent(Base):
     images = relationship('ComicEventImage', back_populates='event', cascade='all, delete-orphan')
     tag_rels = relationship('ComicEventTagRel', back_populates='event', cascade='all, delete-orphan')
     follows = relationship('ComicEventFollow', back_populates='event', cascade='all, delete-orphan')
+    comments = relationship('ComicComment', back_populates='event', cascade='all, delete-orphan')
+    likes = relationship('ComicLike', back_populates='event', cascade='all, delete-orphan')
 
 
 class ComicEventImage(Base):
@@ -621,6 +657,80 @@ class ComicEventFollow(Base):
     user = relationship('User')
 
 
+class ComicComment(Base):
+    """漫展评论"""
+    __tablename__ = 'comic_comments'
+    __table_args__ = (
+        Index('idx_comic_comments_event_parent', 'event_id', 'parent_id'),
+        Index('idx_comic_comments_parent_created', 'parent_id', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    content = Column(Text, nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    event_id = Column(Integer, ForeignKey('comic_events.id'), nullable=False, index=True)
+    parent_id = Column(Integer, ForeignKey('comic_comments.id'), nullable=True, index=True)
+    reply_to_user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
+    like_count = Column(Integer, default=0)
+    reply_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    author = relationship('User', foreign_keys=[user_id])
+    event = relationship('ComicEvent', back_populates='comments')
+    parent = relationship('ComicComment', remote_side=[id], backref='replies')
+    reply_to_user = relationship('User', foreign_keys=[reply_to_user_id])
+
+    def to_dict(self, current_user_id=None):
+        result = {
+            'id': self.id,
+            'content': self.content,
+            'user_id': self.user_id,
+            'event_id': self.event_id,
+            'parent_id': self.parent_id,
+            'reply_to_user_id': self.reply_to_user_id,
+            'reply_to_user': self.reply_to_user.to_dict() if self.reply_to_user else None,
+            'user': self.author.to_dict() if self.author else None,
+            'like_count': self.like_count,
+            'reply_count': self.reply_count,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'replies': [],
+            'replies_has_more': False,
+            'replies_page': 1,
+        }
+        return result
+
+
+class ComicLike(Base):
+    """漫展点赞"""
+    __tablename__ = 'comic_likes'
+    __table_args__ = (
+        Index('idx_comic_likes_event_user', 'event_id', 'user_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    event_id = Column(Integer, ForeignKey('comic_events.id'), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User')
+    event = relationship('ComicEvent', back_populates='likes')
+
+
+class ComicCommentLike(Base):
+    """漫展评论点赞"""
+    __tablename__ = 'comic_comment_likes'
+    __table_args__ = (
+        Index('idx_ccl_user_comment', 'user_id', 'comment_id', unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    comment_id = Column(Integer, ForeignKey('comic_comments.id'), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # ============================================================
 # WebSocket 协议表（序号机制 + 断线补发 + ACK 去重）
 # ============================================================
@@ -654,4 +764,176 @@ class WSAckDedup(Base):
 
     client_msg_id = Column(String(36), primary_key=True)  # UUID
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    message_id = Column(Integer, nullable=True)  # 首次处理时记录的 message_id，重复 ACK 时回传
     processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+# ============================================================
+# 角色系统模型
+# ============================================================
+
+class Role(Base):
+    """角色定义表"""
+    __tablename__ = 'roles'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(32), unique=True, nullable=False)    # admin / organizer / coser / ...
+    label = Column(String(32), nullable=False)                # 管理员 / 主办方 / Coser / ...
+    description = Column(String(128), default='')
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'label': self.label,
+            'description': self.description,
+            'sort_order': self.sort_order,
+        }
+
+
+class UserRole(Base):
+    """用户-角色关联表（多对多）"""
+    __tablename__ = 'user_roles'
+
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    role_id = Column(Integer, ForeignKey('roles.id', ondelete='CASCADE'), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User', back_populates='user_roles')
+    role = relationship('Role')
+
+
+class CoserProfile(Base):
+    """Coser 专属资料"""
+    __tablename__ = 'coser_profiles'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
+    cosname = Column(String(64), default='')
+    bio = Column(Text)
+    styles = Column(String(512), default='')
+    city = Column(String(32), default='')
+    is_available = Column(Boolean, default=True)
+    price_range_min = Column(Integer, default=0)
+    price_range_max = Column(Integer, default=0)
+    portfolio_images = Column(Text)
+    social_links = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'cosname': self.cosname,
+            'bio': self.bio,
+            'styles': self.styles.split(',') if self.styles else [],
+            'city': self.city,
+            'is_available': self.is_available,
+            'price_range_min': self.price_range_min,
+            'price_range_max': self.price_range_max,
+            'portfolio_images': self.portfolio_images,
+            'social_links': self.social_links,
+        }
+
+
+class PhotographerProfile(Base):
+    """摄影师专属资料"""
+    __tablename__ = 'photographer_profiles'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
+    equipment = Column(String(512), default='')
+    styles = Column(String(512), default='')
+    city = Column(String(32), default='')
+    is_available = Column(Boolean, default=True)
+    price_range_min = Column(Integer, default=0)
+    price_range_max = Column(Integer, default=0)
+    portfolio_images = Column(Text)
+    social_links = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'equipment': self.equipment,
+            'styles': self.styles.split(',') if self.styles else [],
+            'city': self.city,
+            'is_available': self.is_available,
+            'price_range_min': self.price_range_min,
+            'price_range_max': self.price_range_max,
+            'portfolio_images': self.portfolio_images,
+            'social_links': self.social_links,
+        }
+
+
+class ServiceProfile(Base):
+    """通用服务商资料（毛娘 / 妆娘 / 后期师 / 票务代理）"""
+    __tablename__ = 'service_profiles'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
+    service_type = Column(String(32), nullable=False)  # wig_stylist / makeup_artist / editor / ticket_agent
+    description = Column(Text)
+    city = Column(String(32), default='')
+    is_available = Column(Boolean, default=True)
+    price_info = Column(String(512), default='')
+    portfolio_images = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'service_type': self.service_type,
+            'description': self.description,
+            'city': self.city,
+            'is_available': self.is_available,
+            'price_info': self.price_info,
+            'portfolio_images': self.portfolio_images,
+        }
+
+
+class RoleApplication(Base):
+    """角色申请表"""
+    __tablename__ = 'role_applications'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    role_id = Column(Integer, ForeignKey('roles.id', ondelete='CASCADE'), nullable=False)
+    status = Column(String(16), default='pending')   # pending / approved / rejected
+    reason = Column(Text)
+    review_comment = Column(Text)
+    reviewer_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    user = relationship('User', foreign_keys=[user_id])
+    role = relationship('Role')
+    reviewer = relationship('User', foreign_keys=[reviewer_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'role_id': self.role_id,
+            'role': self.role.to_dict() if self.role else None,
+            'status': self.status,
+            'reason': self.reason,
+            'review_comment': self.review_comment,
+            'reviewer_id': self.reviewer_id,
+            'user': self.user.to_dict() if self.user else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
+        }

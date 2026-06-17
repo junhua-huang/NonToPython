@@ -7,11 +7,12 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Block
+from app.ws_manager import ws_manager
 
 router = APIRouter()
 
 
-@router.post("/")
+@router.post("")
 def block_user(
     payload: dict = Body(...),
     user: User = Depends(get_current_user),
@@ -38,6 +39,7 @@ def block_user(
     try:
         db.add(block)
         db.commit()
+        ws_manager.invalidate_blocked_cache(user.id)
         return {"message": "User blocked successfully", "block": block.to_dict()}
     except Exception as e:
         db.rollback()
@@ -60,6 +62,7 @@ def unblock_user(
     try:
         db.delete(block)
         db.commit()
+        ws_manager.invalidate_blocked_cache(user.id)
         return {"message": "User unblocked successfully"}
     except Exception as e:
         db.rollback()

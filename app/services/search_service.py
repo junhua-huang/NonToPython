@@ -3,7 +3,7 @@
 """
 from sqlalchemy import or_, and_, func
 from sqlalchemy.orm import Session
-from app.models.models import User, Post
+from app.models.models import User, Post, ComicEvent, ComicCity
 
 
 class SearchService:
@@ -98,17 +98,104 @@ class SearchService:
 
         user_results = SearchService.search_users(db, query, page, per_page, current_user_id)
         post_results = SearchService.search_posts(db, query, page, per_page, is_public=True)
+        event_results = SearchService.search_comic_events(db, query, per_page=per_page, user_id=current_user_id)
 
         return {
             'query': query,
             'users': user_results['users'],
             'posts': post_results['posts'],
+            'events': event_results['events'],
             'user_total': user_results['total'],
             'post_total': post_results['total'],
-            'total_results': user_results['total'] + post_results['total'],
+            'event_total': event_results['total'],
+            'total_results': user_results['total'] + post_results['total'] + event_results['total'],
             'current_page': page,
             'per_page': per_page
         }
+
+    @staticmethod
+    def search_comic_events(db: Session, query: str, per_page: int = 10, user_id: int = None):
+        """模糊搜索漫展：名称 / 场馆 / 城市名"""
+        if not query or len(query.strip()) < 1:
+            return {'events': [], 'total': 0}
+
+        from datetime import datetime
+        search_term = f'%{query}%'
+        now = datetime.utcnow()
+
+        events_query = (
+            db.query(ComicEvent)
+            .join(ComicCity, ComicEvent.city_id == ComicCity.id)
+            .filter(
+                or_(
+                    ComicEvent.name.ilike(search_term),
+                    ComicEvent.venue.ilike(search_term),
+                    ComicCity.name.ilike(search_term),
+                ),
+                ComicEvent.end_date >= now,
+            )
+            .order_by(ComicEvent.start_date.asc())
+            .limit(per_page)
+        )
+
+        total = events_query.count()
+        events = events_query.all()
+
+        if not events:
+            return {'events': [], 'total': 0}
+
+        event_ids = [e.id for e in events]
+        city_map = {c.id: c.name for c in db.query(ComicCity).filter(ComicCity.id.in_({e.city_id for e in events})).all()}
+
+        from app.models.models import ComicEventImage, ComicEventFollow
+        images_map = {}
+        imgs = db.query(ComicEventImage).filter(
+            ComicEventImage.event_id.in_(event_ids)
+        ).order_by(ComicEventImage.is_cover.desc(), ComicEventImage.sort_order.asc()).all()
+        for img in imgs:
+            images_map.setdefault(img.event_id, []).append({
+                "id": img.id, "imageUrl": img.image_url,
+                "isCover": bool(img.is_cover), "sortOrder": img.sort_order,
+            })
+
+        follow_set = set()
+        follow_count_map = {}
+        if user_id:
+            follows = db.query(ComicEventFollow).filter(
+                ComicEventFollow.event_id.in_(event_ids),
+                ComicEventFollow.user_id == user_id,
+            ).all()
+            follow_set = {f.event_id for f in follows}
+
+        from sqlalchemy import text
+        follow_counts = db.execute(text(
+            "SELECT event_id, COUNT(*) FROM comic_event_follows "
+            "WHERE event_id IN :eids GROUP BY event_id"
+        ), {"eids": tuple(event_ids)}).fetchall()
+        for fc in follow_counts:
+            follow_count_map[fc[0]] = fc[1]
+
+        status_text = {0: "即将开始", 1: "进行中", 2: "已结束"}
+
+        result = []
+        for e in events:
+            result.append({
+                "id": e.id,
+                "name": e.name,
+                "cityName": city_map.get(e.city_id, ""),
+                "venue": e.venue or "",
+                "startDate": e.start_date.isoformat() if e.start_date else None,
+                "endDate": e.end_date.isoformat() if e.end_date else None,
+                "status": e.status,
+                "statusText": status_text.get(e.status, ""),
+                "ticketInfo": e.ticket_info or "",
+                "images": images_map.get(e.id, []),
+                "isFollowed": e.id in follow_set,
+                "followCount": follow_count_map.get(e.id, 0),
+                "createdAt": e.created_at.isoformat() if e.created_at else None,
+            })
+
+        return {'events': result, 'total': total}
 
     @staticmethod
     def search_posts_by_hashtag(db: Session, hashtag: str, page: int = 1, per_page: int = 20):

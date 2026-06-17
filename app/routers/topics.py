@@ -168,7 +168,7 @@ def get_topic_posts(
     return results
 
 
-@router.post("/")
+@router.post("")
 def create_topic(
     payload: dict = Body(...),
     user: User = Depends(get_current_user),

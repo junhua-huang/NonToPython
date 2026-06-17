@@ -49,7 +49,7 @@ def _handle_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/")
+@router.post("")
 def submit_report(
     payload: dict = Body(...),
     user: User = Depends(get_current_user),

@@ -27,7 +27,7 @@ def get_personalized_feed(
 @router.get("/trending")
 def get_trending_posts(
     limit: int = Query(10, ge=1, le=50),
-    hours: int = Query(24, ge=1, le=168),
+    hours: int = Query(24, ge=1, le=720),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):

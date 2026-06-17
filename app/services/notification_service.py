@@ -19,12 +19,26 @@ class NotificationService:
 
     @staticmethod
     def _push_new_notification(user_id: int, notification: Notification):
-        """异步推送 WebSocket 新通知事件"""
+        """从 HTTP 请求线程安全地推送 WebSocket 通知"""
         from app.ws_manager import ws_manager
 
         async def _push():
             db = SessionLocal()
             try:
+                sender_id = notification.sender_id if hasattr(notification, "sender_id") else None
+
+                # 屏蔽检查：接收者屏蔽了发送者，则不推送
+                if sender_id and user_id != sender_id:
+                    if sender_id in ws_manager.get_blocked_user_ids(user_id):
+                        return
+
+                # 查询发送者信息
+                sender = None
+                if sender_id:
+                    s = db.query(User).filter(User.id == sender_id).first()
+                    if s:
+                        sender = {"username": s.username, "avatar_url": s.avatar_url}
+
                 unread_count = (
                     db.query(Notification)
                     .filter(
@@ -33,23 +47,19 @@ class NotificationService:
                     )
                     .count()
                 )
+                notification_dict = notification.to_dict() if hasattr(notification, "to_dict") else {}
+                notification_dict["sender"] = sender
+
                 await ws_manager.send_with_seq(user_id, "new_notification", {
-                    "notification": notification.to_dict() if hasattr(notification, "to_dict") else {},
+                    "notification": notification_dict,
                     "unread_count": unread_count,
                 })
             except Exception as e:
-                logger.warning(f"WS push new_notification failed for user_id={user_id}: {e}")
+                logger.warning(f"[NOTIFY PUSH] failed uid={user_id}: {e}", exc_info=True)
             finally:
                 db.close()
 
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_push())
-            else:
-                asyncio.run(_push())
-        except RuntimeError:
-            asyncio.run(_push())
+        ws_manager.schedule_push(_push())
 
     @staticmethod
     def create_notification(user_id, notification_type, title, content,

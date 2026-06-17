@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/")
+@router.post("")
 async def create_post(
     image: Optional[UploadFile] = File(None),
     video: Optional[UploadFile] = File(None),
@@ -158,6 +158,10 @@ def get_posts(
     ]
     friend_ids.append(current_user_id)
 
+    # 过滤已屏蔽用户的帖子
+    from app.ws_manager import ws_manager
+    blocked_ids = ws_manager.get_blocked_user_ids(current_user_id)
+
     posts_query = (
         db.query(Post)
         .filter(
@@ -168,6 +172,9 @@ def get_posts(
         )
         .order_by(Post.created_at.desc())
     )
+
+    if blocked_ids:
+        posts_query = posts_query.filter(~Post.user_id.in_(blocked_ids))
 
     offset = (page - 1) * per_page
     posts = posts_query.offset(offset).limit(per_page + 1).all()
@@ -195,6 +202,12 @@ def get_user_posts(
     db: Session = Depends(get_db),
 ):
     """获取指定用户的帖子"""
+    # 屏蔽检查：当前用户屏蔽了目标用户，则无法查看
+    if user.id != user_id:
+        from app.ws_manager import ws_manager
+        if user_id in ws_manager.get_blocked_user_ids(user.id):
+            return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
+
     posts_query = (
         db.query(Post)
         .filter(Post.user_id == user_id, Post.is_public == True)
@@ -328,6 +341,11 @@ def get_user_liked_posts(
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # 屏蔽检查
+    from app.ws_manager import ws_manager
+    if user_id in ws_manager.get_blocked_user_ids(user.id):
+        return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
 
     try:
         likes_query = db.query(Like).filter(Like.user_id == user_id).order_by(Like.created_at.desc())

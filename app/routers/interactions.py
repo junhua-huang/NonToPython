@@ -184,6 +184,13 @@ def create_comment(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
+    # 屏蔽检查：存在双向屏蔽关系则禁止评论
+    if user.id != post.user_id:
+        from app.ws_manager import ws_manager
+        if user.id in ws_manager.get_blocked_user_ids(post.user_id) or \
+           post.user_id in ws_manager.get_blocked_user_ids(user.id):
+            raise HTTPException(status_code=403, detail="Cannot comment on this post")
+
     content = payload.get("content")
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
@@ -258,6 +265,10 @@ def get_comments(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
+    # 获取当前用户屏蔽列表，过滤评论
+    from app.ws_manager import ws_manager
+    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+
     if parent_id is not None:
         # ========== 获取指定父评论的回复（分页） ==========
         parent_comment = db.query(Comment).filter(Comment.id == parent_id).first()
@@ -269,6 +280,8 @@ def get_comments(
             .filter(Comment.parent_id == parent_id)
             .order_by(Comment.created_at.asc())
         )
+        if blocked_ids:
+            replies_query = replies_query.filter(~Comment.user_id.in_(blocked_ids))
         total = replies_query.count()
         replies = replies_query.offset((page - 1) * per_page).limit(per_page).all()
         has_more = (page * per_page) < total
@@ -286,6 +299,8 @@ def get_comments(
         .filter(Comment.post_id == post_id, Comment.parent_id == None)
         .order_by(Comment.created_at.desc())
     )
+    if blocked_ids:
+        comments_query = comments_query.filter(~Comment.user_id.in_(blocked_ids))
     total = comments_query.count()
     comments = comments_query.offset((page - 1) * per_page).limit(per_page).all()
 
@@ -299,6 +314,9 @@ def get_comments(
             .order_by(Comment.parent_id, Comment.created_at.asc())
             .all()
         )
+        # 过滤已屏蔽用户的回复
+        if blocked_ids:
+            all_replies = [r for r in all_replies if r.user_id not in blocked_ids]
         for reply in all_replies:
             replies_by_parent.setdefault(reply.parent_id, []).append(reply)
 

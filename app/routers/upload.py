@@ -1,6 +1,7 @@
 """
 上传路由 - FastAPI 重构版
 """
+import os
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import RedirectResponse
@@ -115,6 +116,10 @@ def confirm_upload(
     """客户端上传完成后确认，重命名临时文件"""
     cos_key = payload.get("cos_key")
     final_filename = payload.get("final_filename")
+    # final_filename 为空时，用 cos_key 的原文件名兜底（cos_key 本身已是合法唯一路径）
+    if cos_key and not final_filename:
+        final_filename = os.path.basename(cos_key)
+        logger.info(f"[confirm] final_filename empty, falling back to cos_key basename: {final_filename}")
     logger.info(f"[confirm] user_id={user.id} cos_key={cos_key} final_filename={final_filename}")
     if not cos_key or not final_filename:
         raise HTTPException(status_code=400, detail="cos_key and final_filename are required")

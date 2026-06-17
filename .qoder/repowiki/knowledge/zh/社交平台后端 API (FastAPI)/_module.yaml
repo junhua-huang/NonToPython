@@ -1,0 +1,84 @@
+schema_version: 1
+module_path: ""
+title: 社交平台后端 API (FastAPI)
+scope:
+    - .gitignore
+    - requirements.txt
+    - openapi.json
+    - websocket_api.json
+    - comic_tables.sql
+    - error_analysis.md
+    - .env
+    - .idea\.gitignore
+    - .idea\NanTuPy.iml
+    - .idea\inspectionProfiles\profiles_settings.xml
+    - .idea\misc.xml
+    - .idea\modules.xml
+    - .idea\workspace.xml
+    - app.log
+    - app\__init__.py
+    - app\app.log
+    - app\core\__init__.py
+    - app\core\config.py
+    - app\core\config_production.py
+    - app\core\reset_password.py
+    - app\core\ssl_config.py
+    - app\database.py
+    - app\dependencies.py
+    - app\main.py
+    - app\models\__init__.py
+    - app\models\models.py
+    - app\routers\__init__.py
+    - app\routers\admin.py
+    - app\routers\auth.py
+    - app\routers\blocks.py
+    - app\routers\chat.py
+    - app\routers\comic.py
+    - app\routers\friends.py
+    - app\routers\health.py
+    - app\routers\interactions.py
+    - app\routers\notifications.py
+    - app\routers\posts.py
+    - app\routers\recommendations.py
+    - app\routers\reports.py
+    - app\routers\search.py
+    - app\routers\topics.py
+    - app\routers\upload.py
+    - app\routers\ws.py
+    - app\services\__init__.py
+    - app\services\content_filter.py
+    - app\services\content_moderation.py
+    - app\services\image_optimizer.py
+    - app\services\mention_service.py
+    - app\services\notification_service.py
+    - app\services\recommendation_service.py
+    - app\services\search_service.py
+    - app\services\topic_service.py
+    - app\utils.py
+    - app\ws_manager.py
+    - migrations\add_ws_protocol_tables.sql
+    - seed_comic_cities.sql
+    - server.log
+    - server_err.log
+    - server_out.log
+    - srv_err.log
+    - srv_out.log
+    - tests\README_TESTS.md
+    - tests\conftest.py
+    - tests\diagnose_search.py
+    - tests\diagnose_websocket.py
+    - tests\full_api_test.py
+    - tests\tempfile_1776786806641.bash
+    - tests\test_complete_api.py
+    - tests\test_email_search.py
+    - tests\test_empty_search.py
+    - tests\test_profile_upload.py
+    - tests\test_search_api.py
+    - tests\test_search_fix.py
+    - tests\test_upload.py
+    - tests\test_websocket.py
+    - tests\test_ws_connect.py
+    - tests\test_ws_simple.py
+source_files: []
+depends_on: []
+related_to: []

@@ -198,17 +198,17 @@ class TopicService:
 
     @staticmethod
     def get_trending_topics(db: Session, limit: int = 10):
-        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
         result = db.execute(
             text('''SELECT t.id, COUNT(pt.post_id) as recent_post_count
                 FROM topics t
                 JOIN post_topics pt ON t.id = pt.topic_id
                 JOIN posts p ON pt.post_id = p.id
-                WHERE p.created_at >= :seven_days_ago AND p.is_public = true
+                WHERE p.created_at >= :thirty_days_ago AND p.is_public = true
                 GROUP BY t.id
                 ORDER BY recent_post_count DESC
                 LIMIT :limit'''),
-            {'seven_days_ago': seven_days_ago, 'limit': limit}
+            {'thirty_days_ago': thirty_days_ago, 'limit': limit}
         )
         trending = []
         for row in result:

@@ -11,7 +11,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, get_optional_user
-from app.models.models import User
+from app.models.models import (
+    User, ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
+    ComicComment, ComicLike, ComicCommentLike,
+)
 
 router = APIRouter()
 
@@ -82,10 +85,8 @@ def get_events(
     data_sql = text(f"""
         SELECT e.id, e.name, e.start_date, e.end_date,
                e.venue, e.status, e.intro,
-               e.creator_id,
+               e.creator_id, e.like_count, e.comment_count,
                c.name AS city_name, c.id AS city_id,
-               (SELECT image_url FROM comic_event_images
-                WHERE event_id = e.id AND is_cover = 1 LIMIT 1) AS cover_image,
                (SELECT COUNT(*) FROM comic_event_follows WHERE event_id = e.id) AS follow_count,
                GROUP_CONCAT(DISTINCT t.name SEPARATOR ',') AS tag_names,
                u.username AS creator_name, u.avatar_url AS creator_avatar, e.created_at
@@ -105,37 +106,65 @@ def get_events(
 
     user_id = current_user.id if current_user else None
 
+    # 批量查询图片列表
+    event_ids = [r[0] for r in rows]
+    images_map: dict = {}
+    if event_ids:
+        imgs = db.query(ComicEventImage).filter(
+            ComicEventImage.event_id.in_(event_ids)
+        ).order_by(
+            ComicEventImage.event_id,
+            ComicEventImage.is_cover.desc(),
+            ComicEventImage.sort_order.asc()
+        ).all()
+        for img in imgs:
+            images_map.setdefault(img.event_id, []).append({
+                "id": img.id, "imageUrl": img.image_url,
+                "isCover": bool(img.is_cover), "sortOrder": img.sort_order,
+            })
+
     records = []
     for r in rows:
-        tags = [t.strip() for t in (r[12] or '').split(',') if t.strip()]
+        event_id = r[0]
+        tags = [t.strip() for t in (r[13] or '').split(',') if t.strip()]
         creator_id = r[7]
         is_owner = (user_id is not None and creator_id == user_id)
         is_followed = False
         if user_id is not None:
             fo = db.execute(
                 text("SELECT 1 FROM comic_event_follows WHERE event_id = :eid AND user_id = :uid"),
-                {'eid': r[0], 'uid': user_id}
+                {'eid': event_id, 'uid': user_id}
             ).first()
             is_followed = fo is not None
 
+        images = images_map.get(event_id, [])
+        cover_image = next((i["imageUrl"] for i in images if i["isCover"]), None) \
+                  or (images[0]["imageUrl"] if images else None)
+
+        # 实时重算状态（数据库里的 status 是创建时算的，不会随时间更新）
+        real_status, real_status_text = _recalc_status_text(r[2], r[3])
+
         records.append({
-            'id': r[0],
+            'id': event_id,
             'name': r[1],
             'startDate': r[2].strftime('%Y-%m-%d') if r[2] else None,
             'endDate': r[3].strftime('%Y-%m-%d') if r[3] else None,
             'venue': r[4] or '',
-            'status': r[5],
-            'statusText': {0: '即将开始', 1: '进行中', 2: '已结束'}.get(r[5], ''),
-            'cityName': r[8] or '',
-            'cityId': r[9],
-            'coverImage': r[10],
-            'followCount': r[11] or 0,
+            'status': real_status,
+            'statusText': real_status_text,
+            'cityName': r[10] or '',
+            'cityId': r[11],
+            'likeCount': r[8] or 0,
+            'commentCount': r[9] or 0,
+            'followCount': r[12] or 0,
+            'coverImage': cover_image,
+            'images': images,
             'tags': tags,
             'isOwner': is_owner,
             'isFollowed': is_followed,
-            'creatorName': r[13],
-            'creatorAvatar': r[14],
-            'createdAt': r[15].strftime('%Y-%m-%dT%H:%M:%S') if r[15] else None,
+            'creatorName': r[14],
+            'creatorAvatar': r[15],
+            'createdAt': r[16].strftime('%Y-%m-%dT%H:%M:%S') if r[16] else None,
         })
 
     pages = (total + size - 1) // size if total > 0 else 0
@@ -163,6 +192,7 @@ def get_event_detail(
                e.ticket_info, e.website, e.intro, e.status,
                c.name AS city_name,
                (SELECT COUNT(*) FROM comic_event_follows WHERE event_id = e.id) AS follow_count,
+               e.like_count, e.comment_count,
                GROUP_CONCAT(DISTINCT t.name SEPARATOR ',') AS tag_names,
                u.username AS creator_name, u.avatar_url AS creator_avatar, e.created_at
         FROM comic_events e
@@ -177,7 +207,7 @@ def get_event_detail(
     if not row:
         raise HTTPException(status_code=404, detail='漫展不存在')
 
-    tags = [t.strip() for t in (row[14] or '').split(',') if t.strip()]
+    tags = [t.strip() for t in (row[16] or '').split(',') if t.strip()]
 
     # 图片列表
     img_sql = text("""
@@ -195,6 +225,7 @@ def get_event_detail(
 
     is_followed = False
     is_owner = False
+    is_liked = False
     if user_id:
         fo = db.execute(
             text("SELECT 1 FROM comic_event_follows WHERE event_id = :eid AND user_id = :uid"),
@@ -207,6 +238,14 @@ def get_event_detail(
             {'eid': event_id, 'uid': user_id}
         ).first()
         is_owner = ow is not None
+
+        lk = db.query(ComicLike).filter(
+            ComicLike.event_id == event_id, ComicLike.user_id == user_id
+        ).first()
+        is_liked = lk is not None
+
+    # 实时重算状态（数据库里的 status 是创建时算的，不会随时间更新）
+    real_status, real_status_text = _recalc_status_text(row[4], row[5])
 
     return {
         'id': row[0],
@@ -221,17 +260,20 @@ def get_event_detail(
         'ticketInfo': row[8],
         'website': row[9],
         'intro': row[10],
-        'status': row[11],
-        'statusText': {0: '即将开始', 1: '进行中', 2: '已结束'}.get(row[11], ''),
+        'status': real_status,
+        'statusText': real_status_text,
         'coverImage': cover,
         'followCount': row[13] or 0,
+        'likeCount': row[14] or 0,
+        'commentCount': row[15] or 0,
         'isFollowed': is_followed,
+        'isLiked': is_liked,
         'isOwner': is_owner,
         'tags': tags,
         'images': images,
-        'creatorName': row[15],
-        'creatorAvatar': row[16],
-        'createdAt': row[17].strftime('%Y-%m-%dT%H:%M:%S') if row[17] else None,
+        'creatorName': row[17],
+        'creatorAvatar': row[18],
+        'createdAt': row[19].strftime('%Y-%m-%dT%H:%M:%S') if row[19] else None,
     }
 
 
@@ -250,11 +292,26 @@ def _parse_tags(tag_ids) -> List[int]:
     return []
 
 
-def _calc_status(start_date: str, end_date: str) -> int:
-    """根据日期计算漫展状态"""
+def _calc_status(start_date, end_date) -> int:
+    """根据日期计算漫展状态
+
+    兼容 str（'YYYY-MM-DD'）与 date 对象两种输入。
+    """
+    def _to_date(val):
+        if val is None or val == '':
+            return None
+        if isinstance(val, date_cls):
+            return val
+        if isinstance(val, datetime):
+            return val.date()
+        try:
+            return datetime.strptime(str(val), '%Y-%m-%d').date()
+        except Exception:
+            return None
+
     try:
-        sd = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
-        ed = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
+        sd = _to_date(start_date)
+        ed = _to_date(end_date)
         today = date_cls.today()
         if sd and ed:
             if today < sd:
@@ -263,9 +320,26 @@ def _calc_status(start_date: str, end_date: str) -> int:
                 return 1
             else:
                 return 2
+        if sd and today < sd:
+            return 0
+        if sd and today >= sd:
+            return 2
     except Exception:
         pass
     return 0
+
+
+_STATUS_TEXT_MAP = {0: '即将开始', 1: '进行中', 2: '已结束'}
+
+
+def _recalc_status_text(start_date, end_date):
+    """根据当前日期实时重算 (status, statusText)。
+
+    漫展创建时只计算一次 status 存入数据库，之后不会自动更新。
+    列表/详情接口返回前调用本函数，确保状态标签随时间正确变化。
+    """
+    status = _calc_status(start_date, end_date)
+    return status, _STATUS_TEXT_MAP.get(status, '')
 
 
 @router.post("/events", status_code=201)
@@ -476,10 +550,8 @@ def get_my_events(
 
     data_sql = text("""
         SELECT e.id, e.name, e.start_date, e.end_date,
-               e.venue, e.status, e.intro,
+               e.venue, e.status, e.intro, e.like_count, e.comment_count,
                c.name AS city_name, c.id AS city_id,
-               (SELECT image_url FROM comic_event_images
-                WHERE event_id = e.id AND is_cover = 1 LIMIT 1) AS cover_image,
                (SELECT COUNT(*) FROM comic_event_follows WHERE event_id = e.id) AS follow_count,
                GROUP_CONCAT(DISTINCT t.name SEPARATOR ',') AS tag_names,
                u.username AS creator_name, u.avatar_url AS creator_avatar, e.created_at
@@ -497,31 +569,60 @@ def get_my_events(
         'uid': user.id, 'size': size, 'offset': offset
     }).fetchall()
 
+    # 批量查询图片列表
+    event_ids = [r[0] for r in rows]
+    images_map: dict = {}
+    if event_ids:
+        imgs = db.query(ComicEventImage).filter(
+            ComicEventImage.event_id.in_(event_ids)
+        ).order_by(
+            ComicEventImage.event_id,
+            ComicEventImage.is_cover.desc(),
+            ComicEventImage.sort_order.asc()
+        ).all()
+        for img in imgs:
+            images_map.setdefault(img.event_id, []).append({
+                "id": img.id, "imageUrl": img.image_url,
+                "isCover": bool(img.is_cover), "sortOrder": img.sort_order,
+            })
+
     records = []
     for r in rows:
-        tags = [t.strip() for t in (r[11] or '').split(',') if t.strip()]
+        event_id = r[0]
+        tags = [t.strip() for t in (r[12] or '').split(',') if t.strip()]
         fo = db.execute(
             text("SELECT 1 FROM comic_event_follows WHERE event_id = :eid AND user_id = :uid"),
-            {'eid': r[0], 'uid': user.id}
+            {'eid': event_id, 'uid': user.id}
         ).first()
+
+        images = images_map.get(event_id, [])
+        cover_image = next((i["imageUrl"] for i in images if i["isCover"]), None) \
+                  or (images[0]["imageUrl"] if images else None)
+
+        # 实时重算状态
+        real_status, real_status_text = _recalc_status_text(r[2], r[3])
+
         records.append({
-            'id': r[0],
+            'id': event_id,
             'name': r[1],
             'startDate': r[2].strftime('%Y-%m-%d') if r[2] else None,
             'endDate': r[3].strftime('%Y-%m-%d') if r[3] else None,
             'venue': r[4] or '',
-            'status': r[5],
-            'statusText': {0: '即将开始', 1: '进行中', 2: '已结束'}.get(r[5], ''),
-            'cityName': r[7] or '',
-            'cityId': r[8],
-            'coverImage': r[9],
-            'followCount': r[10] or 0,
+            'status': real_status,
+            'statusText': real_status_text,
+            'cityName': r[9] or '',
+            'cityId': r[10],
+            'likeCount': r[7] or 0,
+            'commentCount': r[8] or 0,
+            'followCount': r[11] or 0,
+            'coverImage': cover_image,
+            'images': images,
             'tags': tags,
             'isOwner': True,
             'isFollowed': fo is not None,
-            'creatorName': r[12],
-            'creatorAvatar': r[13],
-            'createdAt': r[14].strftime('%Y-%m-%dT%H:%M:%S') if r[14] else None,
+            'creatorName': r[13],
+            'creatorAvatar': r[14],
+            'createdAt': r[15].strftime('%Y-%m-%dT%H:%M:%S') if r[15] else None,
         })
 
     pages = (total + size - 1) // size if total > 0 else 0
@@ -559,11 +660,9 @@ def get_my_followed(
 
     data_sql = text("""
         SELECT e.id, e.name, e.start_date, e.end_date,
-               e.venue, e.status, e.intro,
+               e.venue, e.status, e.intro, e.like_count, e.comment_count,
                e.creator_id,
                c.name AS city_name, c.id AS city_id,
-               (SELECT image_url FROM comic_event_images
-                WHERE event_id = e.id AND is_cover = 1 LIMIT 1) AS cover_image,
                (SELECT COUNT(*) FROM comic_event_follows WHERE event_id = e.id) AS follow_count,
                GROUP_CONCAT(DISTINCT t.name SEPARATOR ',') AS tag_names,
                u.username AS creator_name, u.avatar_url AS creator_avatar, e.created_at
@@ -582,27 +681,56 @@ def get_my_followed(
         'uid': user.id, 'size': size, 'offset': offset
     }).fetchall()
 
+    # 批量查询图片列表
+    event_ids = [r[0] for r in rows]
+    images_map: dict = {}
+    if event_ids:
+        imgs = db.query(ComicEventImage).filter(
+            ComicEventImage.event_id.in_(event_ids)
+        ).order_by(
+            ComicEventImage.event_id,
+            ComicEventImage.is_cover.desc(),
+            ComicEventImage.sort_order.asc()
+        ).all()
+        for img in imgs:
+            images_map.setdefault(img.event_id, []).append({
+                "id": img.id, "imageUrl": img.image_url,
+                "isCover": bool(img.is_cover), "sortOrder": img.sort_order,
+            })
+
     records = []
     for r in rows:
-        tags = [t.strip() for t in (r[12] or '').split(',') if t.strip()]
+        event_id = r[0]
+        tags = [t.strip() for t in (r[13] or '').split(',') if t.strip()]
+
+        images = images_map.get(event_id, [])
+        cover_image = next((i["imageUrl"] for i in images if i["isCover"]), None) \
+                  or (images[0]["imageUrl"] if images else None)
+
+        # 实时重算状态
+        real_status, real_status_text = _recalc_status_text(r[2], r[3])
+
         records.append({
-            'id': r[0],
+            'id': event_id,
             'name': r[1],
             'startDate': r[2].strftime('%Y-%m-%d') if r[2] else None,
             'endDate': r[3].strftime('%Y-%m-%d') if r[3] else None,
             'venue': r[4] or '',
-            'status': r[5],
-            'statusText': {0: '即将开始', 1: '进行中', 2: '已结束'}.get(r[5], ''),
-            'cityName': r[8] or '',
-            'cityId': r[9],
-            'coverImage': r[10],
-            'followCount': r[11] or 0,
+            'status': real_status,
+            'statusText': real_status_text,
+            'cityName': r[10] or '',
+            'cityId': r[11],
+            'likeCount': r[7] or 0,
+            'commentCount': r[8] or 0,
+            'followCount': r[12] or 0,
+            'coverImage': cover_image,
+            'images': images,
             'tags': tags,
             'isFollowed': True,
-            'isOwner': r[7] == user.id,
-            'creatorName': r[13],
-            'creatorAvatar': r[14],
-            'createdAt': r[15].strftime('%Y-%m-%dT%H:%M:%S') if r[15] else None,
+            'isOwner': r[9] == user.id,
+            'creatorName': r[14],
+            'creatorAvatar': r[15],
+            'createdAt': r[16].strftime('%Y-%m-%dT%H:%M:%S') if r[16] else None,
         })
 
     pages = (total + size - 1) // size if total > 0 else 0
@@ -614,218 +742,278 @@ def get_my_followed(
         'pages': pages,
     }
 # ============================================================
-# 漫展评论 API
+# 漫展评论 + 点赞 API（ORM 版）
 # ============================================================
 
-def _ensure_comic_comments_table(db: Session):
-    """确保 comic_comments 表存在"""
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS comic_comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            event_id INTEGER NOT NULL,
-            parent_id INTEGER,
-            reply_to_user_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (event_id) REFERENCES comic_events(id),
-            FOREIGN KEY (parent_id) REFERENCES comic_comments(id),
-            FOREIGN KEY (reply_to_user_id) REFERENCES users(id)
+@router.get("/events/{event_id}/comments")
+def get_comic_comments(
+    event_id: int,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_optional_user),
+):
+    """获取漫展一级评论（分页），含前3条子回复"""
+    # 验证漫展存在
+    ev = db.query(ComicEvent).filter(ComicEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="漫展不存在")
+
+    uid = current_user.id if current_user else None
+    offset = (page - 1) * size
+
+    total = db.query(ComicComment).filter(
+        ComicComment.event_id == event_id,
+        ComicComment.parent_id.is_(None),
+    ).count()
+
+    comments = (
+        db.query(ComicComment)
+        .filter(ComicComment.event_id == event_id, ComicComment.parent_id.is_(None))
+        .order_by(ComicComment.created_at.desc())
+        .offset(offset)
+        .limit(size)
+        .all()
+    )
+
+    result = []
+    for c in comments:
+        d = c.to_dict()
+        # 预取前3条子回复
+        top_replies = (
+            db.query(ComicComment)
+            .filter(ComicComment.parent_id == c.id)
+            .order_by(ComicComment.created_at.asc())
+            .limit(3)
+            .all()
         )
-    """))
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS comic_comment_likes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            comment_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (comment_id) REFERENCES comic_comments(id),
-            UNIQUE(user_id, comment_id)
-        )
-    """))
+        d["replies"] = [r.to_dict() for r in top_replies]
+        if c.reply_count > 3:
+            d["replies_has_more"] = True
+        result.append(d)
+
+    result = _comic_batch_enrich(db, result, uid)
+    pages = (total + size - 1) // size if total > 0 else 0
+    return {"comments": result, "total": total, "page": page, "size": size, "pages": pages}
+
+
+@router.post("/events/{event_id}/comments", status_code=201)
+def post_comic_comment(
+    event_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """发表漫展评论 / 回复"""
+    ev = db.query(ComicEvent).filter(ComicEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="漫展不存在")
+
+    content = (payload.get("content") or "").strip()
+    parent_id = payload.get("parentId") or payload.get("parent_id")
+    reply_to_user_id = payload.get("replyToUserId") or payload.get("reply_to_user_id")
+
+    if not content or len(content) > 2000:
+        raise HTTPException(status_code=400, detail="评论内容不能为空且不超过2000字")
+
+    if parent_id:
+        parent = db.query(ComicComment).filter(ComicComment.id == parent_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="父评论不存在")
+        parent.reply_count += 1
+
+    comment = ComicComment(
+        content=content,
+        user_id=current_user.id,
+        event_id=event_id,
+        parent_id=parent_id,
+        reply_to_user_id=reply_to_user_id,
+    )
+    db.add(comment)
+    ev.comment_count += 1
     db.commit()
+    db.refresh(comment)
+
+    enriched = _comic_batch_enrich(db, [comment.to_dict()], current_user.id)
+    return {"comment": enriched[0]}
 
 
-def _comic_comment_batch_enrich(db: Session, all_comments: list, current_user_id: int | None) -> list:
-    """批量 enrich 漫展评论：收集所有 comment_id → 4 次聚合查询替代逐条 N*4 查询"""
+@router.delete("/events/comments/{comment_id}")
+def delete_comic_comment(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除漫展评论"""
+    comment = db.query(ComicComment).filter(ComicComment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="评论不存在")
+    if comment.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权限")
+
+    # 更新漫展评论计数
+    ev = db.query(ComicEvent).filter(ComicEvent.id == comment.event_id).first()
+    if ev and ev.comment_count > 0:
+        ev.comment_count -= 1
+
+    # 删除关联点赞
+    db.query(ComicCommentLike).filter(ComicCommentLike.comment_id == comment_id).delete()
+    # 删除子回复
+    db.query(ComicComment).filter(ComicComment.parent_id == comment_id).delete()
+
+    db.delete(comment)
+    db.commit()
+    return {"message": "ok"}
+
+
+@router.get("/events/comments/{comment_id}/replies")
+def get_comic_comment_replies(
+    comment_id: int,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_optional_user),
+):
+    """获取漫展评论子回复（分页）"""
+    uid = current_user.id if current_user else None
+    offset = (page - 1) * size
+
+    total = db.query(ComicComment).filter(ComicComment.parent_id == comment_id).count()
+    replies = (
+        db.query(ComicComment)
+        .filter(ComicComment.parent_id == comment_id)
+        .order_by(ComicComment.created_at.asc())
+        .offset(offset)
+        .limit(size)
+        .all()
+    )
+
+    result = [r.to_dict() for r in replies]
+    result = _comic_batch_enrich(db, result, uid)
+    return {"replies": result, "total": total, "page": page, "size": size}
+
+
+@router.post("/events/comments/{comment_id}/like")
+def toggle_comic_comment_like(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """点赞/取消点赞漫展评论"""
+    comment = db.query(ComicComment).filter(ComicComment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="评论不存在")
+
+    existing = db.query(ComicCommentLike).filter(
+        ComicCommentLike.comment_id == comment_id,
+        ComicCommentLike.user_id == current_user.id,
+    ).first()
+
+    if existing:
+        db.delete(existing)
+        if comment.like_count > 0:
+            comment.like_count -= 1
+        db.commit()
+        return {"is_liked": False, "like_count": comment.like_count}
+    else:
+        like = ComicCommentLike(user_id=current_user.id, comment_id=comment_id)
+        db.add(like)
+        comment.like_count += 1
+        db.commit()
+        return {"is_liked": True, "like_count": comment.like_count}
+
+
+@router.post("/events/{event_id}/like")
+def toggle_comic_event_like(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """点赞/取消点赞漫展"""
+    ev = db.query(ComicEvent).filter(ComicEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="漫展不存在")
+
+    existing = db.query(ComicLike).filter(
+        ComicLike.event_id == event_id,
+        ComicLike.user_id == current_user.id,
+    ).first()
+
+    if existing:
+        db.delete(existing)
+        if ev.like_count > 0:
+            ev.like_count -= 1
+        db.commit()
+        return {"is_liked": False, "like_count": ev.like_count}
+    else:
+        like = ComicLike(user_id=current_user.id, event_id=event_id)
+        db.add(like)
+        ev.like_count += 1
+        db.commit()
+        return {"is_liked": True, "like_count": ev.like_count}
+
+
+# — 批量 enrich 工具 —
+
+def _comic_batch_enrich(db: Session, all_comments: list, current_user_id: int | None) -> list:
+    """批量填充评论的 user / like_count / is_liked / reply_count"""
     if not all_comments:
         return []
 
-    # 展平嵌套的 replies
+    # 展平嵌套 replies
     flat = []
     for c in all_comments:
         flat.append(c)
-        if c.get('replies'):
-            flat.extend(c['replies'])
+        if c.get("replies"):
+            flat.extend(c["replies"])
 
     if not flat:
         return all_comments
 
-    comment_ids = [c['id'] for c in flat]
-    user_ids = set(c['user_id'] for c in flat)
-    reply_to_user_ids = set(c.get('reply_to_user_id') for c in flat if c.get('reply_to_user_id'))
-    all_user_ids = user_ids | reply_to_user_ids
+    comment_ids = [c["id"] for c in flat]
+    user_ids = {c["user_id"] for c in flat}
+    reply_to_ids = {c.get("reply_to_user_id") for c in flat if c.get("reply_to_user_id")}
+    all_user_ids = list(user_ids | reply_to_ids)
 
-    # 1. 批量加载用户
+    # 1. 用户
     user_map = {}
     if all_user_ids:
-        uid_list = list(all_user_ids)
-        placeholders = ','.join([f':uid{i}' for i in range(len(uid_list))])
-        params = {f'uid{i}': uid for i, uid in enumerate(uid_list)}
-        users = db.execute(text(
-            f"SELECT id, username, display_name, avatar FROM users WHERE id IN ({placeholders})"
-        ), params).mappings().all()
-        user_map = {u['id']: dict(u) for u in users}
+        users = db.query(User).filter(User.id.in_(all_user_ids)).all()
+        user_map = {u.id: u.to_dict() for u in users}
 
-    # 2. 批量 like_count
-    like_count_map = {}
+    # 2. like_count
+    like_count_map: dict = {}
     if comment_ids:
-        cid_list = list(comment_ids)
-        placeholders = ','.join([f':cid{i}' for i in range(len(cid_list))])
-        params = {f'cid{i}': cid for i, cid in enumerate(cid_list)}
-        lcs = db.execute(text(
-            f"SELECT comment_id, COUNT(*) as cnt FROM comic_comment_likes WHERE comment_id IN ({placeholders}) GROUP BY comment_id"
-        ), params).mappings().all()
-        like_count_map = {lc['comment_id']: lc['cnt'] for lc in lcs}
+        rows = db.execute(text(
+            "SELECT comment_id, COUNT(*) AS cnt FROM comic_comment_likes "
+            "WHERE comment_id IN :cids GROUP BY comment_id"
+        ), {"cids": tuple(comment_ids)}).fetchall()
+        like_count_map = {r[0]: r[1] for r in rows}
 
-    # 3. 批量 is_liked
-    liked_set = set()
+    # 3. is_liked
+    liked_set: set = set()
     if comment_ids and current_user_id:
-        cid_list = list(comment_ids)
-        placeholders = ','.join([f':cid{i}' for i in range(len(cid_list))])
-        params = {f'cid{i}': cid for i, cid in enumerate(cid_list)}
-        params['uid'] = current_user_id
-        liked_rows = db.execute(text(
-            f"SELECT comment_id FROM comic_comment_likes WHERE comment_id IN ({placeholders}) AND user_id=:uid"
-        ), params).mappings().all()
-        liked_set = {r['comment_id'] for r in liked_rows}
+        rows = db.execute(text(
+            "SELECT comment_id FROM comic_comment_likes "
+            "WHERE comment_id IN :cids AND user_id = :uid"
+        ), {"cids": tuple(comment_ids), "uid": current_user_id}).fetchall()
+        liked_set = {r[0] for r in rows}
 
-    # 4. 批量 reply_count
-    reply_count_map = {}
+    # 4. reply_count
+    reply_count_map: dict = {}
     if comment_ids:
-        cid_list = list(comment_ids)
-        placeholders = ','.join([f':cid{i}' for i in range(len(cid_list))])
-        params = {f'cid{i}': cid for i, cid in enumerate(cid_list)}
-        rcs = db.execute(text(
-            f"SELECT parent_id, COUNT(*) as cnt FROM comic_comments WHERE parent_id IN ({placeholders}) GROUP BY parent_id"
-        ), params).mappings().all()
-        reply_count_map = {rc['parent_id']: rc['cnt'] for rc in rcs}
+        rows = db.execute(text(
+            "SELECT parent_id, COUNT(*) AS cnt FROM comic_comments "
+            "WHERE parent_id IN :cids GROUP BY parent_id"
+        ), {"cids": tuple(comment_ids)}).fetchall()
+        reply_count_map = {r[0]: r[1] for r in rows}
 
-    # 填充字段
     for c in flat:
-        c['user'] = user_map.get(c['user_id'])
-        c['reply_to_user'] = user_map.get(c.get('reply_to_user_id')) if c.get('reply_to_user_id') else None
-        c['like_count'] = like_count_map.get(c['id'], 0)
-        c['is_liked'] = c['id'] in liked_set
-        c['reply_count'] = reply_count_map.get(c['id'], 0)
-        c['target_type'] = 'comic'
+        c["user"] = user_map.get(c["user_id"])
+        c["like_count"] = like_count_map.get(c["id"], 0)
+        c["is_liked"] = c["id"] in liked_set
+        c["reply_count"] = reply_count_map.get(c["id"], 0)
+        if c.get("reply_to_user_id"):
+            c["reply_to_user"] = user_map.get(c["reply_to_user_id"])
 
     return all_comments
-
-
-@router.get("/events/{event_id}/comments")
-def get_comic_comments(event_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100),
-                       db: Session = Depends(get_db), current_user: User = Depends(get_optional_user)):
-    """获取漫展评论"""
-    _ensure_comic_comments_table(db)
-    uid = current_user.id if current_user else None
-    offset = (page - 1) * size
-    total = db.execute(text(
-        "SELECT COUNT(*) as cnt FROM comic_comments WHERE event_id=:eid AND parent_id IS NULL"
-    ), {'eid': event_id}).mappings().first()['cnt']
-    rows = db.execute(text("""
-        SELECT * FROM comic_comments
-        WHERE event_id=:eid AND parent_id IS NULL
-        ORDER BY created_at DESC
-        LIMIT :lim OFFSET :off
-    """), {'eid': event_id, 'lim': size, 'off': offset}).mappings().all()
-    comments = [dict(r) for r in rows]
-    for c in comments:
-        subs = db.execute(text(
-            "SELECT * FROM comic_comments WHERE parent_id=:pid ORDER BY created_at ASC LIMIT 3"
-        ), {'pid': c['id']}).mappings().all()
-        c['replies'] = [dict(s) for s in subs]
-    comments = _comic_comment_batch_enrich(db, comments, uid)
-    pages = (total + size - 1) // size if total > 0 else 0
-    return {'comments': comments, 'total': total, 'page': page, 'size': size, 'pages': pages}
-
-
-@router.post("/events/{event_id}/comments")
-def post_comic_comment(event_id: int, content: str = Body(..., embed=True),
-                       parent_id: int | None = Body(None, embed=True),
-                       reply_to_user_id: int | None = Body(None, embed=True),
-                       db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """发表漫展评论"""
-    _ensure_comic_comments_table(db)
-    content = content.strip()
-    if not content or len(content) > 2000:
-        raise HTTPException(status_code=400, detail="评论内容不能为空且不超过2000字")
-    db.execute(text("""
-        INSERT INTO comic_comments (content, user_id, event_id, parent_id, reply_to_user_id)
-        VALUES (:content, :uid, :eid, :pid, :ruid)
-    """), {'content': content, 'uid': current_user.id, 'eid': event_id,
-           'pid': parent_id, 'ruid': reply_to_user_id})
-    db.commit()
-    cid = db.execute(text("SELECT last_insert_rowid()")).scalar()
-    row = db.execute(text("SELECT * FROM comic_comments WHERE id=:id"), {'id': cid}).mappings().first()
-    result = dict(row)
-    enriched = _comic_comment_enrich(db, [result], current_user.id)
-    return {'comment': enriched[0]}
-
-
-@router.delete("/events/comments/{comment_id}")
-def delete_comic_comment(comment_id: int, db: Session = Depends(get_db),
-                         current_user: User = Depends(get_current_user)):
-    """删除漫展评论"""
-    _ensure_comic_comments_table(db)
-    row = db.execute(text("SELECT user_id FROM comic_comments WHERE id=:id"), {'id': comment_id}).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="评论不存在")
-    if row[0] != current_user.id:
-        raise HTTPException(status_code=403, detail="无权限")
-    db.execute(text("DELETE FROM comic_comment_likes WHERE comment_id=:id"), {'id': comment_id})
-    db.execute(text("DELETE FROM comic_comments WHERE id=:id"), {'id': comment_id})
-    db.commit()
-    return {'message': 'ok'}
-
-
-@router.post("/events/comments/{comment_id}/like")
-def like_comic_comment(comment_id: int, db: Session = Depends(get_db),
-                       current_user: User = Depends(get_current_user)):
-    """点赞/取消点赞漫展评论"""
-    _ensure_comic_comments_table(db)
-    existing = db.execute(text(
-        "SELECT id FROM comic_comment_likes WHERE comment_id=:cid AND user_id=:uid"
-    ), {'cid': comment_id, 'uid': current_user.id}).first()
-    if existing:
-        db.execute(text("DELETE FROM comic_comment_likes WHERE id=:id"), {'id': existing[0]})
-        db.commit()
-        return {'message': 'unliked', 'is_liked': False}
-    else:
-        db.execute(text(
-            "INSERT INTO comic_comment_likes (user_id, comment_id) VALUES (:uid, :cid)"
-        ), {'uid': current_user.id, 'cid': comment_id})
-        db.commit()
-        return {'message': 'liked', 'is_liked': True}
-
-
-@router.get("/events/comments/{comment_id}/replies")
-def get_comic_comment_replies(comment_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100),
-                              db: Session = Depends(get_db), current_user: User = Depends(get_optional_user)):
-    """获取漫展评论子回复"""
-    _ensure_comic_comments_table(db)
-    uid = current_user.id if current_user else None
-    offset = (page - 1) * size
-    total = db.execute(text(
-        "SELECT COUNT(*) as cnt FROM comic_comments WHERE parent_id=:pid"
-    ), {'pid': comment_id}).mappings().first()['cnt']
-    rows = db.execute(text("""
-        SELECT * FROM comic_comments WHERE parent_id=:pid
-        ORDER BY created_at ASC LIMIT :lim OFFSET :off
-    """), {'pid': comment_id, 'lim': size, 'off': offset}).mappings().all()
-    replies = [dict(r) for r in rows]
-    replies = _comic_comment_enrich(db, replies, uid)
-    return {'replies': replies, 'total': total, 'page': page, 'size': size}

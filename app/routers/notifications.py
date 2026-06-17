@@ -3,6 +3,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -21,7 +22,16 @@ def get_notifications(
     db: Session = Depends(get_db),
 ):
     """获取当前用户的通知列表"""
+    # 屏蔽检查：过滤已屏蔽用户发送的通知
+    from app.ws_manager import ws_manager
+    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+
     query = db.query(Notification).filter(Notification.user_id == user.id)
+    if blocked_ids:
+        query = query.filter(or_(
+            Notification.sender_id == None,
+            ~Notification.sender_id.in_(blocked_ids),
+        ))
     if unread_only:
         query = query.filter(Notification.is_read == False)
     query = query.order_by(Notification.created_at.desc())
@@ -30,6 +40,19 @@ def get_notifications(
     notifications = query.offset((page - 1) * per_page).limit(per_page).all()
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
+    # 批量查询发送者信息（避免 N+1）
+    sender_ids = list({n.sender_id for n in notifications if n.sender_id})
+    senders = {}
+    if sender_ids:
+        sender_users = db.query(User).filter(User.id.in_(sender_ids)).all()
+        senders = {
+            u.id: {
+                "username": u.username,
+                "avatar_url": u.avatar_url,
+            }
+            for u in sender_users
+        }
+
     unread_count = (
         db.query(Notification)
         .filter(Notification.user_id == user.id, Notification.is_read == False)
@@ -37,7 +60,10 @@ def get_notifications(
     )
 
     return {
-        "notifications": [n.to_dict() for n in notifications],
+        "notifications": [
+            {**n.to_dict(), "sender": senders.get(n.sender_id) if n.sender_id else None}
+            for n in notifications
+        ],
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -53,11 +79,15 @@ def get_unread_count(
     db: Session = Depends(get_db),
 ):
     """获取未读通知数量"""
-    count = (
-        db.query(Notification)
-        .filter(Notification.user_id == user.id, Notification.is_read == False)
-        .count()
-    )
+    from app.ws_manager import ws_manager
+    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+    query = db.query(Notification).filter(Notification.user_id == user.id, Notification.is_read == False)
+    if blocked_ids:
+        query = query.filter(or_(
+            Notification.sender_id == None,
+            ~Notification.sender_id.in_(blocked_ids),
+        ))
+    count = query.count()
     return {"unread_count": count}
 
 
@@ -84,12 +114,12 @@ async def mark_as_read(
             .filter(Notification.user_id == user.id, Notification.is_read == False)
             .count()
         )
-        await ws_manager.send(user.id, {
-            "type": "notifications_read",
+        await ws_manager.send_with_seq(user.id, "notifications_read", {
+            "notification_ids": [notification_id],
             "unread_count": unread_count,
         })
 
-        return {"message": "Notification marked as read", "notification": notification.to_dict()}
+        return {"message": "Notification marked as read", "notification": notification.to_dict(), "unread_count": unread_count}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -108,12 +138,11 @@ async def mark_all_as_read(
         db.commit()
 
         # --- WebSocket 实时推送 ---
-        await ws_manager.send(user.id, {
-            "type": "notifications_read",
+        await ws_manager.send_with_seq(user.id, "notifications_read", {
             "unread_count": 0,
         })
 
-        return {"message": "All notifications marked as read"}
+        return {"message": "All notifications marked as read", "unread_count": 0}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

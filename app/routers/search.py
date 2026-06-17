@@ -3,15 +3,261 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import case, or_
+from sqlalchemy import case, or_, func, text
+import json
 from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Post, Friendship, SearchHistory, Topic
+from app.models.models import (
+    User, Post, Friendship, SearchHistory, Topic,
+    Like, Comment, post_topics,
+    ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
+)
 from app.services.search_service import SearchService
 
 router = APIRouter()
+
+
+# ============================================================
+# 特殊关键词处理
+# ============================================================
+
+def _handle_special_query(db: Session, query: str, page: int, per_page: int, user_id: int):
+    """检测特殊搜索关键词，返回对应数据；不匹配则返回 None"""
+
+    if query in ("热门帖子", "热门贴子"):
+        return _hot_posts(db, page, per_page)
+
+    if query in ("话题趋势", "热门话题"):
+        return _trending_topics(db, page, per_page)
+
+    if query in ("近期漫展", "最近漫展"):
+        return _comic_events(db, page, per_page, user_id)
+
+    return None
+
+
+def _hot_posts(db: Session, page: int, per_page: int):
+    """7天内热度最高的帖子 Top 10
+    热度 = 浏览量 + 点赞数×3 + 评论数×2
+    """
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    rows = db.execute(text("""
+        SELECT p.id, p.content, p.images, p.video_url, p.post_type,
+               p.user_id, p.created_at, p.updated_at, p.visibility,
+               p.is_public, p.view_count,
+               COALESCE(l.like_count, 0) AS like_count,
+               COALESCE(c.comment_count, 0) AS comment_count,
+               (p.view_count + COALESCE(l.like_count, 0) * 3 + COALESCE(c.comment_count, 0) * 2) AS hot_score
+        FROM posts p
+        LEFT JOIN (
+            SELECT post_id, COUNT(*) AS like_count FROM likes GROUP BY post_id
+        ) l ON p.id = l.post_id
+        LEFT JOIN (
+            SELECT post_id, COUNT(*) AS comment_count FROM comments GROUP BY post_id
+        ) c ON p.id = c.post_id
+        WHERE p.created_at >= :since AND p.is_public = 1
+        ORDER BY hot_score DESC
+        LIMIT :limit
+    """), {"since": seven_days_ago, "limit": per_page}).fetchall()
+
+    # 批量取用户信息
+    user_ids = {r.user_id for r in rows}
+    users_map = {}
+    if user_ids:
+        users_map = {u.id: u.to_dict() for u in db.query(User).filter(User.id.in_(user_ids)).all()}
+
+    posts = []
+    for r in rows:
+        images = r.images
+        if isinstance(images, str):
+            try:
+                images = json.loads(images)
+            except (json.JSONDecodeError, TypeError):
+                images = []
+        posts.append({
+            "id": r.id,
+            "content": r.content,
+            "images": images,
+            "video_url": r.video_url,
+            "post_type": r.post_type,
+            "user_id": r.user_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            "visibility": r.visibility,
+            "is_public": r.is_public,
+            "view_count": r.view_count,
+            "like_count": r.like_count,
+            "comment_count": r.comment_count,
+            "hot_score": int(r.hot_score) if r.hot_score else 0,
+            "author": users_map.get(r.user_id),
+        })
+
+    return {
+        "query": "热门帖子",
+        "type": "hot_posts",
+        "period": "7天",
+        "posts": posts,
+        "total": len(posts),
+        "current_page": page,
+        "per_page": per_page,
+    }
+
+
+def _trending_topics(db: Session, page: int, per_page: int):
+    """7天内热门话题 Top 10
+    按话题在近7天帖子中出现次数排序
+    """
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    rows = db.execute(text("""
+        SELECT t.id, t.name, t.description, t.icon_url, t.color,
+               t.post_count, t.follower_count, t.is_trending,
+               t.created_at, t.updated_at,
+               COUNT(pt.post_id) AS recent_post_count
+        FROM topics t
+        JOIN post_topics pt ON t.id = pt.topic_id
+        JOIN posts p ON pt.post_id = p.id
+        WHERE p.created_at >= :since AND p.is_public = 1
+        GROUP BY t.id, t.name, t.description, t.icon_url, t.color,
+                 t.post_count, t.follower_count, t.is_trending,
+                 t.created_at, t.updated_at
+        ORDER BY recent_post_count DESC
+        LIMIT :limit
+    """), {"since": seven_days_ago, "limit": per_page}).fetchall()
+
+    topics = []
+    for r in rows:
+        topics.append({
+            "id": r.id,
+            "name": r.name,
+            "description": r.description,
+            "icon_url": r.icon_url,
+            "color": r.color,
+            "post_count": r.post_count,
+            "follower_count": r.follower_count,
+            "is_trending": r.is_trending,
+            "recent_post_count": r.recent_post_count,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        })
+
+    return {
+        "query": "话题趋势",
+        "type": "trending_topics",
+        "period": "7天",
+        "topics": topics,
+        "total": len(topics),
+        "current_page": page,
+        "per_page": per_page,
+    }
+
+
+def _comic_events(db: Session, page: int, per_page: int, user_id: int):
+    """近期3个月漫展列表（含进行中 + 即将开始）"""
+    now = datetime.utcnow()
+    three_months_later = now + timedelta(days=90)
+
+    events = (
+        db.query(ComicEvent)
+        .filter(
+            ComicEvent.end_date >= now,
+            ComicEvent.start_date <= three_months_later,
+        )
+        .order_by(ComicEvent.start_date.asc())
+        .limit(per_page)
+        .all()
+    )
+
+    # 批量取关联数据
+    event_ids = [e.id for e in events]
+    city_map = {}
+    images_map: dict = {}
+    tags_map: dict = {}
+    follow_set: set = set()
+    follow_count_map: dict = {}
+    creator_map: dict = {}
+
+    if event_ids:
+        cities = db.query(ComicCity).filter(ComicCity.id.in_({e.city_id for e in events})).all()
+        city_map = {c.id: c.name for c in cities}
+
+        imgs = db.query(ComicEventImage).filter(
+            ComicEventImage.event_id.in_(event_ids)
+        ).order_by(ComicEventImage.is_cover.desc(), ComicEventImage.sort_order.asc()).all()
+        for img in imgs:
+            images_map.setdefault(img.event_id, []).append({
+                "id": img.id, "imageUrl": img.image_url,
+                "isCover": bool(img.is_cover), "sortOrder": img.sort_order,
+            })
+
+        tag_rels = db.query(ComicEventTagRel).filter(
+            ComicEventTagRel.event_id.in_(event_ids)
+        ).all()
+        tag_ids = {tr.tag_id for tr in tag_rels}
+        tag_name_map = {}
+        if tag_ids:
+            tag_name_map = {t.id: t.name for t in db.query(ComicTag).filter(ComicTag.id.in_(tag_ids)).all()}
+        for tr in tag_rels:
+            tags_map.setdefault(tr.event_id, []).append(tag_name_map.get(tr.tag_id, ""))
+
+        # 关注数
+        follow_counts = db.execute(text(
+            "SELECT event_id, COUNT(*) FROM comic_event_follows "
+            "WHERE event_id IN :eids GROUP BY event_id"
+        ), {"eids": tuple(event_ids)}).fetchall()
+        for fc in follow_counts:
+            follow_count_map[fc[0]] = fc[1]
+
+        # 创建者
+        creator_ids = {e.creator_id for e in events}
+        creators = db.query(User).filter(User.id.in_(creator_ids)).all()
+        creator_map = {u.id: {"username": u.username, "avatarUrl": u.avatar_url} for u in creators}
+
+        if user_id:
+            follows = db.query(ComicEventFollow).filter(
+                ComicEventFollow.event_id.in_(event_ids),
+                ComicEventFollow.user_id == user_id,
+            ).all()
+            follow_set = {f.event_id for f in follows}
+
+    status_text = {0: "即将开始", 1: "进行中", 2: "已结束"}
+    result = []
+    for e in events:
+        creator = creator_map.get(e.creator_id, {})
+        result.append({
+            "id": e.id,
+            "name": e.name,
+            "cityName": city_map.get(e.city_id, ""),
+            "venue": e.venue or "",
+            "startDate": e.start_date.isoformat() if e.start_date else None,
+            "endDate": e.end_date.isoformat() if e.end_date else None,
+            "status": e.status,
+            "statusText": status_text.get(e.status, ""),
+            "ticketInfo": e.ticket_info or "",
+            "tags": tags_map.get(e.id, []),
+            "images": images_map.get(e.id, []),
+            "isFollowed": e.id in follow_set,
+            "followCount": follow_count_map.get(e.id, 0),
+            "creatorName": creator.get("username", ""),
+            "creatorAvatar": creator.get("avatarUrl", ""),
+            "createdAt": e.created_at.isoformat() if e.created_at else None,
+        })
+
+    return {
+        "query": "近期漫展",
+        "type": "comic_events",
+        "period": "3个月",
+        "events": result,
+        "total": len(result),
+        "current_page": page,
+        "per_page": per_page,
+    }
+
+
+# ============================================================
+# 路由定义
+# ============================================================
 
 
 @router.get("/users")
@@ -55,14 +301,20 @@ def global_search(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """全局综合搜索"""
+    """全局综合搜索（含特殊关键词：热门帖子 / 话题趋势 / 近期漫展）"""
     if not q.strip():
         return {
-            "query": "", "users": [], "posts": [],
-            "user_total": 0, "post_total": 0, "total_results": 0,
+            "query": "", "users": [], "posts": [], "events": [],
+            "user_total": 0, "post_total": 0, "event_total": 0, "total_results": 0,
             "current_page": page, "per_page": per_page,
         }
-    results = SearchService.global_search(db, query=q.strip(), page=page, per_page=per_page, current_user_id=user.id)
+
+    query = q.strip()
+    special = _handle_special_query(db, query, page, per_page, user.id)
+    if special is not None:
+        return special
+
+    results = SearchService.global_search(db, query=query, page=page, per_page=per_page, current_user_id=user.id)
     return results
 
 
