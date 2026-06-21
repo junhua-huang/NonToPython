@@ -10,19 +10,11 @@ class Config:
     JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'change-me-in-production')
 
     # 运行环境与 CORS 配置
-    # 开发环境允许本机/局域网调试；生产环境默认只允许正式前端域名。
+    # 开发环境完全放开 HTTP/HTTPS 来源，生产环境默认只允许正式 www 前端域名。
     DEFAULT_PRODUCTION_CORS_ORIGINS = [
         'https://www.nonto.online',
-        'https://nonto.online',
     ]
-    DEVELOPMENT_CORS_ORIGIN_REGEX = (
-        r'^https?://('
-        r'localhost|127\.0\.0\.1|0\.0\.0\.0|10\.0\.2\.2|'
-        r'10\.\d{1,3}\.\d{1,3}\.\d{1,3}|'
-        r'172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|'
-        r'192\.168\.\d{1,3}\.\d{1,3}'
-        r')(:\d+)?$'
-    )
+    DEVELOPMENT_CORS_ORIGIN_REGEX = r'^https?://.+$'
 
     @classmethod
     def get_app_env(cls) -> str:
