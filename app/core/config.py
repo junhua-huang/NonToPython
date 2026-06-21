@@ -9,6 +9,45 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
     JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'change-me-in-production')
 
+    # 运行环境与 CORS 配置
+    # 开发环境允许本机/局域网调试；生产环境默认只允许正式前端域名。
+    DEFAULT_PRODUCTION_CORS_ORIGINS = [
+        'https://www.nonto.online',
+        'https://nonto.online',
+    ]
+    DEVELOPMENT_CORS_ORIGIN_REGEX = (
+        r'^https?://('
+        r'localhost|127\.0\.0\.1|0\.0\.0\.0|10\.0\.2\.2|'
+        r'10\.\d{1,3}\.\d{1,3}\.\d{1,3}|'
+        r'172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|'
+        r'192\.168\.\d{1,3}\.\d{1,3}'
+        r')(:\d+)?$'
+    )
+
+    @classmethod
+    def get_app_env(cls) -> str:
+        return os.environ.get('APP_ENV', 'development').strip().lower()
+
+    @classmethod
+    def get_cors_settings(cls) -> dict:
+        origins_raw = os.environ.get('CORS_ORIGINS', '').strip()
+        if origins_raw:
+            return {
+                'allow_origins': [origin.strip() for origin in origins_raw.split(',') if origin.strip()],
+                'allow_origin_regex': None,
+            }
+
+        if cls.get_app_env() == 'production':
+            return {
+                'allow_origins': cls.DEFAULT_PRODUCTION_CORS_ORIGINS,
+                'allow_origin_regex': None,
+            }
+
+        return {
+            'allow_origins': [],
+            'allow_origin_regex': cls.DEVELOPMENT_CORS_ORIGIN_REGEX,
+        }
+
     # 数据库配置 - 从环境变量读取
     DB_USER = os.environ.get('DB_USER', 'root')
     DB_PASS = os.environ.get('DB_PASS', '')
@@ -36,6 +75,28 @@ class Config:
     COS_BUCKET = os.environ.get('COS_BUCKET', '')
     COS_BUCKET_NAME = os.environ.get('COS_BUCKET_NAME', os.environ.get('COS_BUCKET', ''))
     COS_DOMAIN = os.environ.get('COS_DOMAIN', '')
+
+    # 极光推送 (JPush) 配置 - Master Secret 仅服务端使用，不可下发到客户端
+    JPUSH_APP_KEY = os.environ.get('JPUSH_APP_KEY', '')
+    JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
+    # iOS: true=生产环境 APNs，false=开发环境；Android 忽略此参数
+    JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'false').lower() == 'true'
+
+    # 邮件 (SMTP) 配置 - 用于发送邮箱验证码
+    # QQ 邮箱用 SSL 465 端口，授权码非登录密码
+    SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.qq.com')
+    SMTP_PORT = int(os.environ.get('SMTP_PORT', '465'))
+    SMTP_USER = os.environ.get('SMTP_USER', '')
+    SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')  # 授权码
+    SMTP_FROM = os.environ.get('SMTP_FROM', '')
+    SMTP_USE_SSL = os.environ.get('SMTP_USE_SSL', 'true').lower() == 'true'
+
+    # 邮箱验证码限流配置
+    OTP_RATE_LIMIT_PER_EMAIL_60S = 1      # 同邮箱 60s 内最多发 1 次
+    OTP_RATE_LIMIT_PER_EMAIL_1H = 5       # 同邮箱 1 小时内最多 5 次
+    OTP_RATE_LIMIT_PER_IP_1H = 10         # 同 IP 1 小时内最多 10 次
+    OTP_EXPIRE_MINUTES = 10               # 验证码有效期 10 分钟
+    LOGIN_FAIL_THRESHOLD = 5              # 登录失败 N 次后要求邮箱验证码
 
     DEBUG = True
     TESTING = False

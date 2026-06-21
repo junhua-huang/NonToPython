@@ -49,6 +49,8 @@ class WSManager:
         return cls._instance
 
     def __init__(self):
+        if getattr(self, "_initialized", False):
+            return
         if not hasattr(self, "_connections"):
             self._connections: dict[int, dict[str, WebSocket]] = {}
             self._last_ping: dict[str, float] = {}
@@ -56,10 +58,12 @@ class WSManager:
             self._session_cache: dict[int, tuple[float, list[dict]]] = {}
             self._conv_ids_cache: dict[int, tuple[float, list[int]]] = {}
             self._blocked_cache: dict[int, tuple[float, set[int]]] = {}
+            self._loop: Optional[asyncio.AbstractEventLoop] = None
             self._heartbeat_task_started = False
-        self._push_queue = asyncio.Queue()
-        self._push_worker_started = False
-        self._per_user_pending: dict[int, int] = {}
+            self._push_queue: asyncio.Queue = asyncio.Queue()
+            self._push_worker_started = False
+            self._per_user_pending: dict[int, int] = {}
+        self._initialized = True
 
     # ================================================================
     # 推送队列 — 解耦"落库+ACK"与"推送接收方"
@@ -121,9 +125,14 @@ class WSManager:
         用户重连后通过 sync 机制补发，无需实时 WS 推送。"""
         full_payload = {"event": event, "data": payload}
         if self._loop and self._loop.is_running():
-            asyncio.ensure_future(self._next_seq(user_id, full_payload))
-        else:
-            logger.warning(f"[WS SEQ] Cannot ensure seq log: event loop not available, uid={user_id}")
+            asyncio.run_coroutine_threadsafe(self._next_seq(user_id, full_payload), self._loop)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._next_seq_sync(user_id, full_payload)
+            return
+        loop.create_task(self._next_seq(user_id, full_payload))
 
     def enqueue_push_batch(self, items: list[tuple[int, str, dict]]):
         for uid, evt, pld in items:
@@ -337,11 +346,16 @@ class WSManager:
         await self._raw_send_to_connections(user_id, data)
 
     def schedule_push(self, coro):
-        """从同步线程安全调度协程到主事件循环"""
+        """从同步线程安全调度协程到可用事件循环。"""
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(coro, self._loop)
-        else:
-            logger.warning("[WS PUSH] Cannot schedule: event loop not available")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(coro)
+            return
+        loop.create_task(coro)
 
     async def _notify_friends_offline(self, user_id: int):
         """用户全部设备离线时，通知在线好友该用户已下线"""
@@ -458,39 +472,40 @@ class WSManager:
     # 序号系统
     # ================================================================
 
+    def _next_seq_sync(self, user_id: int, payload: dict) -> Optional[int]:
+        db: Session = SessionLocal()
+        try:
+            from app.models.models import WSUserSeq, WSMessageLog
+            row = db.query(WSUserSeq).filter(WSUserSeq.user_id == user_id).first()
+            if row is None:
+                row = WSUserSeq(user_id=user_id, current_seq=0)
+                db.add(row)
+                db.flush()
+            db.execute(
+                text("UPDATE ws_user_seq SET current_seq = current_seq + 1 WHERE user_id = :uid"),
+                {"uid": user_id}
+            )
+            new_seq = db.execute(
+                text("SELECT current_seq FROM ws_user_seq WHERE user_id = :uid"),
+                {"uid": user_id}
+            ).scalar()
+            log_entry = WSMessageLog(
+                user_id=user_id, seq=new_seq,
+                payload=json.dumps(payload, ensure_ascii=False),
+                created_at=datetime.utcnow(),
+            )
+            db.add(log_entry)
+            db.commit()
+            return new_seq
+        except Exception as e:
+            logger.error(f"[WS SEQ] _next_seq failed uid={user_id}: {e}")
+            db.rollback()
+            return None
+        finally:
+            db.close()
+
     async def _next_seq(self, user_id: int, payload: dict) -> Optional[int]:
-        def _sync():
-            db: Session = SessionLocal()
-            try:
-                from app.models.models import WSUserSeq, WSMessageLog
-                row = db.query(WSUserSeq).filter(WSUserSeq.user_id == user_id).first()
-                if row is None:
-                    row = WSUserSeq(user_id=user_id, current_seq=0)
-                    db.add(row)
-                    db.flush()
-                db.execute(
-                    text("UPDATE ws_user_seq SET current_seq = current_seq + 1 WHERE user_id = :uid"),
-                    {"uid": user_id}
-                )
-                new_seq = db.execute(
-                    text("SELECT current_seq FROM ws_user_seq WHERE user_id = :uid"),
-                    {"uid": user_id}
-                ).scalar()
-                log_entry = WSMessageLog(
-                    user_id=user_id, seq=new_seq,
-                    payload=json.dumps(payload, ensure_ascii=False),
-                    created_at=datetime.utcnow(),
-                )
-                db.add(log_entry)
-                db.commit()
-                return new_seq
-            except Exception as e:
-                logger.error(f"[WS SEQ] _next_seq failed uid={user_id}: {e}")
-                db.rollback()
-                return None
-            finally:
-                db.close()
-        return await asyncio.get_event_loop().run_in_executor(None, _sync)
+        return await asyncio.get_event_loop().run_in_executor(None, self._next_seq_sync, user_id, payload)
 
     async def get_messages_after_seq(self, user_id: int, last_received_seq: int, limit: int = 200) -> list[dict]:
         def _sync():

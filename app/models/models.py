@@ -23,21 +23,21 @@ def _get_ws_manager():
 
 post_topics = Table(
     'post_topics', Base.metadata,
-    Column('post_id', Integer, ForeignKey('posts.id', ondelete='CASCADE'), primary_key=True),
-    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+    Column('post_id', Integer, ForeignKey('posts.id', ondelete='CASCADE', name='fk_post_topics_post'), primary_key=True),
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE', name='fk_post_topics_topic'), primary_key=True),
     Column('created_at', DateTime, default=datetime.utcnow),
 )
 
 post_visibility = Table(
     'post_visibility', Base.metadata,
-    Column('post_id', Integer, ForeignKey('posts.id', ondelete='CASCADE'), primary_key=True),
-    Column('user_id', Integer, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True),
+    Column('post_id', Integer, ForeignKey('posts.id', ondelete='CASCADE', name='fk_post_visibility_post'), primary_key=True),
+    Column('user_id', Integer, ForeignKey('users.id', ondelete='CASCADE', name='fk_post_visibility_user'), primary_key=True),
 )
 
 topic_followers = Table(
     'topic_followers', Base.metadata,
-    Column('user_id', Integer, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True),
-    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE'), primary_key=True),
+    Column('user_id', Integer, ForeignKey('users.id', ondelete='CASCADE', name='fk_topic_followers_user'), primary_key=True),
+    Column('topic_id', Integer, ForeignKey('topics.id', ondelete='CASCADE', name='fk_topic_followers_topic'), primary_key=True),
     Column('created_at', DateTime, default=datetime.utcnow),
 )
 
@@ -60,7 +60,9 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     is_admin = Column(Boolean, default=False)
-    
+    # 邮箱是否已验证（注册时通过邮箱验证码验证后置 True）
+    is_email_verified = Column(Boolean, default=False)
+
     # 隐私设置
     profile_visibility = Column(String(20), default='public')
     post_default_visibility = Column(String(20), default='public')
@@ -74,7 +76,7 @@ class User(Base):
     notify_sound = Column(Boolean, default=True)
     
     # 关系
-    posts = relationship('Post', back_populates='author', lazy='dynamic', cascade='all, delete-orphan')
+    posts = relationship('Post', back_populates='author', lazy='dynamic', cascade='all, delete-orphan', foreign_keys='Post.user_id')
     comments = relationship('Comment', foreign_keys='Comment.user_id', back_populates='author', lazy='dynamic', cascade='all, delete-orphan')
     likes = relationship('Like', back_populates='user', lazy='dynamic', cascade='all, delete-orphan')
     blocks = relationship('Block', foreign_keys='Block.blocker_id', back_populates='blocker', lazy='dynamic', cascade='all, delete-orphan')
@@ -124,6 +126,9 @@ class User(Base):
 class Post(Base):
     """帖子模型"""
     __tablename__ = 'posts'
+    __table_args__ = (
+        Index('ix_posts_community_created', 'community_id', 'created_at'),
+    )
     
     id = Column(Integer, primary_key=True)
     content = Column(Text, nullable=False)
@@ -136,14 +141,21 @@ class Post(Base):
     visibility = Column(String(20), default='public')
     is_public = Column(Boolean, default=True)
     view_count = Column(Integer, default=0)
+
+    # 社群关联（Phase 1）
+    community_id = Column(Integer, ForeignKey('communities.id', name='fk_posts_community'), nullable=True)
+    community_only = Column(Boolean, default=False)   # true=仅社群可见，不进主信息流
+    hidden_by_admin = Column(Boolean, default=False)  # 社群管理员隐藏标记
+    hidden_by = Column(Integer, ForeignKey('users.id', name='fk_posts_hidden_by'), nullable=True)
+    hidden_at = Column(DateTime, nullable=True)
     
     # 关系
-    author = relationship('User', back_populates='posts')
+    author = relationship('User', back_populates='posts', foreign_keys=[user_id])
     comments = relationship('Comment', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     likes = relationship('Like', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     
     def get_like_count(self):
-        return self.likes.count()
+        return self.likes.filter(Like.comment_id.is_(None)).count()
     
     def get_comment_count(self):
         return self.comments.count()
@@ -202,10 +214,30 @@ class Post(Base):
             'like_count': like_count if like_count is not None else self.get_like_count(),
             'comment_count': comment_count if comment_count is not None else self.get_comment_count(),
             'view_count': self.view_count,
+            'community_id': self.community_id,
             'topics': topics if topics is not None else self.get_topics(db=db),
             'is_liked': is_liked if is_liked is not None else False,
         }
         return result
+
+
+class PostFeedSeen(Base):
+    """首页推荐流曝光记录，用于短期去重。"""
+    __tablename__ = 'post_feed_seen'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'post_id', 'source', name='uq_post_feed_seen_user_post_source'),
+        Index('idx_post_feed_seen_user_source_seen_post', 'user_id', 'source', 'seen_at', 'post_id'),
+        Index('idx_post_feed_seen_post_source', 'post_id', 'source'),
+        Index('idx_post_feed_seen_seen_at', 'seen_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    post_id = Column(Integer, ForeignKey('posts.id', ondelete='CASCADE'), nullable=False)
+    source = Column(String(32), nullable=False, default='home_feed')
+    seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Comment(Base):
@@ -260,12 +292,14 @@ class Like(Base):
     __tablename__ = 'likes'
     __table_args__ = (
         Index('idx_likes_comment_user', 'comment_id', 'user_id'),
+        UniqueConstraint('user_id', 'post_id', name='unique_user_post_like'),
+        Index('idx_comment_id', 'comment_id'),
     )
     
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     post_id = Column(Integer, ForeignKey('posts.id'), nullable=True, index=True)
-    comment_id = Column(Integer, ForeignKey('comments.id'), nullable=True, index=True)
+    comment_id = Column(Integer, ForeignKey('comments.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     user = relationship('User', back_populates='likes')
@@ -285,7 +319,10 @@ class Like(Base):
 class Friendship(Base):
     """好友关系模型"""
     __tablename__ = 'friendships'
-    
+    __table_args__ = (
+        UniqueConstraint('sender_id', 'receiver_id', name='unique_friendship'),
+    )
+
     id = Column(Integer, primary_key=True)
     sender_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     receiver_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
@@ -308,32 +345,45 @@ class Friendship(Base):
 
 
 class Conversation(Base):
-    """会话模型"""
+    """会话模型（支持一对一私信 + 社群群聊）"""
     __tablename__ = 'conversations'
-    
+    __table_args__ = (
+        UniqueConstraint('user1_id', 'user2_id', name='unique_conversation'),  # 仅一对一生效
+        Index('ix_conversations_type', 'type'),
+    )
+
     id = Column(Integer, primary_key=True)
-    user1_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
-    user2_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    type = Column(String(20), default='direct')       # direct（一对一）/ community（社群群聊）
+    community_id = Column(Integer, ForeignKey('communities.id', name='fk_conversations_community'), nullable=True)
+    user1_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)   # 一对一用
+    user2_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)   # 一对一用
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_message_at = Column(DateTime)
-    
+
     user1 = relationship('User', foreign_keys=[user1_id])
     user2 = relationship('User', foreign_keys=[user2_id])
+    community = relationship('Community', foreign_keys=[community_id])
     messages = relationship('Message', back_populates='conversation', lazy='dynamic',
                             cascade='all, delete-orphan', order_by='Message.created_at')
     participants = relationship('ConversationParticipant', back_populates='conversation',
                                 lazy='dynamic', cascade='all, delete-orphan')
-    
+
     def to_dict(self):
-        return {
+        d = {
             'id': self.id,
+            'type': self.type,
+            'community_id': self.community_id,
             'user1_id': self.user1_id,
             'user2_id': self.user2_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'last_message_at': self.last_message_at.isoformat() if self.last_message_at else None,
         }
+        if self.community and self.type == 'community':
+            d['community_name'] = self.community.name
+            d['community_avatar'] = self.community.avatar_url
+        return d
 
 
 class ConversationParticipant(Base):
@@ -354,6 +404,7 @@ class Message(Base):
     __tablename__ = 'messages'
     __table_args__ = (
         Index('idx_messages_conv_time', 'conversation_id', 'created_at'),
+        Index('ix_messages_created_at', 'created_at'),
     )
     
     id = Column(Integer, primary_key=True)
@@ -368,6 +419,7 @@ class Message(Base):
     is_read = Column(Boolean, default=False)
     is_recalled = Column(Boolean, default=False)
     recalled_at = Column(DateTime, nullable=True)
+    deleted_by_admin = Column(Boolean, default=False)     # 管理员删除他人消息标记
     created_at = Column(DateTime, default=datetime.utcnow)
     
     conversation = relationship('Conversation', back_populates='messages')
@@ -394,6 +446,9 @@ class Message(Base):
 class Notification(Base):
     """通知模型"""
     __tablename__ = 'notifications'
+    __table_args__ = (
+        Index('ix_notifications_created_at', 'created_at'),
+    )
     
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
@@ -459,7 +514,10 @@ class Topic(Base):
 class Block(Base):
     """屏蔽模型"""
     __tablename__ = 'blocks'
-    
+    __table_args__ = (
+        UniqueConstraint('blocker_id', 'blocked_id', name='unique_block'),
+    )
+
     id = Column(Integer, primary_key=True)
     blocker_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     blocked_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
@@ -481,12 +539,17 @@ class Block(Base):
 class Report(Base):
     """举报模型"""
     __tablename__ = 'reports'
+    __table_args__ = (
+        Index('idx_reporter_target', 'reporter_id', 'target_type', 'target_id'),
+        Index('ix_reports_created_at', 'created_at'),
+        Index('ix_reports_target_id', 'target_id'),
+    )
     
     id = Column(Integer, primary_key=True)
     reporter_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     target_type = Column(String(20), nullable=False)
     target_id = Column(Integer, nullable=False)
-    reason = Column(String(50), nullable=False)
+    reason = Column(String(200), nullable=False)
     description = Column(Text)
     status = Column(String(20), default='pending')
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -511,6 +574,9 @@ class Report(Base):
 class PostView(Base):
     """帖子浏览记录"""
     __tablename__ = 'post_views'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'post_id', name='uq_user_post_view'),
+    )
     
     id = Column(Integer, primary_key=True)
     post_id = Column(Integer, ForeignKey('posts.id'), nullable=False, index=True)
@@ -706,7 +772,7 @@ class ComicLike(Base):
     """漫展点赞"""
     __tablename__ = 'comic_likes'
     __table_args__ = (
-        Index('idx_comic_likes_event_user', 'event_id', 'user_id'),
+        Index('idx_comic_likes_event_user', 'event_id', 'user_id', unique=True),
     )
 
     id = Column(Integer, primary_key=True)
@@ -937,3 +1003,53 @@ class RoleApplication(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
         }
+
+
+class UserDevice(Base):
+    """用户设备 - 存储极光推送 registrationId，支持多设备登录"""
+    __tablename__ = 'user_devices'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    registration_id = Column(String(255), nullable=False, index=True)
+    platform = Column(String(20), default='android')  # android / ios / harmony
+    app_version = Column(String(50))
+    last_active_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'registration_id': self.registration_id,
+            'platform': self.platform,
+            'app_version': self.app_version,
+            'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
+            'is_active': self.is_active,
+        }
+
+
+class EmailOtp(Base):
+    """邮箱验证码 - 用于注册验证、忘记密码、登录限流验证"""
+    __tablename__ = 'email_otps'
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(120), nullable=False, index=True)
+    code = Column(String(6), nullable=False)
+    purpose = Column(String(20), nullable=False)  # register / reset_password / login
+    is_used = Column(Boolean, default=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    ip_address = Column(String(45))  # 审计/限流用
+
+
+class LoginAttempt(Base):
+    """登录失败记录 - 用于登录错误限流（连续失败 N 次要求邮箱验证码）"""
+    __tablename__ = 'login_attempts'
+
+    id = Column(Integer, primary_key=True)
+    identifier = Column(String(120), nullable=False, index=True)  # username 或 email
+    ip_address = Column(String(45), nullable=False, index=True)
+    success = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

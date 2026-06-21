@@ -3,7 +3,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import case, or_, func, text
+from sqlalchemy import case, or_, func, text, bindparam
 import json
 from datetime import datetime, timedelta
 
@@ -15,8 +15,13 @@ from app.models.models import (
     ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
 )
 from app.services.search_service import SearchService
+from app.routers.comic import _recalc_status_text
 
 router = APIRouter()
+
+
+def _is_short_query(q: str) -> bool:
+    return len((q or "").strip()) < 2
 
 
 # ============================================================
@@ -158,6 +163,7 @@ def _comic_events(db: Session, page: int, per_page: int, user_id: int):
     now = datetime.utcnow()
     three_months_later = now + timedelta(days=90)
 
+    offset = (page - 1) * per_page
     events = (
         db.query(ComicEvent)
         .filter(
@@ -165,6 +171,7 @@ def _comic_events(db: Session, page: int, per_page: int, user_id: int):
             ComicEvent.start_date <= three_months_later,
         )
         .order_by(ComicEvent.start_date.asc())
+        .offset(offset)
         .limit(per_page)
         .all()
     )
@@ -205,7 +212,7 @@ def _comic_events(db: Session, page: int, per_page: int, user_id: int):
         follow_counts = db.execute(text(
             "SELECT event_id, COUNT(*) FROM comic_event_follows "
             "WHERE event_id IN :eids GROUP BY event_id"
-        ), {"eids": tuple(event_ids)}).fetchall()
+        ).bindparams(bindparam('eids', expanding=True)), {"eids": event_ids}).fetchall()
         for fc in follow_counts:
             follow_count_map[fc[0]] = fc[1]
 
@@ -225,6 +232,9 @@ def _comic_events(db: Session, page: int, per_page: int, user_id: int):
     result = []
     for e in events:
         creator = creator_map.get(e.creator_id, {})
+        # 实时重算状态：数据库里的 status 是创建时算的，不会随时间变化，
+        # 必须按当前日期重新计算，否则已结束的漫展会一直显示"即将开始"。
+        real_status, real_status_text = _recalc_status_text(e.start_date, e.end_date)
         result.append({
             "id": e.id,
             "name": e.name,
@@ -232,8 +242,8 @@ def _comic_events(db: Session, page: int, per_page: int, user_id: int):
             "venue": e.venue or "",
             "startDate": e.start_date.isoformat() if e.start_date else None,
             "endDate": e.end_date.isoformat() if e.end_date else None,
-            "status": e.status,
-            "statusText": status_text.get(e.status, ""),
+            "status": real_status,
+            "statusText": real_status_text,
             "ticketInfo": e.ticket_info or "",
             "tags": tags_map.get(e.id, []),
             "images": images_map.get(e.id, []),
@@ -269,7 +279,7 @@ def search_users(
     db: Session = Depends(get_db),
 ):
     """搜索用户"""
-    if not q.strip():
+    if _is_short_query(q):
         return {"users": [], "total": 0, "pages": 0, "current_page": page, "per_page": per_page}
 
     results = SearchService.search_users(db, query=q.strip(), page=page, per_page=per_page, current_user_id=user.id)
@@ -286,7 +296,7 @@ def search_posts(
     db: Session = Depends(get_db),
 ):
     """搜索帖子"""
-    if not q.strip():
+    if _is_short_query(q):
         return {"posts": [], "total": 0, "pages": 0, "current_page": page, "per_page": per_page}
 
     results = SearchService.search_posts(db, query=q.strip(), page=page, per_page=per_page, user_id=user_id, is_public=True)
@@ -302,7 +312,8 @@ def global_search(
     db: Session = Depends(get_db),
 ):
     """全局综合搜索（含特殊关键词：热门帖子 / 话题趋势 / 近期漫展）"""
-    if not q.strip():
+    per_page = min(per_page, 10)
+    if _is_short_query(q):
         return {
             "query": "", "users": [], "posts": [], "events": [],
             "user_total": 0, "post_total": 0, "event_total": 0, "total_results": 0,
@@ -439,7 +450,7 @@ def search_topics(
     db: Session = Depends(get_db),
 ):
     """搜索话题（按名称模糊匹配）"""
-    if not q.strip():
+    if _is_short_query(q):
         return {"topics": [], "total": 0, "pages": 0, "current_page": page, "per_page": per_page}
 
     query = q.strip()

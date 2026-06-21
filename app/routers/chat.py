@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Conversation, Message, ConversationParticipant, Friendship
+from app.models.community import CommunityMember
 from app.ws_manager import ws_manager
 
 logger = logging.getLogger(__name__)
@@ -22,33 +23,42 @@ router = APIRouter()
 
 @router.get("/sessions")
 def get_sessions(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(30, ge=1, le=100),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """返回当前用户所有会话列表（首屏数据，与 WS session_list 同构）"""
-    from sqlalchemy import func, and_
+    from sqlalchemy import func, and_, case
 
-    conversations = (
-        db.query(Conversation)
-        .filter(
-            (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
-        )
-        .order_by(func.coalesce(Conversation.last_message_at, Conversation.created_at).desc())
-        .all()
+    offset = (page - 1) * per_page
+    other_user_expr = case(
+        (Conversation.user1_id == user.id, Conversation.user2_id),
+        else_=Conversation.user1_id,
     )
+    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+    direct_membership = (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
+    community_membership = (
+        (Conversation.type == 'community')
+        & (CommunityMember.user_id == user.id)
+        & (CommunityMember.status == 'active')
+    )
+    base_query = db.query(Conversation).outerjoin(
+        CommunityMember,
+        CommunityMember.community_id == Conversation.community_id,
+    ).filter(direct_membership | community_membership)
+    if blocked_ids:
+        base_query = base_query.filter(
+            (Conversation.type == 'community') | ~other_user_expr.in_(blocked_ids)
+        )
+    base_query = base_query.order_by(
+        func.coalesce(Conversation.last_message_at, Conversation.created_at).desc()
+    )
+    total = base_query.count()
+    conversations = base_query.offset(offset).limit(per_page).all()
 
     if not conversations:
-        return {"sessions": [], "total": 0}
-
-    # 过滤已屏蔽用户的会话
-    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
-    if blocked_ids:
-        conversations = [
-            c for c in conversations
-            if (c.user2_id if c.user1_id == user.id else c.user1_id) not in blocked_ids
-        ]
-        if not conversations:
-            return {"sessions": [], "total": 0}
+        return {"sessions": [], "total": total, "page": page, "per_page": per_page}
 
     conv_ids = [c.id for c in conversations]
 
@@ -92,8 +102,10 @@ def get_sessions(
     # 批量取所有涉及的用户信息
     all_user_ids = set()
     for c in conversations:
-        all_user_ids.add(c.user1_id)
-        all_user_ids.add(c.user2_id)
+        if c.user1_id:
+            all_user_ids.add(c.user1_id)
+        if c.user2_id:
+            all_user_ids.add(c.user2_id)
     all_user_ids.discard(user.id)
 
     users_map = {}
@@ -103,10 +115,33 @@ def get_sessions(
 
     result = []
     for conv in conversations:
+        last_message = last_msg_map.get(conv.id)
+        updated_at = (
+            conv.last_message_at.isoformat()
+            if conv.last_message_at
+            else conv.created_at.isoformat()
+        )
+        if conv.type == 'community':
+            result.append({
+                "id": conv.id,
+                "conversation_id": conv.id,
+                "user1_id": conv.user1_id,
+                "user2_id": conv.user2_id,
+                "type": conv.type,
+                "community_id": conv.community_id,
+                "community_name": conv.community.name if conv.community else None,
+                "community_avatar": conv.community.avatar_url if conv.community else None,
+                "participants": [],
+                "other_user": None,
+                "last_message": last_message.to_dict() if last_message else None,
+                "unread_count": unread_map.get(conv.id, 0),
+                "updated_at": updated_at,
+                "last_message_at": updated_at,
+            })
+            continue
+
         other_id = conv.user2_id if conv.user1_id == user.id else conv.user1_id
         other_user = users_map.get(other_id)
-        last_message = last_msg_map.get(conv.id)
-
         participants = []
         if other_user:
             participants.append({
@@ -121,24 +156,16 @@ def get_sessions(
             "conversation_id": conv.id,
             "user1_id": conv.user1_id,
             "user2_id": conv.user2_id,
-            "type": "single",
+            "type": conv.type,
             "participants": participants,
             "other_user": other_user.to_dict() if other_user else None,
             "last_message": last_message.to_dict() if last_message else None,
             "unread_count": unread_map.get(conv.id, 0),
-            "updated_at": (
-                conv.last_message_at.isoformat()
-                if conv.last_message_at
-                else conv.created_at.isoformat()
-            ),
-            "last_message_at": (
-                conv.last_message_at.isoformat()
-                if conv.last_message_at
-                else conv.created_at.isoformat()
-            ),
+            "updated_at": updated_at,
+            "last_message_at": updated_at,
         })
 
-    return {"sessions": result, "total": len(result)}
+    return {"sessions": result, "total": total, "page": page, "per_page": per_page}
 
 
 # ============================================================
@@ -206,8 +233,10 @@ def get_conversations(
     # 批量取所有涉及的用户信息
     all_user_ids = set()
     for c in conversations:
-        all_user_ids.add(c.user1_id)
-        all_user_ids.add(c.user2_id)
+        if c.user1_id:
+            all_user_ids.add(c.user1_id)
+        if c.user2_id:
+            all_user_ids.add(c.user2_id)
     all_user_ids.discard(user.id)
 
     users_map = {}
@@ -330,9 +359,6 @@ def get_messages_batch(
     替代逐个请求 /api/chat/messages/{convId} 的 N+1 问题。
     """
     # 解析会话 ID 列表
-    logger.info(f"Getting messages batch for user {user.id}")
-    logger.info(f"Conv IDs: {conv_ids}")
-    logger.info(type(conv_ids))
     try:
         conv_id_list = [int(x.strip()) for x in conv_ids.split(",") if x.strip()]
     except ValueError:
@@ -340,11 +366,10 @@ def get_messages_batch(
 
     if not conv_id_list:
         raise HTTPException(status_code=400, detail="conv_ids is required")
-    if len(conv_id_list) > 50:
-        raise HTTPException(status_code=400, detail="Maximum 50 conversation IDs allowed")
-
-    # 去重保序
+    # 去重保序，并限制单次批量预取规模。
     conv_id_list = list(dict.fromkeys(conv_id_list))
+    if len(conv_id_list) > 20:
+        raise HTTPException(status_code=400, detail="Maximum 20 conversation IDs allowed")
 
     # 批量查询会话，验证用户权限
     conversations = db.query(Conversation).filter(
@@ -570,18 +595,15 @@ async def mark_conversation_as_read(
     if conversation.user1_id != user.id and conversation.user2_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    unread = (
+    updated_count = (
         db.query(Message)
         .filter(
             Message.conversation_id == conversation_id,
             Message.is_read == False,
             Message.sender_id != user.id,
         )
-        .all()
+        .update({Message.is_read: True}, synchronize_session=False)
     )
-
-    for m in unread:
-        m.is_read = True
 
     try:
         db.commit()
@@ -608,7 +630,7 @@ async def mark_conversation_as_read(
         # 失效缓存（已读导致 unread_count 变化）
         ws_manager.invalidate_session_cache(user.id)
 
-        return {"message": "All messages marked as read", "marked_count": len(unread)}
+        return {"message": "All messages marked as read", "marked_count": updated_count}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

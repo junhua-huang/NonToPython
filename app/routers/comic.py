@@ -6,7 +6,7 @@ from datetime import datetime, date as date_cls
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -68,7 +68,7 @@ def get_events(
     page = max(page, 1)
     size = min(max(size, 1), 50)
 
-    where = "WHERE e.status IN (0, 1)"
+    where = "WHERE e.end_date >= CURDATE()"
     params = {}
     if city:
         where += " AND c.name = :city"
@@ -106,8 +106,16 @@ def get_events(
 
     user_id = current_user.id if current_user else None
 
-    # 批量查询图片列表
+    # 批量查询图片和当前用户关注状态，避免列表页逐行查询。
     event_ids = [r[0] for r in rows]
+    followed_event_ids = set()
+    if user_id is not None and event_ids:
+        follow_sql = text(
+            "SELECT event_id FROM comic_event_follows WHERE user_id = :uid AND event_id IN :event_ids"
+        ).bindparams(bindparam('event_ids', expanding=True))
+        followed_rows = db.execute(follow_sql, {'uid': user_id, 'event_ids': event_ids}).fetchall()
+        followed_event_ids = {row[0] for row in followed_rows}
+
     images_map: dict = {}
     if event_ids:
         imgs = db.query(ComicEventImage).filter(
@@ -129,13 +137,7 @@ def get_events(
         tags = [t.strip() for t in (r[13] or '').split(',') if t.strip()]
         creator_id = r[7]
         is_owner = (user_id is not None and creator_id == user_id)
-        is_followed = False
-        if user_id is not None:
-            fo = db.execute(
-                text("SELECT 1 FROM comic_event_follows WHERE event_id = :eid AND user_id = :uid"),
-                {'eid': event_id, 'uid': user_id}
-            ).first()
-            is_followed = fo is not None
+        is_followed = event_id in followed_event_ids
 
         images = images_map.get(event_id, [])
         cover_image = next((i["imageUrl"] for i in images if i["isCover"]), None) \
@@ -494,7 +496,9 @@ def toggle_follow(
     user: User = Depends(get_current_user),
 ):
     """关注 / 取消关注漫展"""
-    uid = payload.get('userId') or user.id
+    # 安全：忽略客户端传入的 userId，始终使用当前登录用户的 id，
+    # 防止越权替他人关注/取关。
+    uid = user.id
 
     # 漫展存在？
     ev = db.execute(
@@ -987,7 +991,7 @@ def _comic_batch_enrich(db: Session, all_comments: list, current_user_id: int | 
         rows = db.execute(text(
             "SELECT comment_id, COUNT(*) AS cnt FROM comic_comment_likes "
             "WHERE comment_id IN :cids GROUP BY comment_id"
-        ), {"cids": tuple(comment_ids)}).fetchall()
+        ).bindparams(bindparam('cids', expanding=True)), {"cids": comment_ids}).fetchall()
         like_count_map = {r[0]: r[1] for r in rows}
 
     # 3. is_liked
@@ -996,7 +1000,7 @@ def _comic_batch_enrich(db: Session, all_comments: list, current_user_id: int | 
         rows = db.execute(text(
             "SELECT comment_id FROM comic_comment_likes "
             "WHERE comment_id IN :cids AND user_id = :uid"
-        ), {"cids": tuple(comment_ids), "uid": current_user_id}).fetchall()
+        ).bindparams(bindparam('cids', expanding=True)), {"cids": comment_ids, "uid": current_user_id}).fetchall()
         liked_set = {r[0] for r in rows}
 
     # 4. reply_count
@@ -1005,7 +1009,7 @@ def _comic_batch_enrich(db: Session, all_comments: list, current_user_id: int | 
         rows = db.execute(text(
             "SELECT parent_id, COUNT(*) AS cnt FROM comic_comments "
             "WHERE parent_id IN :cids GROUP BY parent_id"
-        ), {"cids": tuple(comment_ids)}).fetchall()
+        ).bindparams(bindparam('cids', expanding=True)), {"cids": comment_ids}).fetchall()
         reply_count_map = {r[0]: r[1] for r in rows}
 
     for c in flat:

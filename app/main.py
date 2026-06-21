@@ -9,14 +9,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+import os
+import time
 
+from app.core.config import Config
 from app.database import init_db
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
+from app.routers import push
+from app.routers import communities
 
-# 配置日志
+# 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
+# 通过 LOG_LEVEL 环境变量覆盖（DEBUG/INFO/WARNING）。
+_log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=getattr(logging, _log_level, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
@@ -45,25 +52,67 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down NanTuPy server...")
 
 
+# 安全：生产环境通过 HIDE_API_DOCS=1 关闭 openapi.json / docs / redoc，
+# 避免暴露全部接口结构。开发环境保留（默认不设该变量）。
+_hide_docs = os.environ.get('HIDE_API_DOCS', '0') == '1'
 app = FastAPI(
     title="NanTuPy",
     description="社交平台后端 API (FastAPI 重构版)",
     version="2.0.0",
     lifespan=lifespan,
+    docs_url=None if _hide_docs else "/docs",
+    redoc_url=None if _hide_docs else "/redoc",
+    openapi_url=None if _hide_docs else "/openapi.json",
 )
 
 # CORS 中间件
-# allow_origins=["*"] + allow_credentials=True 在 Starlette 简单请求路径中存在已知缺陷:
-# simple_headers 输出 Access-Control-Allow-Origin: *，与 credentials 冲突致浏览器拒绝。
-# 用 allow_origin_regex=".*" 替代 — Starlette 会正确回显请求 Origin。
+# 开发环境允许 localhost/127.0.0.1/私有局域网来源，方便 Flutter Web 调试；
+# 生产环境默认只允许正式前端域名，可用 CORS_ORIGINS 覆盖。
+_cors_settings = Config.get_cors_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",
+    allow_origins=_cors_settings["allow_origins"],
+    allow_origin_regex=_cors_settings["allow_origin_regex"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+def _get_perf_slow_request_ms():
+    try:
+        return int(os.environ.get('PERF_SLOW_REQUEST_MS', '500'))
+    except ValueError:
+        logger.warning('Invalid PERF_SLOW_REQUEST_MS value; falling back to 500')
+        return 500
+
+
+_perf_slow_request_ms = _get_perf_slow_request_ms()
+_perf_logger = logging.getLogger('app.performance')
+
+
+@app.middleware("http")
+async def log_request_timing(request, call_next):
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        path = request.url.path
+        if path.startswith('/api/'):
+            log_payload = {
+                'method': request.method,
+                'path': path,
+                'status_code': status_code,
+                'elapsed_ms': elapsed_ms,
+            }
+            if elapsed_ms >= _perf_slow_request_ms:
+                _perf_logger.warning('slow_request %s', log_payload)
+            else:
+                _perf_logger.debug('request_timing %s', log_payload)
 
 # COOP / COEP 安全头 — Flutter Web (CanvasKit + WASM) 需要 SharedArrayBuffer
 # 注意：只应在静态 HTML 页面响应上设置，API 和 OPTIONS 预检不需要
@@ -97,6 +146,8 @@ app.include_router(health.router, prefix="", tags=["Health"])
 app.include_router(admin.router, prefix="", tags=["Admin"])
 app.include_router(comic.router, prefix="/api/comic", tags=["Comic"])
 app.include_router(roles.router, tags=["Roles"])
+app.include_router(push.router, prefix="/api/push", tags=["Push"])
+app.include_router(communities.router, prefix="/api/communities", tags=["Communities"])
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 

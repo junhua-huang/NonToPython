@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
-from app.models.models import User, Topic
+from app.dependencies import get_current_user, require_content_manager
+from app.models.models import User, Topic, topic_followers
 from app.services.topic_service import TopicService
 
 router = APIRouter()
@@ -33,10 +33,23 @@ def get_trending_topics(
 ):
     """获取热门话题"""
     trending = TopicService.get_trending_topics(db, limit=limit)
+    topic_ids = [topic["id"] for topic in trending]
+    followed_topic_ids = set()
+    if topic_ids:
+        followed_rows = (
+            db.query(topic_followers.c.topic_id)
+            .filter(
+                topic_followers.c.user_id == user.id,
+                topic_followers.c.topic_id.in_(topic_ids),
+            )
+            .all()
+        )
+        followed_topic_ids = {row[0] for row in followed_rows}
+
     topics_with_follow = []
     for topic in trending:
         topic_data = dict(topic)
-        topic_data["is_following"] = TopicService.is_user_following_topic(db, user.id, topic["id"])
+        topic_data["is_following"] = topic["id"] in followed_topic_ids
         topics_with_follow.append(topic_data)
     return {"topics": topics_with_follow, "total": len(trending)}
 
@@ -234,10 +247,10 @@ def unfollow_topic(
 def update_topic(
     topic_id: int,
     payload: dict = Body(...),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_content_manager),
     db: Session = Depends(get_db),
 ):
-    """更新话题信息（管理员功能）"""
+    """更新话题信息（管理员/组织者功能）"""
     topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
@@ -260,10 +273,10 @@ def update_topic(
 @router.delete("/{topic_id}")
 def delete_topic(
     topic_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_content_manager),
     db: Session = Depends(get_db),
 ):
-    """删除话题（管理员功能）"""
+    """删除话题（管理员/组织者功能）"""
     topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")

@@ -33,5 +33,18 @@ def get_db():
 
 
 def init_db():
-    """创建所有表"""
-    Base.metadata.create_all(bind=engine)
+    """数据库初始化。
+
+    表结构由 Alembic 迁移管理（见 alembic/ 目录），应用启动时不再
+    调用 create_all() —— 那样只能建新表、无法 ALTER 已有表，会导致
+    schema 漂移（如 is_email_verified 缺列事故）。
+
+    迁移执行流程（纯手动）：
+      - 改模型后：alembic revision -m "xxx" --autogenerate
+      - 审查生成脚本 → alembic upgrade head
+      - 新环境部署：alembic upgrade head
+
+    本函数保留为空壳，供未来放置其他启动期 DB 初始化逻辑
+    （如预热连接、写入初始角色数据等）。
+    """
+    pass

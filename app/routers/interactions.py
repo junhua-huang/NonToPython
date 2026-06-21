@@ -62,7 +62,11 @@ def like_post(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    existing = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first()
+    existing = db.query(Like).filter(
+        Like.user_id == user.id,
+        Like.post_id == post_id,
+        Like.comment_id.is_(None),
+    ).first()
     if existing:
         return {"message": "Post already liked", "like_count": post.get_like_count()}
 
@@ -84,7 +88,11 @@ def unlike_post(
     db: Session = Depends(get_db),
 ):
     """取消点赞"""
-    like = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first()
+    like = db.query(Like).filter(
+        Like.user_id == user.id,
+        Like.post_id == post_id,
+        Like.comment_id.is_(None),
+    ).first()
     if not like:
         raise HTTPException(status_code=404, detail="You have not liked this post")
 
@@ -109,7 +117,10 @@ def get_post_likes(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    likes = db.query(Like).filter(Like.post_id == post_id).all()
+    likes = db.query(Like).filter(
+        Like.post_id == post_id,
+        Like.comment_id.is_(None),
+    ).all()
     return {"likes": [l.to_dict() for l in likes], "total": len(likes)}
 
 
@@ -133,7 +144,7 @@ def like_comment(
     if existing:
         return {"message": "Comment already liked", "comment_id": comment_id, "like_count": comment.like_count}
 
-    like = Like(user_id=user.id, post_id=comment.post_id, comment_id=comment_id)
+    like = Like(user_id=user.id, comment_id=comment_id)
     try:
         db.add(like)
         comment.like_count += 1

@@ -175,10 +175,13 @@ class SearchService:
         for fc in follow_counts:
             follow_count_map[fc[0]] = fc[1]
 
-        status_text = {0: "即将开始", 1: "进行中", 2: "已结束"}
+        # 实时重算状态：数据库里的 status 是创建时算的，不会随时间变化，
+        # 必须按当前日期重新计算，否则已结束的漫展会一直显示"即将开始"。
+        from app.routers.comic import _recalc_status_text
 
         result = []
         for e in events:
+            real_status, real_status_text = _recalc_status_text(e.start_date, e.end_date)
             result.append({
                 "id": e.id,
                 "name": e.name,
@@ -186,8 +189,8 @@ class SearchService:
                 "venue": e.venue or "",
                 "startDate": e.start_date.isoformat() if e.start_date else None,
                 "endDate": e.end_date.isoformat() if e.end_date else None,
-                "status": e.status,
-                "statusText": status_text.get(e.status, ""),
+                "status": real_status,
+                "statusText": real_status_text,
                 "ticketInfo": e.ticket_info or "",
                 "images": images_map.get(e.id, []),
                 "isFollowed": e.id in follow_set,

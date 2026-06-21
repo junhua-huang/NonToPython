@@ -18,14 +18,14 @@ class NotificationService:
         return SessionLocal()
 
     @staticmethod
-    def _push_new_notification(user_id: int, notification: Notification):
-        """从 HTTP 请求线程安全地推送 WebSocket 通知"""
+    def _push_new_notification(user_id: int, notification_dict: dict):
+        """从 HTTP 请求线程安全地推送 WebSocket 通知。"""
         from app.ws_manager import ws_manager
 
         async def _push():
             db = SessionLocal()
             try:
-                sender_id = notification.sender_id if hasattr(notification, "sender_id") else None
+                sender_id = notification_dict.get("sender_id")
 
                 # 屏蔽检查：接收者屏蔽了发送者，则不推送
                 if sender_id and user_id != sender_id:
@@ -47,13 +47,33 @@ class NotificationService:
                     )
                     .count()
                 )
-                notification_dict = notification.to_dict() if hasattr(notification, "to_dict") else {}
-                notification_dict["sender"] = sender
+                notification_payload = dict(notification_dict)
+                notification_payload["sender"] = sender
 
                 await ws_manager.send_with_seq(user_id, "new_notification", {
-                    "notification": notification_dict,
+                    "notification": notification_payload,
                     "unread_count": unread_count,
                 })
+
+                # 极光推送：用户离线时（WS 投递不到）补一条系统通知，让用户即使不在
+                # App 内也能感知。前台用户 WS 已投递，这里跳过避免重复打扰。
+                if not ws_manager.is_connected(user_id):
+                    from app.services.push_service import PushService
+                    notif_type = notification_dict.get("notification_type") or "notification"
+                    related_id = notification_dict.get("related_id")
+                    related_type = notification_dict.get("related_type")
+                    alert_title = (notification_dict.get("title") or "南图")[:40]
+                    alert_content = (notification_dict.get("content") or "你有一条新通知")[:80]
+                    PushService.schedule_send_to_user(
+                        user_id,
+                        alert_title=alert_title,
+                        alert_content=alert_content,
+                        extras={
+                            "type": notif_type,
+                            "related_id": str(related_id) if related_id is not None else "",
+                            "related_type": related_type or "",
+                        },
+                    )
             except Exception as e:
                 logger.warning(f"[NOTIFY PUSH] failed uid={user_id}: {e}", exc_info=True)
             finally:
@@ -82,7 +102,8 @@ class NotificationService:
             db.refresh(notification)
 
             # --- WebSocket 推送 ---
-            NotificationService._push_new_notification(user_id, notification)
+            notification_dict = notification.to_dict()
+            NotificationService._push_new_notification(user_id, notification_dict)
 
             return notification
         except Exception as e:

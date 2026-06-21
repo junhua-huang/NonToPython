@@ -16,11 +16,20 @@ router = APIRouter()
 def get_personalized_feed(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
+    cursor: str | None = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """获取个性化推荐动态"""
-    result = RecommendationService.get_personalized_feed(db, user_id=user.id, page=page, per_page=per_page)
+    page = min(page, 50)
+    per_page = min(per_page, 20)
+    result = RecommendationService.get_personalized_feed(
+        db,
+        user_id=user.id,
+        page=page,
+        per_page=per_page,
+        cursor=cursor,
+    )
     return result
 
 

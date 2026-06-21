@@ -95,14 +95,59 @@ def _can_send_to_user(db: Session, from_user_id: int, to_user_id: int) -> bool:
     return is_friend is not None
 
 
+def _can_send_to_participants(from_user_id: int, participant_ids: list[int]) -> bool:
+    """Return whether a user can send to all other participants in an existing conversation."""
+    for participant_id in participant_ids:
+        if participant_id == from_user_id:
+            continue
+        if from_user_id in ws_manager.get_blocked_user_ids(participant_id):
+            return False
+        if participant_id in ws_manager.get_blocked_user_ids(from_user_id):
+            return False
+    return True
+
+
+def _validate_send_message_payload(payload: dict) -> dict | None:
+    """Validate send_message payload. Returns {'code', 'error'} when invalid."""
+    conversation_id = payload.get("conversation_id")
+    receiver_id = payload.get("receiver_id")
+    message_type = payload.get("message_type", "text")
+    content = (payload.get("content") or "").strip()
+
+    if not conversation_id and not receiver_id:
+        return {"code": 400, "error": "conversation_id or receiver_id required"}
+    if message_type == "text" and not content:
+        return {"code": 400, "error": "Content cannot be empty"}
+    return None
+
+
+def _send_error_status(error: str) -> int:
+    if error == "Conversation not found":
+        return 404
+    if error in {"Not a conversation participant", "Cannot send message to this user"}:
+        return 403
+    if error == "Content cannot be empty":
+        return 400
+    return 500
+
+
 def _build_session_list(db: Session, user_id: int) -> list[dict]:
     from sqlalchemy import func
     from app.models.models import Conversation, ConversationParticipant, Message, User
+    from app.models.community import CommunityMember
 
     conversations = (
         db.query(Conversation)
-        .join(ConversationParticipant)
-        .filter(ConversationParticipant.user_id == user_id)
+        .outerjoin(ConversationParticipant)
+        .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
+        .filter(
+            (ConversationParticipant.user_id == user_id)
+            | (
+                (Conversation.type == 'community')
+                & (CommunityMember.user_id == user_id)
+                & (CommunityMember.status == 'active')
+            )
+        )
         .order_by(Conversation.last_message_at.desc())
         .limit(50)
         .all()
@@ -115,7 +160,8 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
     if blocked_ids:
         conversations = [
             c for c in conversations
-            if (c.user1_id if c.user2_id == user_id else c.user2_id) not in blocked_ids
+            if c.type == 'community'
+            or (c.user1_id if c.user2_id == user_id else c.user2_id) not in blocked_ids
         ]
         if not conversations:
             return []
@@ -147,7 +193,11 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
 
     all_partner_ids = set()
     for conv in conversations:
-        all_partner_ids.add(conv.user1_id if conv.user2_id == user_id else conv.user2_id)
+        if conv.type == 'community':
+            continue
+        partner_id = conv.user1_id if conv.user2_id == user_id else conv.user2_id
+        if partner_id is not None:
+            all_partner_ids.add(partner_id)
 
     partners = {}
     if all_partner_ids:
@@ -156,12 +206,28 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
 
     session_list = []
     for conv in conversations:
+        if conv.type == 'community':
+            session_list.append({
+                'id': conv.id,
+                'conversation_id': conv.id,
+                'type': conv.type,
+                'community_id': conv.community_id,
+                'community_name': conv.community.name if conv.community else None,
+                'community_avatar': conv.community.avatar_url if conv.community else None,
+                'last_message': last_messages.get(conv.id),
+                'unread_count': unread_counts.get(conv.id, 0),
+                'created_at': conv.created_at.isoformat() if conv.created_at else None,
+                'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
+            })
+            continue
+
         partner_id = conv.user1_id if conv.user2_id == user_id else conv.user2_id
         if partner_id not in partners:
             continue
         session_list.append({
             'id': conv.id,
             'conversation_id': conv.id,
+            'type': conv.type,
             'partner_id': partner_id,
             'partner': partners.get(partner_id),
             'last_message': last_messages.get(conv.id),
@@ -255,11 +321,21 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
         def _load_convs():
             db = _get_db_session()
             try:
+                from app.models.community import CommunityMember
+
                 return [
                     c.id for c in
                     db.query(Conversation)
-                    .join(ConversationParticipant)
-                    .filter(ConversationParticipant.user_id == user_id)
+                    .outerjoin(ConversationParticipant)
+                    .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
+                    .filter(
+                        (ConversationParticipant.user_id == user_id)
+                        | (
+                            (Conversation.type == 'community')
+                            & (CommunityMember.user_id == user_id)
+                            & (CommunityMember.status == 'active')
+                        )
+                    )
                     .all()
                 ]
             finally:
@@ -326,6 +402,11 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     quote_message_id = payload.get("quote_message_id")
     quote_preview = payload.get("quote_preview")
 
+    validation_error = _validate_send_message_payload(payload)
+    if validation_error:
+        await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
+        return
+
     # 1. 幂等
     if client_msg_id and await ws_manager.check_and_record_dedup(user_id, client_msg_id):
         # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
@@ -343,10 +424,6 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             })
         return
 
-    if not conversation_id and not receiver_id:
-        await _send_error(user_id, request_id, 400, "conversation_id or receiver_id required")
-        return
-
     # 2. 持久化
     def _persist():
         db = _get_db_session()
@@ -358,6 +435,8 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 participant_ids = _get_conversation_participant_ids(db, conversation_id)
                 if user_id not in participant_ids:
                     return {"error": "Not a conversation participant"}
+                if not _can_send_to_participants(user_id, participant_ids):
+                    return {"error": "Cannot send message to this user"}
             elif receiver_id:
                 if not _can_send_to_user(db, user_id, receiver_id):
                     return {"error": "Cannot send message to this user"}
@@ -421,7 +500,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     result = await loop.run_in_executor(None, _persist)
 
     if isinstance(result, dict) and "error" in result:
-        await _send_error(user_id, request_id, 500, result["error"])
+        await _send_error(user_id, request_id, _send_error_status(result["error"]), result["error"])
         return
 
     # 3. ACK
@@ -492,6 +571,8 @@ async def _handle_send_event(websocket: WebSocket, user_id: int, data: dict):
     """处理 send_event：已读、通知已读等状态事件"""
     request_id = data.get("request_id", "")
     payload = _get_payload(data)
+    if request_id and not payload.get("request_id"):
+        payload = {**payload, "request_id": request_id}
     if not payload.get("event") and data.get("event"):
         payload = {**payload, "event": data["event"]}
     if not payload.get("conversation_id") and data.get("conversation_id"):
@@ -583,7 +664,7 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
 
 async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload: dict):
     """会话标记已读"""
-    from app.models.models import Message
+    from app.models.models import Message, ConversationParticipant
 
     conv_id = payload.get("conversation_id")
     if not conv_id:
@@ -592,20 +673,34 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
     def _mark():
         db = _get_db_session()
         try:
+            participant = (
+                db.query(ConversationParticipant)
+                .filter(
+                    ConversationParticipant.conversation_id == conv_id,
+                    ConversationParticipant.user_id == user_id,
+                )
+                .first()
+            )
+            if not participant:
+                return {"error": "Not a conversation participant"}
+
             result = (
                 db.query(Message)
                 .filter(Message.conversation_id == conv_id, Message.sender_id != user_id, Message.is_read == False)
                 .update({"is_read": True})
             )
             db.commit()
-            if result > 0:
-                return _get_conversation_participant_ids(db, conv_id)
-            return []
+            participant_ids = _get_conversation_participant_ids(db, conv_id)
+            return participant_ids if result > 0 else []
         finally:
             db.close()
 
     loop = asyncio.get_event_loop()
     participant_ids = await loop.run_in_executor(None, _mark)
+
+    if isinstance(participant_ids, dict) and "error" in participant_ids:
+        await _send_error(user_id, payload.get("request_id", ""), 403, participant_ids["error"])
+        return
 
     for pid in participant_ids:
         if pid != user_id:
@@ -687,14 +782,30 @@ async def _handle_join(websocket: WebSocket, user_id: int, data: dict):
     def _check():
         db = _get_db_session()
         try:
-            from app.models.models import ConversationParticipant
-            p = (
+            from app.models.models import Conversation, ConversationParticipant
+            from app.models.community import CommunityMember
+
+            participant = (
                 db.query(ConversationParticipant)
                 .filter(ConversationParticipant.conversation_id == conv_id,
                         ConversationParticipant.user_id == user_id)
                 .first()
             )
-            return p is not None
+            if participant:
+                return True
+
+            community_member = (
+                db.query(Conversation)
+                .join(CommunityMember, CommunityMember.community_id == Conversation.community_id)
+                .filter(
+                    Conversation.id == conv_id,
+                    Conversation.type == 'community',
+                    CommunityMember.user_id == user_id,
+                    CommunityMember.status == 'active',
+                )
+                .first()
+            )
+            return community_member is not None
         finally:
             db.close()
 
@@ -752,21 +863,29 @@ async def websocket_endpoint(websocket: WebSocket):
     user_id = None
     conn_id = None
 
+    # 优先从 URL query 参数取 token（兜底：若客户端先发 connect 再接消息 auth，避免时序竞争）
+    token_from_url = websocket.query_params.get("access_token", "")
+
     try:
         # ── 阶段 1: 等待 auth ──
-        try:
-            data = await asyncio.wait_for(websocket.receive_json(), timeout=AUTH_TIMEOUT)
-        except asyncio.TimeoutError:
-            await websocket.close(code=4001, reason="auth_timeout")
-            return
+        if token_from_url:
+            token = token_from_url
+            request_id = ""
+            logger.info(f"[WS] token from URL query param")
+        else:
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=AUTH_TIMEOUT)
+            except asyncio.TimeoutError:
+                await websocket.close(code=4001, reason="auth_timeout")
+                return
 
-        msg_type = data.get("type", "")
-        if msg_type != "auth":
-            await websocket.close(code=4001, reason="auth_required")
-            return
+            msg_type = data.get("type", "")
+            if msg_type != "auth":
+                await websocket.close(code=4001, reason="auth_required")
+                return
 
-        token = data.get("payload", {}).get("token", "")
-        request_id = data.get("request_id", "")
+            token = data.get("payload", {}).get("token", "")
+            request_id = data.get("request_id", "")
 
         if not token:
             await websocket.send_json(_make_response("auth_result", request_id,

@@ -16,6 +16,9 @@ env/
 # Logs
 *.log
 
+# Archives / local bundles
+*.zip
+
 # Environment
 .env
 .env.local

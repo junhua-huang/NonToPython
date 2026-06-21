@@ -28,6 +28,8 @@ async def create_post(
     video_url_input: Optional[str] = Form(None, alias="video_url"),
     visibility: str = Form("public"),
     visible_user_ids: Optional[str] = Form(None),
+    community_id: Optional[int] = Form(None),
+    community_only: Optional[bool] = Form(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -106,6 +108,20 @@ async def create_post(
             })
         content = moderation_result["filtered_text"]
 
+    # 社群发帖校验
+    if community_id:
+        from app.models.community import Community, CommunityMember
+        c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
+        if not c:
+            raise HTTPException(status_code=404, detail="社群不存在")
+        m = db.query(CommunityMember).filter(
+            CommunityMember.community_id == community_id,
+            CommunityMember.user_id == current_user_id,
+            CommunityMember.status == 'active',
+        ).first()
+        if not m:
+            raise HTTPException(status_code=403, detail="你不是该社群成员，无法发帖")
+
     post = Post(
         content=content,
         images=images_json,
@@ -114,6 +130,8 @@ async def create_post(
         user_id=current_user_id,
         visibility=visibility,
         is_public=(visibility == "public"),
+        community_id=community_id,
+        community_only=community_only or False,
     )
 
     try:
@@ -143,40 +161,58 @@ async def create_post(
 def get_posts(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
+    community_id: Optional[int] = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取帖子列表（动态）"""
+    """获取帖子列表（动态）。community_id 非空时返回社群帖子流。"""
     current_user_id = user.id
 
-    friendships = db.query(Friendship).filter(
-        ((Friendship.sender_id == current_user_id) | (Friendship.receiver_id == current_user_id))
-        & (Friendship.status == "accepted")
-    ).all()
-    friend_ids = [
-        f.sender_id if f.receiver_id == current_user_id else f.receiver_id for f in friendships
-    ]
-    friend_ids.append(current_user_id)
+    # 社群帖子流：只看该社群帖子
+    if community_id:
+        from app.models.community import Community
+        c = db.query(Community).filter(Community.id == community_id).first()
+        if not c or c.status != 'active':
+            raise HTTPException(status_code=404, detail="社群不存在")
 
-    # 过滤已屏蔽用户的帖子
-    from app.ws_manager import ws_manager
-    blocked_ids = ws_manager.get_blocked_user_ids(current_user_id)
-
-    posts_query = (
-        db.query(Post)
-        .filter(
-            or_(
-                Post.visibility == "public",
-                Post.user_id.in_(friend_ids),
-            )
+        posts_query = (
+            db.query(Post)
+            .filter(Post.community_id == community_id, Post.hidden_by_admin == False)
+            .order_by(Post.created_at.desc())
         )
-        .order_by(Post.created_at.desc())
-    )
+        offset = (page - 1) * per_page
+    else:
+        # 主信息流
+        friendships = db.query(Friendship).filter(
+            ((Friendship.sender_id == current_user_id) | (Friendship.receiver_id == current_user_id))
+            & (Friendship.status == "accepted")
+        ).all()
+        friend_ids = [
+            f.sender_id if f.receiver_id == current_user_id else f.receiver_id for f in friendships
+        ]
+        friend_ids.append(current_user_id)
 
-    if blocked_ids:
-        posts_query = posts_query.filter(~Post.user_id.in_(blocked_ids))
+        # 过滤已屏蔽用户的帖子
+        from app.ws_manager import ws_manager
+        blocked_ids = ws_manager.get_blocked_user_ids(current_user_id)
 
-    offset = (page - 1) * per_page
+        posts_query = (
+            db.query(Post)
+            .filter(
+                or_(
+                    Post.visibility == "public",
+                    Post.user_id.in_(friend_ids),
+                )
+            )
+            .filter(or_(Post.community_only == False, Post.community_only == None))  # 主信息流排除仅社群可见帖
+            .order_by(Post.created_at.desc())
+        )
+
+        if blocked_ids:
+            posts_query = posts_query.filter(~Post.user_id.in_(blocked_ids))
+
+        offset = (page - 1) * per_page
+
     posts = posts_query.offset(offset).limit(per_page + 1).all()
     has_more = len(posts) > per_page
     if has_more:
@@ -348,19 +384,22 @@ def get_user_liked_posts(
         return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
 
     try:
-        likes_query = db.query(Like).filter(Like.user_id == user_id).order_by(Like.created_at.desc())
         offset = (page - 1) * per_page
-        likes = likes_query.offset(offset).limit(per_page + 1).all()
-        has_more = len(likes) > per_page
+        liked_rows = (
+            db.query(Post, Like.created_at.label("liked_at"))
+            .join(Like, Like.post_id == Post.id)
+            .filter(Like.user_id == user_id)
+            .order_by(Like.created_at.desc())
+            .offset(offset)
+            .limit(per_page + 1)
+            .all()
+        )
+        has_more = len(liked_rows) > per_page
         if has_more:
-            likes = likes[:per_page]
+            liked_rows = liked_rows[:per_page]
 
         current_user_id = user.id
-        # 收集所有有效的 post 对象
-        post_objects = []
-        for like in likes:
-            if like.post:
-                post_objects.append(like.post)
+        post_objects = [post for post, _liked_at in liked_rows]
 
         from app.services.recommendation_service import RecommendationService
         batch_data = RecommendationService._batch_load_post_data(db, post_objects, current_user_id)
