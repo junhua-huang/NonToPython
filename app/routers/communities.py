@@ -33,6 +33,33 @@ def _community_message_to_dict(message: Message):
     }
 
 
+def _normalize_community_message_payload(payload: dict):
+    content = (payload.get("content") or "").strip()
+    message_type = (payload.get("message_type") or "text").strip().lower()
+    media_url = (payload.get("media_url") or "").strip()
+    mention_user_ids = payload.get("mention_user_ids", [])
+    allowed_types = {'text', 'image', 'video'}
+
+    if message_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="不支持的消息类型")
+
+    if message_type == 'text' and not content:
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+    if message_type in {'image', 'video'}:
+        if not (media_url or content):
+            raise HTTPException(status_code=400, detail="媒体消息不能为空")
+        if not media_url:
+            media_url = content
+        if not content:
+            content = media_url
+
+    if not isinstance(mention_user_ids, list):
+        mention_user_ids = []
+
+    return content, message_type, media_url or None, mention_user_ids
+
+
 # ============================================================
 # 我的社群（必须在 /{community_id} 前定义）
 # ============================================================
@@ -451,13 +478,9 @@ async def send_community_message(
     if not conv:
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
-    content = (payload.get("content") or "").strip()
-    message_type = payload.get("message_type", "text")
-    media_url = payload.get("media_url")
-    mention_user_ids = payload.get("mention_user_ids", [])  # @提及的用户 ID 列表
-
-    if not content and not media_url:
-        raise HTTPException(status_code=400, detail="消息内容不能为空")
+    content, message_type, media_url, mention_user_ids = (
+        _normalize_community_message_payload(payload)
+    )
 
     now = datetime.utcnow()
     msg = Message(

@@ -53,6 +53,22 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('"sender":', source)
         self.assertIn('_community_message_to_dict(msg)', source)
 
+    def test_community_chat_accepts_image_and_video_media_payloads(self):
+        with open('app/routers/communities.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+
+        self.assertIn('def _normalize_community_message_payload', source)
+        self.assertIn("allowed_types = {'text', 'image', 'video'}", source)
+        self.assertIn("message_type == 'text'", source)
+        self.assertIn("message_type in {'image', 'video'}", source)
+        self.assertIn('media_url or content', source)
+        self.assertIn('raise HTTPException(status_code=400, detail="媒体消息不能为空")', source)
+        self.assertIn('content = media_url', source)
+        self.assertIn('message_type=message_type', source)
+        self.assertIn('media_url=media_url', source)
+        self.assertIn('"media_url"', source)
+        self.assertIn('"message_type"', source)
+
     def test_community_membership_maintains_conversation_participants_without_migration(self):
         with open('app/services/community_service.py', 'r', encoding='utf-8') as f:
             source = f.read()
