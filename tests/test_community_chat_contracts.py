@@ -150,6 +150,64 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('self._next_seq_sync(recipient_id, full_payload)', manager_source)
         self.assertIn('_send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)', manager_source)
 
+    def test_my_communities_response_includes_current_membership_for_share_targets(self):
+        from types import SimpleNamespace
+
+        from app.routers.communities import my_communities
+        from app.services.community_service import CommunityService
+
+        class CommunityStub:
+            def __init__(self, community_id, name):
+                self.id = community_id
+                self.name = name
+
+            def to_dict(self):
+                return {"id": self.id, "name": self.name}
+
+        class QueryStub:
+            def __init__(self, members):
+                self.members = members
+
+            def filter(self, *args):
+                return self
+
+            def all(self):
+                return self.members
+
+        class DbStub:
+            def __init__(self, members):
+                self.members = members
+
+            def query(self, model):
+                return QueryStub(self.members)
+
+        communities = [
+            CommunityStub(101, "摄影群"),
+            CommunityStub(202, "活动群"),
+        ]
+        members = [
+            SimpleNamespace(community_id=202, role="member", status="active"),
+            SimpleNamespace(community_id=101, role="admin", status="active"),
+        ]
+        original = CommunityService.list_my_communities
+        CommunityService.list_my_communities = staticmethod(
+            lambda db, user_id, manage_only=False: communities
+        )
+        try:
+            result = my_communities(
+                user=SimpleNamespace(id=9),
+                db=DbStub(members),
+            )
+        finally:
+            CommunityService.list_my_communities = original
+
+        self.assertEqual(result, {
+            "communities": [
+                {"id": 101, "name": "摄影群", "my_role": "admin", "my_status": "active"},
+                {"id": 202, "name": "活动群", "my_role": "member", "my_status": "active"},
+            ]
+        })
+
     def test_community_membership_maintains_conversation_participants_without_migration(self):
         with open('app/services/community_service.py', 'r', encoding='utf-8') as f:
             source = f.read()

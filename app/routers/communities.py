@@ -61,7 +61,21 @@ def my_communities(
 ):
     """我加入的社群（manage_only=True 仅返回我管理的）"""
     items = CommunityService.list_my_communities(db, user.id, manage_only=manage_only)
-    return {"communities": [c.to_dict() for c in items]}
+    community_ids = [community.id for community in items]
+    members = db.query(CommunityMember).filter(
+        CommunityMember.user_id == user.id,
+        CommunityMember.community_id.in_(community_ids),
+    ).all() if community_ids else []
+    member_by_community = {member.community_id: member for member in members}
+    communities = []
+    for community in items:
+        data = community.to_dict()
+        member = member_by_community.get(community.id)
+        if member:
+            data['my_role'] = member.role
+            data['my_status'] = member.status
+        communities.append(data)
+    return {"communities": communities}
 
 
 # ============================================================
