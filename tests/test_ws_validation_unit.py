@@ -18,6 +18,20 @@ class WebSocketValidationTests(unittest.TestCase):
         self.assertEqual(ws._send_error_status("Cannot send message to this user"), 403)
         self.assertEqual(ws._send_error_status("Message send failed"), 500)
 
+    def test_send_payload_rejects_unknown_message_type(self):
+        payload = {"conversation_id": 10, "message_type": "file", "content": "x"}
+
+        error = ws._validate_send_message_payload(payload)
+
+        self.assertEqual(error, {"code": 400, "error": "不支持的消息类型"})
+
+    def test_send_payload_rejects_user_created_system_message(self):
+        payload = {"conversation_id": 10, "message_type": "system", "content": "fake"}
+
+        error = ws._validate_send_message_payload(payload)
+
+        self.assertEqual(error, {"code": 403, "error": "系统消息不能由用户发送"})
+
     def test_existing_conversation_send_checks_block_state_between_participants(self):
         with patch.object(ws.ws_manager, "get_blocked_user_ids", side_effect=lambda uid: {1} if uid == 2 else set()):
             allowed = ws._can_send_to_participants(1, [1, 2])

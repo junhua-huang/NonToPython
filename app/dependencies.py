@@ -63,23 +63,12 @@ def require_role(*role_names: str):
         except AuthError as e:
             raise HTTPException(status_code=e.code, detail=e.message)
 
-        # 从 JWT payload 中读取角色（快速路径），不在则查库
-        from jose import jwt
-        from app.core.config import Config
-        try:
-            payload = jwt.decode(access_token, Config.JWT_SECRET_KEY, algorithms=["HS256"])
-            token_roles = set(payload.get("roles", []))
-        except Exception:
-            token_roles = set()
-
-        if token_roles:
-            user_roles = token_roles
-        else:
-            from app.models.models import UserRole, Role
-            ur_rows = db.query(UserRole).filter(UserRole.user_id == user.id).all()
-            role_ids = [ur.role_id for ur in ur_rows]
-            roles = db.query(Role).filter(Role.id.in_(role_ids)).all()
-            user_roles = {r.name for r in roles}
+        # 权限以数据库为准，避免 JWT 内旧 roles 在撤销/暂停后继续生效。
+        from app.models.models import UserRole, Role
+        ur_rows = db.query(UserRole).filter(UserRole.user_id == user.id).all()
+        role_ids = [ur.role_id for ur in ur_rows]
+        roles = db.query(Role).filter(Role.id.in_(role_ids)).all() if role_ids else []
+        user_roles = {r.name for r in roles}
 
         if not any(r in user_roles for r in role_names):
             raise HTTPException(status_code=403, detail=f"Required role(s): {', '.join(role_names)}")
@@ -94,15 +83,15 @@ def require_role(*role_names: str):
 # ============================================================
 
 require_admin     = require_role("admin")
-require_organizer = require_role("organizer")
+require_organizer = require_role("event_organizer")
 require_coser     = require_role("coser")
 
 require_service_provider = require_role(
     "coser", "wig_stylist", "makeup_artist",
-    "photographer", "editor", "ticket_agent"
+    "photographer", "retoucher", "ticket_agent", "prop_maker", "costume_maker"
 )
 
-require_content_manager = require_role("admin", "organizer")
+require_content_manager = require_role("admin", "event_organizer")
 
 
 def admin_required(user: User = Depends(require_admin)):

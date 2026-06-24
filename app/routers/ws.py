@@ -15,11 +15,12 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.ws_manager import ws_manager
+from app.services.message_type_service import normalize_user_message_payload
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,26 @@ AUTH_TIMEOUT = 15  # 连接后 15s 内必须发 auth，否则断开
 
 def _get_db_session() -> Session:
     return SessionLocal()
+
+
+def _should_create_message_notification(db: Session, user_id: int) -> bool:
+    """后台/离线用户需要通知中心记录和系统推送入口。"""
+    if not ws_manager.is_connected(user_id):
+        return True
+    from app.services.push_service import PushService
+    return PushService.has_push_target(db, user_id)
+
+
+def _get_message_notification_targets(sender_id: int, participant_ids: list[int]) -> list[int]:
+    """在独立 DB session 中筛选需要通知中心记录的接收方。"""
+    db = _get_db_session()
+    try:
+        return [
+            pid for pid in participant_ids
+            if pid != sender_id and _should_create_message_notification(db, pid)
+        ]
+    finally:
+        db.close()
 
 
 def _get_conversation(db: Session, user_id: int, other_id: int):
@@ -111,13 +132,19 @@ def _validate_send_message_payload(payload: dict) -> dict | None:
     """Validate send_message payload. Returns {'code', 'error'} when invalid."""
     conversation_id = payload.get("conversation_id")
     receiver_id = payload.get("receiver_id")
-    message_type = payload.get("message_type", "text")
+    message_type = (payload.get("message_type") or "text").strip().lower()
     content = (payload.get("content") or "").strip()
 
     if not conversation_id and not receiver_id:
         return {"code": 400, "error": "conversation_id or receiver_id required"}
     if message_type == "text" and not content:
         return {"code": 400, "error": "Content cannot be empty"}
+    if message_type == "post":
+        return None
+    try:
+        normalize_user_message_payload(payload, db=None)
+    except HTTPException as exc:
+        return {"code": exc.status_code, "error": exc.detail}
     return None
 
 
@@ -442,6 +469,12 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                     return {"error": "Cannot send message to this user"}
                 conv = _get_conversation(db, user_id, receiver_id)
 
+            normalized = normalize_user_message_payload(payload, db)
+            content = normalized["content"]
+            media_url = normalized["media_url"]
+            related_id = normalized["related_id"]
+            message_type = normalized["message_type"]
+
             msg = Message(
                 conversation_id=conv.id,
                 sender_id=user_id,
@@ -489,6 +522,9 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 "participant_ids": participant_ids,
                 "unread_counts": unread_counts,
             }
+        except HTTPException as e:
+            db.rollback()
+            return {"error": e.detail, "code": e.status_code}
         except Exception as e:
             logger.error(f"[WS SEND] uid={user_id} persist_error: {e}")
             db.rollback()
@@ -500,7 +536,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     result = await loop.run_in_executor(None, _persist)
 
     if isinstance(result, dict) and "error" in result:
-        await _send_error(user_id, request_id, _send_error_status(result["error"]), result["error"])
+        await _send_error(user_id, request_id, result.get("code", _send_error_status(result["error"])), result["error"])
         return
 
     # 3. ACK
@@ -552,15 +588,12 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         pass
     # #endregion
 
-    # 离线用户写入通知中心（在线用户已通过 WS 实时推送）
-    offline_targets = [
-        p for p in result["participant_ids"]
-        if p != user_id and not ws_manager.is_connected(p)
-    ]
-    if offline_targets:
+    # 后台/离线用户写入通知中心（后台 WS 半连接也需要系统通知入口）
+    notify_targets = _get_message_notification_targets(user_id, result["participant_ids"])
+    if notify_targets:
         from app.services.notification_service import NotificationService
         content = result["msg"].get("content") or ""
-        for pid in offline_targets:
+        for pid in notify_targets:
             NotificationService.notify_message(pid, user_id, content, result["conv_id"])
 
     # 5. 失效缓存

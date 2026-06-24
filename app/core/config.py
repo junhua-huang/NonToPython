@@ -73,6 +73,13 @@ class Config:
     JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
     # iOS: true=生产环境 APNs，false=开发环境；Android 忽略此参数
     JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'false').lower() == 'true'
+    JPUSH_ENABLE_THIRD_PARTY_CHANNEL = os.environ.get('JPUSH_ENABLE_THIRD_PARTY_CHANNEL', 'false').lower() == 'true'
+    JPUSH_THIRD_PARTY_CHANNELS = {
+        item.strip().lower()
+        for item in os.environ.get('JPUSH_THIRD_PARTY_CHANNELS', '').split(',')
+        if item.strip()
+    }
+    PUSH_FOREGROUND_ACTIVE_SECONDS = int(os.environ.get('PUSH_FOREGROUND_ACTIVE_SECONDS', '120'))
 
     # 邮件 (SMTP) 配置 - 用于发送邮箱验证码
     # QQ 邮箱用 SSL 465 端口，授权码非登录密码

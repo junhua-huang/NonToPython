@@ -8,7 +8,7 @@ import logging
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Post, Like, Comment, Friendship, PostView, Notification, post_visibility
+from app.models.models import BUSINESS_IDENTITY_ROLES, User, Post, Like, Comment, Friendship, PostView, Notification, Role, UserRole, post_visibility
 from sqlalchemy import or_, select
 from app.core.config import Config
 from app.utils import FileUploader
@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def resolve_display_role_type(user: User, requested_role: Optional[str], db: Session) -> Optional[str]:
+    """只允许使用当前用户已认证业务身份；无效值不阻断发帖。"""
+    role_name = requested_role.strip().lower() if requested_role else ""
+    if not role_name or role_name not in BUSINESS_IDENTITY_ROLES:
+        return None
+
+    row = (
+        db.query(UserRole)
+        .join(Role, UserRole.role_id == Role.id)
+        .filter(UserRole.user_id == user.id, Role.name == role_name)
+        .first()
+    )
+    return role_name if row else None
+
+
 @router.post("")
 async def create_post(
     image: Optional[UploadFile] = File(None),
@@ -26,6 +41,8 @@ async def create_post(
     content: Optional[str] = Form(None),
     image_urls: Optional[str] = Form(None),
     video_url_input: Optional[str] = Form(None, alias="video_url"),
+    content_category: Optional[str] = Form(None),
+    display_role_type: Optional[str] = Form(None),
     visibility: str = Form("public"),
     visible_user_ids: Optional[str] = Form(None),
     community_id: Optional[int] = Form(None),
@@ -128,6 +145,8 @@ async def create_post(
         video_url=final_video_url,
         post_type=post_type,
         user_id=current_user_id,
+        content_category=content_category.strip() if content_category else None,
+        display_role_type=resolve_display_role_type(user, display_role_type, db),
         visibility=visibility,
         is_public=(visibility == "public"),
         community_id=community_id,

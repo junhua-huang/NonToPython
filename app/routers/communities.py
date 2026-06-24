@@ -13,6 +13,7 @@ from app.dependencies import get_current_user, get_optional_user
 from app.models.models import User, Conversation, Message
 from app.models.community import Community, CommunityMember
 from app.services.community_service import CommunityService, CommunityError, MAX_ADMINS
+from app.services.message_type_service import normalize_user_message_payload
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -33,31 +34,19 @@ def _community_message_to_dict(message: Message):
     }
 
 
-def _normalize_community_message_payload(payload: dict):
-    content = (payload.get("content") or "").strip()
-    message_type = (payload.get("message_type") or "text").strip().lower()
-    media_url = (payload.get("media_url") or "").strip()
+def _normalize_community_message_payload(payload: dict, db: Session):
+    normalized = normalize_user_message_payload(payload, db)
     mention_user_ids = payload.get("mention_user_ids", [])
-    allowed_types = {'text', 'image', 'video'}
-
-    if message_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="不支持的消息类型")
-
-    if message_type == 'text' and not content:
-        raise HTTPException(status_code=400, detail="消息内容不能为空")
-
-    if message_type in {'image', 'video'}:
-        if not (media_url or content):
-            raise HTTPException(status_code=400, detail="媒体消息不能为空")
-        if not media_url:
-            media_url = content
-        if not content:
-            content = media_url
-
     if not isinstance(mention_user_ids, list):
         mention_user_ids = []
 
-    return content, message_type, media_url or None, mention_user_ids
+    return (
+        normalized["content"],
+        normalized["message_type"],
+        normalized["media_url"],
+        normalized["related_id"],
+        mention_user_ids,
+    )
 
 
 # ============================================================
@@ -478,8 +467,8 @@ async def send_community_message(
     if not conv:
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
-    content, message_type, media_url, mention_user_ids = (
-        _normalize_community_message_payload(payload)
+    content, message_type, media_url, related_id, mention_user_ids = (
+        _normalize_community_message_payload(payload, db)
     )
 
     now = datetime.utcnow()
@@ -489,6 +478,7 @@ async def send_community_message(
         content=content,
         message_type=message_type,
         media_url=media_url,
+        related_id=related_id,
         created_at=now,
     )
     db.add(msg)

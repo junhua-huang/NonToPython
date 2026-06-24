@@ -10,7 +10,8 @@ Master Secret 仅存在于服务端，绝不返回给客户端。
 import asyncio
 import base64
 import logging
-from typing import Optional
+from datetime import datetime
+from typing import Iterable, Optional
 
 import httpx
 from sqlalchemy.orm import Session
@@ -53,14 +54,52 @@ class PushService:
         return bool(Config.JPUSH_APP_KEY and Config.JPUSH_MASTER_SECRET)
 
     @classmethod
-    def get_active_registration_ids(cls, db: Session, user_id: int) -> list:
-        """查询用户所有激活设备的 registration_id"""
+    def is_foreground_active(cls, device: UserDevice, now: Optional[datetime] = None) -> bool:
+        """仅最近上报 foreground 的设备视为前台活跃。"""
+        if getattr(device, "app_state", None) != "foreground":
+            return False
+        updated_at = getattr(device, "app_state_updated_at", None)
+        if updated_at is None:
+            return False
+        now = now or datetime.utcnow()
+        age_seconds = (now - updated_at).total_seconds()
+        return 0 <= age_seconds <= Config.PUSH_FOREGROUND_ACTIVE_SECONDS
+
+    @classmethod
+    def filter_push_registration_ids(cls, devices: Iterable[UserDevice]) -> list[str]:
+        """返回应接收系统推送的活跃 Android registration_id。"""
+        targets: list[str] = []
+        for device in devices:
+            if not getattr(device, "is_active", False):
+                continue
+            if (getattr(device, "platform", "android") or "android").lower() != "android":
+                continue
+            registration_id = getattr(device, "registration_id", None)
+            if not registration_id:
+                continue
+            if cls.is_foreground_active(device):
+                continue
+            targets.append(registration_id)
+        return targets
+
+    @classmethod
+    def has_push_target(cls, db: Session, user_id: int) -> bool:
         devices = (
             db.query(UserDevice)
             .filter(UserDevice.user_id == user_id, UserDevice.is_active == True)
             .all()
         )
-        return [d.registration_id for d in devices if d.registration_id]
+        return bool(cls.filter_push_registration_ids(devices))
+
+    @classmethod
+    def get_push_registration_ids(cls, db: Session, user_id: int) -> list[str]:
+        """查询该用户应接收系统推送的 Android registration_id。"""
+        devices = (
+            db.query(UserDevice)
+            .filter(UserDevice.user_id == user_id, UserDevice.is_active == True)
+            .all()
+        )
+        return cls.filter_push_registration_ids(devices)
 
     @classmethod
     def is_push_enabled_for_user(cls, db: Session, user_id: int) -> bool:
@@ -70,6 +109,43 @@ class PushService:
             return False
         # notify_push 默认 True；显式为 False 才关闭
         return getattr(user, "notify_push", True) is not False
+
+    @classmethod
+    def build_android_payload(
+        cls,
+        reg_ids: list[str],
+        alert_title: str,
+        alert_content: str,
+        extras: Optional[dict] = None,
+    ) -> dict:
+        android_alert = {"alert": alert_content}
+        if alert_title:
+            android_alert["title"] = alert_title
+
+        payload = {
+            "platform": "android",
+            "audience": {"registration_id": reg_ids[:MAX_REGISTRATION_IDS_PER_CALL]},
+            "notification": {
+                "android": {**android_alert, "extras": extras or {}},
+            },
+            "options": {"time_to_live": 86400},
+        }
+        if Config.JPUSH_ENABLE_THIRD_PARTY_CHANNEL:
+            channel_templates = {
+                "huawei": {"distribution": "ospush", "importance": "NORMAL"},
+                "xiaomi": {"distribution": "ospush", "channel_id": "nonto_message"},
+                "oppo": {"distribution": "ospush", "channel_id": "nonto_message"},
+                "vivo": {"distribution": "ospush", "classification": 1},
+                "meizu": {"distribution": "ospush"},
+            }
+            enabled_channels = {
+                name: config
+                for name, config in channel_templates.items()
+                if name in Config.JPUSH_THIRD_PARTY_CHANNELS
+            }
+            if enabled_channels:
+                payload["options"]["third_party_channel"] = enabled_channels
+        return payload
 
     @classmethod
     async def send_to_user(
@@ -89,6 +165,7 @@ class PushService:
                        推荐 {type: message|like|comment|friend_request|..., related_id, related_type}
         :return: 是否成功（失败仅记日志，不抛异常，避免影响主流程）
         """
+        extras = extras or {}
         if not cls._enabled():
             logger.debug("[JPUSH] disabled (missing app_key/master_secret)")
             return False
@@ -97,12 +174,12 @@ class PushService:
         try:
             # 用户推送偏好
             if not cls.is_push_enabled_for_user(db, user_id):
-                logger.debug(f"[JPUSH] user {user_id} disabled push")
+                logger.info("[JPUSH] user disabled push uid=%s", user_id)
                 return False
 
-            reg_ids = cls.get_active_registration_ids(db, user_id)
+            reg_ids = cls.get_push_registration_ids(db, user_id)
             if not reg_ids:
-                logger.debug(f"[JPUSH] no active device for user {user_id}")
+                logger.info("[JPUSH] no eligible push target uid=%s", user_id)
                 return False
         except Exception as e:
             logger.warning(f"[JPUSH] query devices failed uid={user_id}: {e}")
@@ -110,32 +187,12 @@ class PushService:
         finally:
             db.close()
 
-        # 极光 android alert 同时支持 title + alert 字段
-        android_alert = {"alert": alert_content}
-        if alert_title:
-            android_alert["title"] = alert_title
-
-        extras = extras or {}
-        # extra_type 用于客户端路由分发
-        payload = {
-            "platform": "android",
-            "audience": {"registration_id": reg_ids[:MAX_REGISTRATION_IDS_PER_CALL]},
-            "notification": {
-                "android": {**android_alert, "extras": extras},
-            },
-            "options": {
-                "time_to_live": 86400,
-                # 第三方厂商通道：让 JPush 自动下发到华为/小米/OPPO/vivo/魅族
-                # 实际到达率取决于是否在极光控制台配置了各厂商证书
-                "third_party_channel": {
-                    "huawei": {"distribution": "ospush", "importance": "NORMAL"},
-                    "xiaomi": {"distribution": "ospush", "channel_id": "nonto_message"},
-                    "oppo": {"distribution": "ospush", "channel_id": "nonto_message"},
-                    "vivo": {"distribution": "ospush", "classification": 1},
-                    "meizu": {"distribution": "ospush"},
-                },
-            },
-        }
+        payload = cls.build_android_payload(
+            reg_ids=reg_ids,
+            alert_title=alert_title,
+            alert_content=alert_content,
+            extras=extras,
+        )
 
         try:
             client = await cls._get_client()
@@ -145,10 +202,20 @@ class PushService:
                 headers={"Authorization": cls._auth_header(), "Content-Type": "application/json"},
             )
             if resp.status_code == 200:
-                logger.info(f"[JPUSH] pushed uid={user_id} targets={len(reg_ids)} extras={extras.get('type')}")
+                logger.info(
+                    "[JPUSH] pushed uid=%s targets=%s type=%s third_party=%s",
+                    user_id,
+                    len(reg_ids),
+                    extras.get("type"),
+                    Config.JPUSH_ENABLE_THIRD_PARTY_CHANNEL,
+                )
                 return True
             logger.warning(
-                f"[JPUSH] push failed uid={user_id} status={resp.status_code} body={resp.text[:300]}"
+                "[JPUSH] push failed uid=%s targets=%s status=%s body=%s",
+                user_id,
+                len(reg_ids),
+                resp.status_code,
+                resp.text[:300],
             )
             return False
         except Exception as e:

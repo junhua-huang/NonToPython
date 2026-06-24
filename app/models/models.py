@@ -3,6 +3,7 @@ FastAPI 版本 - 数据模型定义
 从 Flask-SQLAlchemy 迁移至 SQLAlchemy 2.0+ Declarative
 """
 from datetime import datetime
+import json
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime, Float, ForeignKey,
     Table, Index, func, UniqueConstraint
@@ -15,6 +16,44 @@ def _get_ws_manager():
     """延迟导入，避免循环依赖"""
     from app.ws_manager import ws_manager
     return ws_manager
+
+
+BUSINESS_IDENTITY_ROLES = {
+    "event_organizer": "活动方",
+    "coser": "Coser",
+    "photographer": "摄影师",
+    "wig_stylist": "毛娘",
+    "makeup_artist": "妆娘",
+    "ticket_agent": "票代",
+    "prop_maker": "道具师",
+    "costume_maker": "服装师",
+    "retoucher": "后期师",
+}
+
+SYSTEM_ROLE_NAMES = {"admin", "super_admin", "moderator"}
+ROLE_APPLICATION_STATUSES = {"pending", "verified", "rejected", "suspended"}
+
+
+def is_business_identity_role(role_name: str | None) -> bool:
+    return bool(role_name) and role_name in BUSINESS_IDENTITY_ROLES
+
+
+def get_business_identity_label(role_name: str | None) -> str | None:
+    if not role_name:
+        return None
+    return BUSINESS_IDENTITY_ROLES.get(role_name)
+
+
+def _json_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
 
 
 # ============================================================
@@ -93,12 +132,20 @@ class User(Base):
     user_roles = relationship('UserRole', back_populates='user', lazy='joined', cascade='all, delete-orphan')
     
     def get_role_names(self):
-        """返回当前用户的角色名列表"""
+        """返回当前用户的全部系统角色名，用于权限判断。"""
         return [ur.role.name for ur in self.user_roles if ur.role]
 
     def get_role_labels(self):
-        """返回当前用户的角色标签列表"""
+        """返回当前用户的全部系统角色标签，用于后台/鉴权响应。"""
         return [ur.role.label for ur in self.user_roles if ur.role]
+
+    def get_verified_identity_roles(self):
+        """返回公开展示的已认证业务身份。"""
+        return [ur.role.name for ur in self.user_roles if ur.role and is_business_identity_role(ur.role.name)]
+
+    def get_verified_identity_labels(self):
+        """返回公开展示的已认证业务身份标签。"""
+        return [ur.role.label for ur in self.user_roles if ur.role and is_business_identity_role(ur.role.name)]
 
     def has_role(self, role_name: str) -> bool:
         """检查用户是否拥有某个角色"""
@@ -118,8 +165,10 @@ class User(Base):
             'cover_photo_url': self.cover_photo_url,
             'is_online': is_online,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'roles': self.get_role_names(),
-            'role_labels': self.get_role_labels(),
+            'roles': self.get_verified_identity_roles(),
+            'role_labels': self.get_verified_identity_labels(),
+            'verified_roles': self.get_verified_identity_roles(),
+            'verified_role_labels': self.get_verified_identity_labels(),
         }
 
 
@@ -135,6 +184,8 @@ class Post(Base):
     images = Column(Text)  # JSON array string for multi-image support
     video_url = Column(String(255))
     post_type = Column(String(20), default='text')
+    content_category = Column(String(32), nullable=True)
+    display_role_type = Column(String(32), nullable=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -197,6 +248,9 @@ class Post(Base):
         # is_liked 必须由调用方传入，不再内部创建 Session
         # 如果调用方未传入且 current_user_id 不为 None，说明调用方未做批量查询，
         # 此时使用默认值 False（避免 N+1 反模式）
+        effective_display_role_type = self.display_role_type
+        if self.author is not None and self.display_role_type not in self.author.get_verified_identity_roles():
+            effective_display_role_type = None
 
         result = {
             'id': self.id,
@@ -205,6 +259,9 @@ class Post(Base):
             'image_urls': images_list,
             'video_url': self.video_url,
             'post_type': self.post_type,
+            'content_category': self.content_category,
+            'display_role_type': effective_display_role_type,
+            'display_role_label': get_business_identity_label(effective_display_role_type),
             'user_id': self.user_id,
             'author': self.author.to_dict() if self.author else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
@@ -411,7 +468,7 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey('conversations.id'), nullable=False, index=True)
     sender_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     content = Column(Text)
-    message_type = Column(String(20), default='text')  # text, image, system
+    message_type = Column(String(20), default='text')  # text, image, video, post, system
     media_url = Column(String(255))
     related_id = Column(Integer)
     quote_message_id = Column(Integer, nullable=True)
@@ -856,6 +913,7 @@ class Role(Base):
             'label': self.label,
             'description': self.description,
             'sort_order': self.sort_order,
+            'is_business_identity': is_business_identity_role(self.name),
         }
 
 
@@ -944,10 +1002,13 @@ class PhotographerProfile(Base):
 class ServiceProfile(Base):
     """通用服务商资料（毛娘 / 妆娘 / 后期师 / 票务代理）"""
     __tablename__ = 'service_profiles'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'service_type', name='uq_service_profiles_user_type'),
+    )
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
-    service_type = Column(String(32), nullable=False)  # wig_stylist / makeup_artist / editor / ticket_agent
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    service_type = Column(String(32), nullable=False)  # wig_stylist / makeup_artist / retoucher / ticket_agent / prop_maker / costume_maker
     description = Column(Text)
     city = Column(String(32), default='')
     is_available = Column(Boolean, default=True)
@@ -978,8 +1039,13 @@ class RoleApplication(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     role_id = Column(Integer, ForeignKey('roles.id', ondelete='CASCADE'), nullable=False)
-    status = Column(String(16), default='pending')   # pending / approved / rejected
+    status = Column(String(16), default='pending')   # pending / verified / rejected / suspended
     reason = Column(Text)
+    application_text = Column(Text)
+    proof_images = Column(Text)
+    portfolio_links = Column(Text)
+    contact_info = Column(String(255))
+    extra_note = Column(Text)
     review_comment = Column(Text)
     reviewer_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -995,8 +1061,13 @@ class RoleApplication(Base):
             'user_id': self.user_id,
             'role_id': self.role_id,
             'role': self.role.to_dict() if self.role else None,
-            'status': self.status,
+            'status': 'verified' if self.status == 'approved' else self.status,
             'reason': self.reason,
+            'application_text': self.application_text or self.reason,
+            'proof_images': _json_list(self.proof_images),
+            'portfolio_links': _json_list(self.portfolio_links),
+            'contact_info': self.contact_info,
+            'extra_note': self.extra_note,
             'review_comment': self.review_comment,
             'reviewer_id': self.reviewer_id,
             'user': self.user.to_dict() if self.user else None,
@@ -1015,6 +1086,8 @@ class UserDevice(Base):
     platform = Column(String(20), default='android')  # android / ios / harmony
     app_version = Column(String(50))
     last_active_at = Column(DateTime, default=datetime.utcnow)
+    app_state = Column(String(20), default='unknown')  # foreground / background / unknown
+    app_state_updated_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
@@ -1026,6 +1099,8 @@ class UserDevice(Base):
             'platform': self.platform,
             'app_version': self.app_version,
             'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
+            'app_state': self.app_state,
+            'app_state_updated_at': self.app_state_updated_at.isoformat() if self.app_state_updated_at else None,
             'is_active': self.is_active,
         }
 

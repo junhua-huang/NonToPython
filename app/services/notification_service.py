@@ -55,25 +55,24 @@ class NotificationService:
                     "unread_count": unread_count,
                 })
 
-                # 极光推送：用户离线时（WS 投递不到）补一条系统通知，让用户即使不在
-                # App 内也能感知。前台用户 WS 已投递，这里跳过避免重复打扰。
-                if not ws_manager.is_connected(user_id):
-                    from app.services.push_service import PushService
-                    notif_type = notification_dict.get("notification_type") or "notification"
-                    related_id = notification_dict.get("related_id")
-                    related_type = notification_dict.get("related_type")
-                    alert_title = (notification_dict.get("title") or "南图")[:40]
-                    alert_content = (notification_dict.get("content") or "你有一条新通知")[:80]
-                    PushService.schedule_send_to_user(
-                        user_id,
-                        alert_title=alert_title,
-                        alert_content=alert_content,
-                        extras={
-                            "type": notif_type,
-                            "related_id": str(related_id) if related_id is not None else "",
-                            "related_type": related_type or "",
-                        },
-                    )
+                # 系统通知由 PushService 根据设备前后台状态筛选目标；
+                # 不能只用 WebSocket 在线状态判断，否则移动端后台半连接会漏推。
+                from app.services.push_service import PushService
+                notif_type = notification_dict.get("notification_type") or "notification"
+                related_id = notification_dict.get("related_id")
+                related_type = notification_dict.get("related_type")
+                alert_title = (notification_dict.get("title") or "南图")[:40]
+                alert_content = (notification_dict.get("content") or "你有一条新通知")[:80]
+                PushService.schedule_send_to_user(
+                    user_id,
+                    alert_title=alert_title,
+                    alert_content=alert_content,
+                    extras={
+                        "type": notif_type,
+                        "related_id": str(related_id) if related_id is not None else "",
+                        "related_type": related_type or "",
+                    },
+                )
             except Exception as e:
                 logger.warning(f"[NOTIFY PUSH] failed uid={user_id}: {e}", exc_info=True)
             finally:

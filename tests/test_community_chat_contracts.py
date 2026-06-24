@@ -58,12 +58,10 @@ class CommunityChatContractsTest(unittest.TestCase):
             source = f.read()
 
         self.assertIn('def _normalize_community_message_payload', source)
-        self.assertIn("allowed_types = {'text', 'image', 'video'}", source)
-        self.assertIn("message_type == 'text'", source)
-        self.assertIn("message_type in {'image', 'video'}", source)
-        self.assertIn('media_url or content', source)
-        self.assertIn('raise HTTPException(status_code=400, detail="媒体消息不能为空")', source)
-        self.assertIn('content = media_url', source)
+        self.assertIn('normalize_user_message_payload', source)
+        with open('app/services/message_type_service.py', 'r', encoding='utf-8') as f:
+            service_source = f.read()
+        self.assertIn('"post"', service_source)
         self.assertIn('message_type=message_type', source)
         self.assertIn('media_url=media_url', source)
         self.assertIn('"media_url"', source)

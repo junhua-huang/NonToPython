@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_admin
-from app.models.models import User, SensitiveWord, UserRole, Role, RoleApplication
+from app.models.models import BUSINESS_IDENTITY_ROLES, User, SensitiveWord, UserRole, Role, RoleApplication
 
 router = APIRouter()
 
@@ -121,6 +121,9 @@ def assign_role_to_user(
     if not role_name:
         raise HTTPException(status_code=400, detail="role_name is required")
 
+    if role_name in BUSINESS_IDENTITY_ROLES:
+        raise HTTPException(status_code=403, detail="Only system roles can be assigned directly; business identities must use certification review")
+
     role = db.query(Role).filter(Role.name == role_name).first()
     if not role:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
@@ -215,7 +218,7 @@ def admin_approve_application(
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
 
-    app.status = "approved"
+    app.status = "verified"
     app.review_comment = payload.get("review_comment", "")
     app.reviewer_id = admin.id
     app.reviewed_at = datetime.utcnow()
@@ -258,3 +261,34 @@ def admin_reject_application(
     logger = __import__('logging').getLogger(__name__)
     logger.info(f"Admin {admin.username} rejected role application #{application_id}")
     return {"message": "Application rejected", "application": app.to_dict()}
+
+
+@router.post("/role-applications/{application_id}/suspend")
+def admin_suspend_application(
+    application_id: int,
+    payload: dict = Body(default_factory=dict),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """管理员暂停已认证身份展示"""
+    app = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    app.status = "suspended"
+    app.review_comment = payload.get("review_comment", "")
+    app.reviewer_id = admin.id
+    app.reviewed_at = datetime.utcnow()
+
+    existing = db.query(UserRole).filter(
+        UserRole.user_id == app.user_id,
+        UserRole.role_id == app.role_id,
+    ).first()
+    if existing:
+        db.delete(existing)
+
+    db.commit()
+
+    logger = __import__('logging').getLogger(__name__)
+    logger.info(f"Admin {admin.username} suspended role application #{application_id}")
+    return {"message": "Application suspended", "application": app.to_dict()}

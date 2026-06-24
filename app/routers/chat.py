@@ -12,9 +12,18 @@ from app.dependencies import get_current_user
 from app.models.models import User, Conversation, Message, ConversationParticipant, Friendship
 from app.models.community import CommunityMember
 from app.ws_manager import ws_manager
+from app.services.message_type_service import normalize_user_message_payload
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _should_create_message_notification(db: Session, user_id: int) -> bool:
+    """后台/离线用户需要通知中心记录和系统推送入口。"""
+    if not ws_manager.is_connected(user_id):
+        return True
+    from app.services.push_service import PushService
+    return PushService.has_push_target(db, user_id)
 
 
 # ============================================================
@@ -426,6 +435,7 @@ def get_messages_batch(
                     "sender_id": msg.sender_id,
                     "content": msg.content,
                     "message_type": msg.message_type,
+                    "media_url": msg.media_url,
                     "file_url": msg.media_url,
                     "file_name": None,
                     "file_size": None,
@@ -510,13 +520,11 @@ async def send_message(
     if user.id in blocked_by_receiver or receiver_id in blocked_by_sender:
         raise HTTPException(status_code=403, detail="Cannot send message to this user")
 
-    content = payload.get("content", "")
-    message_type = payload.get("message_type", "text")
-    media_url = payload.get("media_url")
-    related_id = payload.get("related_id")
-
-    if not content and message_type == "text":
-        raise HTTPException(status_code=400, detail="content is required for text messages")
+    normalized = normalize_user_message_payload(payload, db)
+    content = normalized["content"]
+    message_type = normalized["message_type"]
+    media_url = normalized["media_url"]
+    related_id = normalized["related_id"]
 
     message = Message(
         conversation_id=conversation_id,
@@ -568,9 +576,9 @@ async def send_message(
             "unread_count": sender_unread,
         })
 
-        # --- 离线通知中心 ---
-        # HTTP 路径也需要为离线用户写入通知记录（与 WS 路径 _handle_send_message 对齐）
-        if not ws_manager.is_connected(receiver_id):
+        # --- 后台/离线通知中心 ---
+        # 后台用户即使 WS 尚未断开，也需要系统通知入口。
+        if _should_create_message_notification(db, receiver_id):
             from app.services.notification_service import NotificationService
             preview = content[:50] + '...' if len(content) > 50 else content
             NotificationService.notify_message(receiver_id, user.id, preview, conversation_id)

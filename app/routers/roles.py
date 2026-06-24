@@ -4,14 +4,16 @@
 - 角色申请（用户自主申请 → 管理员审核）
 - 角色资料管理（Coser / 摄影师 / 服务商）
 """
+import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_admin, require_role
 from app.models.models import (
+    BUSINESS_IDENTITY_ROLES,
     User, Role, UserRole, RoleApplication,
     CoserProfile, PhotographerProfile, ServiceProfile,
 )
@@ -27,6 +29,11 @@ router = APIRouter(prefix="/api/roles", tags=["Roles"])
 class RoleApplyRequest(BaseModel):
     role_name: str
     reason: str = ""
+    application_text: str = ""
+    proof_images: list[str] = Field(default_factory=list)
+    portfolio_links: list[str] = Field(default_factory=list)
+    contact_info: str = ""
+    extra_note: str = ""
 
 
 class RoleReviewRequest(BaseModel):
@@ -72,7 +79,7 @@ class ServiceProfileUpdate(BaseModel):
 @router.get("")
 def list_roles(db: Session = Depends(get_db)):
     """获取所有可用角色列表（公开接口）"""
-    roles = db.query(Role).order_by(Role.sort_order).all()
+    roles = db.query(Role).filter(Role.name.in_(BUSINESS_IDENTITY_ROLES.keys())).order_by(Role.sort_order).all()
     return {"roles": [r.to_dict() for r in roles]}
 
 
@@ -104,8 +111,8 @@ def apply_role(
     """用户自主申请角色（管理员角色不可申请）"""
     role_name = data.role_name.strip().lower()
 
-    if role_name == "admin":
-        raise HTTPException(status_code=403, detail="Cannot apply for admin role")
+    if role_name not in BUSINESS_IDENTITY_ROLES:
+        raise HTTPException(status_code=403, detail="Only business identities can be applied for")
 
     role = db.query(Role).filter(Role.name == role_name).first()
     if not role:
@@ -128,11 +135,17 @@ def apply_role(
     if pending:
         raise HTTPException(status_code=409, detail="You already have a pending application for this role")
 
+    application_text = (data.application_text or data.reason).strip()
     application = RoleApplication(
         user_id=user.id,
         role_id=role.id,
         status="pending",
-        reason=data.reason.strip(),
+        reason=(data.reason or application_text).strip(),
+        application_text=application_text,
+        proof_images=json.dumps(data.proof_images, ensure_ascii=False),
+        portfolio_links=json.dumps(data.portfolio_links, ensure_ascii=False),
+        contact_info=data.contact_info.strip(),
+        extra_note=data.extra_note.strip(),
     )
     db.add(application)
     db.commit()
@@ -211,7 +224,7 @@ def approve_application(
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
 
-    app.status = "approved"
+    app.status = "verified"
     app.review_comment = data.review_comment.strip()
     app.reviewer_id = user.id
     app.reviewed_at = __import__('datetime').datetime.utcnow()
@@ -253,6 +266,36 @@ def reject_application(
 
     logger.info(f"Admin {user.username} rejected role application #{application_id}")
     return {"message": "Application rejected", "application": app.to_dict()}
+
+
+@router.post("/applications/{application_id}/suspend")
+def suspend_application(
+    application_id: int,
+    data: RoleReviewRequest = Body(default_factory=RoleReviewRequest),
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """管理员暂停已认证身份展示"""
+    app = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    app.status = "suspended"
+    app.review_comment = data.review_comment.strip()
+    app.reviewer_id = user.id
+    app.reviewed_at = __import__('datetime').datetime.utcnow()
+
+    existing = db.query(UserRole).filter(
+        UserRole.user_id == app.user_id,
+        UserRole.role_id == app.role_id,
+    ).first()
+    if existing:
+        db.delete(existing)
+
+    db.commit()
+
+    logger.info(f"Admin {user.username} suspended role application #{application_id}")
+    return {"message": "Application suspended", "application": app.to_dict()}
 
 
 # ============================================================
@@ -319,7 +362,7 @@ def update_photographer_profile(
 
 # === 通用服务商资料 ===
 
-SERVICE_ROLE_NAMES = {"wig_stylist", "makeup_artist", "editor", "ticket_agent"}
+SERVICE_ROLE_NAMES = {"wig_stylist", "makeup_artist", "retoucher", "ticket_agent", "prop_maker", "costume_maker"}
 
 @router.put("/profiles/service")
 def update_service_profile(
@@ -333,6 +376,14 @@ def update_service_profile(
         raise HTTPException(status_code=400, detail="service_type is required")
     if service_type not in SERVICE_ROLE_NAMES:
         raise HTTPException(status_code=400, detail=f"Invalid service_type: {service_type}")
+    verified_service_role = (
+        db.query(UserRole)
+        .join(Role, UserRole.role_id == Role.id)
+        .filter(UserRole.user_id == user.id, Role.name == service_type)
+        .first()
+    )
+    if not verified_service_role:
+        raise HTTPException(status_code=403, detail="Required verified service identity")
 
     profile = db.query(ServiceProfile).filter(
         ServiceProfile.user_id == user.id,
