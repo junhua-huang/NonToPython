@@ -67,6 +67,14 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('"media_url"', source)
         self.assertIn('"message_type"', source)
 
+    def test_community_members_include_online_status_for_chat_header(self):
+        with open('app/models/community.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        member_source = source.split('class CommunityMember')[1].split('class CommunityJoinRequest')[0]
+
+        self.assertIn("'is_online'", member_source)
+        self.assertIn('ws_manager.is_connected(self.user_id)', member_source)
+
     def test_community_membership_maintains_conversation_participants_without_migration(self):
         with open('app/services/community_service.py', 'r', encoding='utf-8') as f:
             source = f.read()

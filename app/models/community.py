@@ -112,6 +112,8 @@ class CommunityMember(Base):
     user = relationship('User')
 
     def to_dict(self):
+        from app.ws_manager import ws_manager
+
         d = {
             'id': self.id,
             'community_id': self.community_id,
@@ -125,6 +127,7 @@ class CommunityMember(Base):
                 'id': self.user.id,
                 'username': self.user.username,
                 'avatar_url': self.user.avatar_url,
+                'is_online': ws_manager.is_connected(self.user_id),
             }
         return d
 
