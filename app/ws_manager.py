@@ -46,6 +46,7 @@ class WSManager:
             cls._instance._push_queue: asyncio.Queue = asyncio.Queue()
             cls._instance._push_worker_started = False
             cls._instance._per_user_pending: dict[int, int] = {}
+            cls._instance._presence_generation: dict[int, int] = {}
         return cls._instance
 
     def __init__(self):
@@ -63,6 +64,7 @@ class WSManager:
             self._push_queue: asyncio.Queue = asyncio.Queue()
             self._push_worker_started = False
             self._per_user_pending: dict[int, int] = {}
+            self._presence_generation: dict[int, int] = {}
         self._initialized = True
 
     # ================================================================
@@ -200,8 +202,10 @@ class WSManager:
             self.remove_user_from_all_conversations(user_id)
             self.invalidate_user_caches(user_id)
 
-            # 用户全部设备离线 → 通知在线好友该用户已下线
-            asyncio.ensure_future(self._notify_friends_offline(user_id))
+            # 用户全部设备离线 → 通知相关社群成员和在线好友该用户已下线
+            presence_generation = self.bump_presence_generation(user_id)
+            asyncio.ensure_future(self.notify_community_presence(user_id, False, presence_generation))
+            asyncio.ensure_future(self._notify_friends_offline(user_id, presence_generation))
 
         logger.info(f"[WS -] uid={user_id} cid={conn_id[:8] if conn_id else 'all'} "
                      f"online_users={len(self._connections)} total_conns={self.total_connections}")
@@ -217,6 +221,17 @@ class WSManager:
     def get_online_user_ids(self) -> list[int]:
         """获取所有在线用户 ID 列表"""
         return list(self._connections.keys())
+
+    def bump_presence_generation(self, user_id: int) -> int:
+        """Increment and return the user's presence transition generation."""
+        generation = self._presence_generation.get(user_id, 0) + 1
+        self._presence_generation[user_id] = generation
+        return generation
+
+    def _is_presence_generation_current(self, user_id: int, expected_generation: int | None) -> bool:
+        if expected_generation is None:
+            return True
+        return self._presence_generation.get(user_id, 0) == expected_generation
 
     # ================================================================
     # 心跳超时检测
@@ -332,6 +347,36 @@ class WSManager:
         if self.is_connected(user_id):
             await self._raw_send_to_connections(user_id, msg_envelope)
 
+    async def _send_presence_with_seq(
+        self,
+        recipient_id: int,
+        event: str,
+        data: dict,
+        subject_user_id: int,
+        expected_generation: int | None,
+    ):
+        """Send presence only if the subject generation is still current at seq allocation."""
+        if (
+            not self.is_connected(recipient_id)
+            or not self._is_presence_generation_current(subject_user_id, expected_generation)
+        ):
+            return
+
+        full_payload = {"event": event, "data": data}
+        seq = self._next_seq_sync(recipient_id, full_payload)
+        if seq is None:
+            logger.warning(f"[WS SEND] uid={recipient_id} {event} seq=FAILED")
+            return
+
+        if (
+            self.is_connected(recipient_id)
+            and self._is_presence_generation_current(subject_user_id, expected_generation)
+        ):
+            logger.debug(f"[WS SEND] uid={recipient_id} {event} seq={seq} {json.dumps(full_payload, ensure_ascii=False)[:200]}")
+            await self._raw_send_to_connections(recipient_id, {
+                "type": "message", "seq": seq, "payload": full_payload
+            })
+
     async def send_error(self, user_id: int, client_msg_id: Optional[str], message: str):
         """向用户推送错误通知"""
         err = {"type": "error", "message": message}
@@ -357,8 +402,11 @@ class WSManager:
             return
         loop.create_task(coro)
 
-    async def _notify_friends_offline(self, user_id: int):
+    async def _notify_friends_offline(self, user_id: int, expected_generation: int | None = None):
         """用户全部设备离线时，通知在线好友该用户已下线"""
+        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
+            return
+
         loop = asyncio.get_event_loop()
 
         def _get_friend_ids():
@@ -377,9 +425,115 @@ class WSManager:
                 db.close()
 
         friend_ids = await loop.run_in_executor(None, _get_friend_ids)
+        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
+            return
         for fid in friend_ids:
+            if not self._is_presence_generation_current(user_id, expected_generation):
+                return
             if self.is_connected(fid):
-                await self.send_with_seq(fid, "friend_offline", {"user_id": user_id})
+                await self._send_presence_with_seq(
+                    fid,
+                    "friend_offline",
+                    {"user_id": user_id},
+                    user_id,
+                    expected_generation,
+                )
+
+    def _get_community_presence_targets_sync(self, user_id: int, online_user_ids: list[int]) -> list[dict]:
+        """Return active online community recipient groups for a user's presence change."""
+        if not online_user_ids:
+            return []
+
+        db = SessionLocal()
+        try:
+            from app.models.community import CommunityMember
+            from app.models.models import Conversation
+
+            community_rows = (
+                db.query(CommunityMember.community_id)
+                .filter(
+                    CommunityMember.user_id == user_id,
+                    CommunityMember.status == 'active',
+                )
+                .all()
+            )
+            community_ids = [row[0] for row in community_rows]
+            if not community_ids:
+                return []
+
+            conversations = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.type == 'community',
+                    Conversation.community_id.in_(community_ids),
+                )
+                .all()
+            )
+            conversation_by_community = {
+                conv.community_id: conv.id
+                for conv in conversations
+                if conv.community_id is not None
+            }
+
+            member_rows = (
+                db.query(CommunityMember.community_id, CommunityMember.user_id)
+                .filter(
+                    CommunityMember.community_id.in_(community_ids),
+                    CommunityMember.status == 'active',
+                    CommunityMember.user_id.in_(online_user_ids),
+                )
+                .all()
+            )
+            recipient_ids_by_community: dict[int, list[int]] = {
+                community_id: [] for community_id in community_ids
+            }
+            for community_id, member_user_id in member_rows:
+                if member_user_id != user_id:
+                    recipient_ids_by_community.setdefault(community_id, []).append(member_user_id)
+
+            return [
+                {
+                    "community_id": community_id,
+                    "conversation_id": conversation_by_community.get(community_id),
+                    "recipient_ids": recipient_ids_by_community.get(community_id, []),
+                }
+                for community_id in community_ids
+            ]
+        finally:
+            db.close()
+
+    async def notify_community_presence(self, user_id: int, is_online: bool, expected_generation: int | None = None):
+        """Notify active community members that a member's app-level presence changed."""
+        try:
+            if (
+                self.is_connected(user_id) != is_online
+                or not self._is_presence_generation_current(user_id, expected_generation)
+            ):
+                return
+
+            loop = asyncio.get_event_loop()
+            online_user_ids = self.get_online_user_ids()
+            targets = await loop.run_in_executor(None, self._get_community_presence_targets_sync, user_id, online_user_ids)
+            if (
+                self.is_connected(user_id) != is_online
+                or not self._is_presence_generation_current(user_id, expected_generation)
+            ):
+                return
+
+            for target in targets:
+                payload = {
+                    "community_id": target["community_id"],
+                    "conversation_id": target.get("conversation_id"),
+                    "user_id": user_id,
+                    "is_online": is_online,
+                }
+                for recipient_id in target.get("recipient_ids", []):
+                    if not self._is_presence_generation_current(user_id, expected_generation):
+                        return
+                    if self.is_connected(recipient_id):
+                        await self._send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)
+        except Exception as e:
+            logger.error(f"[WS PRESENCE] community presence failed uid={user_id} online={is_online}: {e}", exc_info=True)
 
     # ================================================================
     # 会话列表缓存

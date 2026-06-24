@@ -75,6 +75,81 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn("'is_online'", member_source)
         self.assertIn('ws_manager.is_connected(self.user_id)', member_source)
 
+    def test_ws_emits_community_member_presence_event(self):
+        with open('app/routers/ws.py', 'r', encoding='utf-8') as f:
+            ws_source = f.read()
+        with open('app/ws_manager.py', 'r', encoding='utf-8') as f:
+            manager_source = f.read()
+
+        self.assertIn('community_member_presence', ws_source + manager_source)
+        self.assertIn('notify_community_presence', manager_source)
+        self.assertIn('send_with_seq', manager_source)
+        self.assertIn('"community_id"', manager_source)
+        self.assertIn('"conversation_id"', manager_source)
+        self.assertIn('"user_id"', manager_source)
+        self.assertIn('"is_online"', manager_source)
+        self.assertIn('self.is_connected(user_id) != is_online', manager_source)
+        self.assertIn('except Exception as e:', manager_source)
+        self.assertIn('[WS PRESENCE] community presence failed', manager_source)
+
+    def test_community_presence_online_only_on_first_app_connection(self):
+        with open('app/routers/ws.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        auth_source = source.split('async def _do_auth_init')[1].split('async def _notify_friends_online')[0]
+
+        self.assertIn('was_offline = not ws_manager.is_connected(user_id)', auth_source)
+        self.assertIn('conn_id = await ws_manager.connect(user_id, websocket)', auth_source)
+        self.assertIn('if was_offline:', auth_source)
+        self.assertIn('presence_generation = ws_manager.bump_presence_generation(user_id)', auth_source)
+        self.assertIn('await ws_manager.notify_community_presence(user_id, True, presence_generation)', auth_source)
+
+    def test_community_presence_targets_active_members_from_durable_membership(self):
+        with open('app/ws_manager.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+
+        self.assertIn('CommunityMember', source)
+        self.assertIn("CommunityMember.status == 'active'", source)
+        self.assertIn("Conversation.type == 'community'", source)
+        self.assertIn('Conversation.community_id', source)
+        self.assertIn('recipient_ids', source)
+        self.assertIn('online_user_ids', source)
+        self.assertIn('CommunityMember.user_id.in_(online_user_ids)', source)
+        self.assertIn('member_user_id != user_id', source)
+        self.assertIn('if self.is_connected(recipient_id):', source)
+        self.assertIn('await self._send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)', source)
+
+    def test_community_presence_offline_only_after_final_connection_disconnects(self):
+        with open('app/ws_manager.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        disconnect_source = source.split('async def disconnect')[1].split('def heartbeat')[0]
+
+        self.assertIn('if not self._connections[user_id]:', disconnect_source)
+        self.assertIn('notify_community_presence(user_id, False, presence_generation)', disconnect_source)
+        self.assertIn('_connections[user_id].pop', disconnect_source)
+
+    def test_friend_offline_presence_ignores_stale_reconnect_tasks(self):
+        with open('app/ws_manager.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        friend_offline_source = source.split('async def _notify_friends_offline')[1].split('def _get_community_presence_targets_sync')[0]
+
+        self.assertIn('self.is_connected(user_id) or not self._is_presence_generation_current', friend_offline_source)
+        self.assertIn('return', friend_offline_source)
+
+    def test_presence_notifications_use_generation_to_drop_stale_tasks(self):
+        with open('app/ws_manager.py', 'r', encoding='utf-8') as f:
+            manager_source = f.read()
+        with open('app/routers/ws.py', 'r', encoding='utf-8') as f:
+            ws_source = f.read()
+
+        self.assertIn('_presence_generation', manager_source)
+        self.assertIn('def bump_presence_generation', manager_source)
+        self.assertIn('expected_generation', manager_source)
+        self.assertIn('_is_presence_generation_current(user_id, expected_generation)', manager_source)
+        self.assertIn('presence_generation = ws_manager.bump_presence_generation(user_id)', manager_source + ws_source)
+        self.assertIn('async def _send_presence_with_seq', manager_source)
+        self.assertIn('self._next_seq_sync(recipient_id, full_payload)', manager_source)
+        self.assertIn('_send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)', manager_source)
+
     def test_community_membership_maintains_conversation_participants_without_migration(self):
         with open('app/services/community_service.py', 'r', encoding='utf-8') as f:
             source = f.read()

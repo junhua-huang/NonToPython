@@ -294,6 +294,7 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
     """鉴权通过后的初始化流程：注册连接 + 推会话列表 + 加入房间 + 通知好友。返回 (auth_result_dict, conn_id)"""
     from app.models.models import Conversation, ConversationParticipant
 
+    was_offline = not ws_manager.is_connected(user_id)
     conn_id = await ws_manager.connect(user_id, websocket)
     loop = asyncio.get_event_loop()
 
@@ -372,6 +373,10 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
 
     for cid in conv_ids:
         ws_manager.join_conversation(user_id, cid)
+
+    if was_offline:
+        presence_generation = ws_manager.bump_presence_generation(user_id)
+        await ws_manager.notify_community_presence(user_id, True, presence_generation)
 
     # ── 通知在线好友该用户已上线 ──
     for fid in online_friend_ids:
