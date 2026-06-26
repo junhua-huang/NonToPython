@@ -25,6 +25,12 @@ from app.services.quote_service import (
     inject_quote_preview,
     validate_quote,
 )
+from app.services.chat_read_state_service import (
+    can_access_conversation,
+    get_active_conversation_participant_ids,
+    get_community_unread_counts,
+    mark_community_conversation_read,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +91,10 @@ def _get_conversation(db: Session, user_id: int, other_id: int):
 
 
 def _get_conversation_participant_ids(db: Session, conversation_id: int) -> list[int]:
-    from app.models.models import ConversationParticipant
+    from app.models.models import Conversation, ConversationParticipant
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if conversation:
+        return get_active_conversation_participant_ids(db, conversation)
     return [
         r.user_id
         for r in db.query(ConversationParticipant)
@@ -166,13 +175,17 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
     from sqlalchemy import func
     from app.models.models import Conversation, ConversationParticipant, Message, User
     from app.models.community import CommunityMember
+    from app.services.quote_service import inject_quote_preview_batch
 
     conversations = (
         db.query(Conversation)
         .outerjoin(ConversationParticipant)
         .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
         .filter(
-            (ConversationParticipant.user_id == user_id)
+            (
+                (Conversation.type != 'community')
+                & (ConversationParticipant.user_id == user_id)
+            )
             | (
                 (Conversation.type == 'community')
                 & (CommunityMember.user_id == user_id)
@@ -201,16 +214,25 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
 
     unread_counts = dict(
         db.query(Message.conversation_id, func.count(Message.id))
-        .filter(Message.conversation_id.in_(conv_ids), Message.is_read == False, Message.sender_id != user_id)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .filter(
+            Message.conversation_id.in_(conv_ids),
+            Conversation.type != 'community',
+            Message.is_read == False,
+            Message.sender_id != user_id,
+        )
         .group_by(Message.conversation_id)
         .all()
     )
+    unread_counts.update(get_community_unread_counts(db, user_id, conv_ids))
 
-    last_messages = {}
+    last_messages = []
     for conv_id in conv_ids:
         msg = db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.desc()).first()
         if msg:
-            last_messages[conv_id] = msg.to_dict()
+            last_messages.append(msg.to_dict())
+    inject_quote_preview_batch(db, last_messages)
+    last_message_map = {msg["conversation_id"]: msg for msg in last_messages}
 
     all_partner_ids = set()
     for conv in conversations:
@@ -235,7 +257,7 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
                 'community_id': conv.community_id,
                 'community_name': conv.community.name if conv.community else None,
                 'community_avatar': conv.community.avatar_url if conv.community else None,
-                'last_message': last_messages.get(conv.id),
+                'last_message': last_message_map.get(conv.id),
                 'unread_count': unread_counts.get(conv.id, 0),
                 'created_at': conv.created_at.isoformat() if conv.created_at else None,
                 'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
@@ -251,7 +273,7 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
             'type': conv.type,
             'partner_id': partner_id,
             'partner': partners.get(partner_id),
-            'last_message': last_messages.get(conv.id),
+            'last_message': last_message_map.get(conv.id),
             'unread_count': unread_counts.get(conv.id, 0),
             'created_at': conv.created_at.isoformat() if conv.created_at else None,
             'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
@@ -457,9 +479,9 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
                 if not conv:
                     return {"error": "Conversation not found"}
-                participant_ids = _get_conversation_participant_ids(db, conversation_id)
-                if user_id not in participant_ids:
+                if not can_access_conversation(db, conv, user_id):
                     return {"error": "Not a conversation participant"}
+                participant_ids = get_active_conversation_participant_ids(db, conv)
                 if not _can_send_to_participants(user_id, participant_ids):
                     return {"error": "Cannot send message to this user"}
             elif receiver_id:
@@ -494,18 +516,24 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             db.commit()
             db.refresh(msg)
 
-            participant_ids = _get_conversation_participant_ids(db, conv.id)
-            unread_counts = {}
-            for pid in participant_ids:
-                unread_counts[pid] = (
-                    db.query(Message)
-                    .filter(
-                        Message.conversation_id == conv.id,
-                        Message.is_read == False,
-                        Message.sender_id != pid,
+            participant_ids = get_active_conversation_participant_ids(db, conv)
+            if conv.type == 'community':
+                unread_counts = {
+                    pid: get_community_unread_counts(db, pid, [conv.id]).get(conv.id, 0)
+                    for pid in participant_ids
+                }
+            else:
+                unread_counts = {}
+                for pid in participant_ids:
+                    unread_counts[pid] = (
+                        db.query(Message)
+                        .filter(
+                            Message.conversation_id == conv.id,
+                            Message.is_read == False,
+                            Message.sender_id != pid,
+                        )
+                        .count()
                     )
-                    .count()
-                )
 
             msg_dict = inject_quote_preview(db, msg.to_dict())
 
@@ -690,7 +718,7 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
 
 async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload: dict):
     """会话标记已读"""
-    from app.models.models import Message, ConversationParticipant
+    from app.models.models import Message, Conversation, ConversationParticipant
 
     conv_id = payload.get("conversation_id")
     if not conv_id:
@@ -710,11 +738,18 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
             if not participant:
                 return {"error": "Not a conversation participant"}
 
-            result = (
-                db.query(Message)
-                .filter(Message.conversation_id == conv_id, Message.sender_id != user_id, Message.is_read == False)
-                .update({"is_read": True})
-            )
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            if not conversation:
+                return {"error": "Conversation not found"}
+
+            if conversation.type == 'community':
+                result = mark_community_conversation_read(db, conv_id, user_id)
+            else:
+                result = (
+                    db.query(Message)
+                    .filter(Message.conversation_id == conv_id, Message.sender_id != user_id, Message.is_read == False)
+                    .update({"is_read": True})
+                )
             db.commit()
             participant_ids = _get_conversation_participant_ids(db, conv_id)
             return participant_ids if result > 0 else []
@@ -808,30 +843,10 @@ async def _handle_join(websocket: WebSocket, user_id: int, data: dict):
     def _check():
         db = _get_db_session()
         try:
-            from app.models.models import Conversation, ConversationParticipant
-            from app.models.community import CommunityMember
+            from app.models.models import Conversation
 
-            participant = (
-                db.query(ConversationParticipant)
-                .filter(ConversationParticipant.conversation_id == conv_id,
-                        ConversationParticipant.user_id == user_id)
-                .first()
-            )
-            if participant:
-                return True
-
-            community_member = (
-                db.query(Conversation)
-                .join(CommunityMember, CommunityMember.community_id == Conversation.community_id)
-                .filter(
-                    Conversation.id == conv_id,
-                    Conversation.type == 'community',
-                    CommunityMember.user_id == user_id,
-                    CommunityMember.status == 'active',
-                )
-                .first()
-            )
-            return community_member is not None
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            return can_access_conversation(db, conversation, user_id)
         finally:
             db.close()
 

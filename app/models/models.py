@@ -461,6 +461,8 @@ class ConversationParticipant(Base):
     conversation_id = Column(Integer, ForeignKey('conversations.id'), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     joined_at = Column(DateTime, default=datetime.utcnow)
+    last_read_at = Column(DateTime, nullable=True)
+    last_read_message_id = Column(Integer, nullable=True)
     
     conversation = relationship('Conversation', back_populates='participants')
     user = relationship('User')

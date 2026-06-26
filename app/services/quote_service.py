@@ -19,6 +19,7 @@ from app.models.models import Message
 
 # 预览文案截断长度
 _PREVIEW_TEXT_LIMIT = 50
+_UNAVAILABLE_QUOTE_PREVIEW = "消息已撤回"
 
 
 def _preview_text_for(message: Message) -> str:
@@ -79,6 +80,13 @@ def build_quote_preview(quoted: Optional[Message]) -> Optional[str]:
     return _preview_text_for(quoted) or None
 
 
+def _is_same_conversation_quote(quoted: Optional[Message], msg_dict: dict) -> bool:
+    if quoted is None:
+        return False
+    conversation_id = msg_dict.get("conversation_id")
+    return conversation_id is not None and quoted.conversation_id == conversation_id
+
+
 def inject_quote_preview(db: Session, msg_dict: dict) -> dict:
     """序列化消息时实时回填 quote_preview。
 
@@ -94,6 +102,10 @@ def inject_quote_preview(db: Session, msg_dict: dict) -> dict:
         return msg_dict
 
     quoted = db.query(Message).filter(Message.id == quote_id).first()
+    if not _is_same_conversation_quote(quoted, msg_dict):
+        msg_dict["quote_preview"] = _UNAVAILABLE_QUOTE_PREVIEW
+        return msg_dict
+
     msg_dict["quote_preview"] = build_quote_preview(quoted)
     return msg_dict
 
@@ -114,5 +126,13 @@ def inject_quote_preview_batch(db: Session, msg_dicts: list[dict]) -> list[dict]
     }
     for d in msg_dicts:
         qid = d.get("quote_message_id")
-        d["quote_preview"] = build_quote_preview(quoted_map.get(qid)) if qid else None
+        if not qid:
+            d["quote_preview"] = None
+            continue
+        quoted = quoted_map.get(qid)
+        d["quote_preview"] = (
+            build_quote_preview(quoted)
+            if _is_same_conversation_quote(quoted, d)
+            else _UNAVAILABLE_QUOTE_PREVIEW
+        )
     return msg_dicts

@@ -31,8 +31,10 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('CommunityMember', auth_rooms_source)
         self.assertIn("Conversation.type == 'community'", auth_rooms_source)
         join_source = source.split('async def _handle_join')[1].split('async def _handle_leave')[0]
-        self.assertIn('CommunityMember', join_source)
-        self.assertIn("Conversation.type == 'community'", join_source)
+        self.assertIn('can_access_conversation', join_source)
+        read_state_source = open('app/services/chat_read_state_service.py', 'r', encoding='utf-8').read()
+        self.assertIn('CommunityMember', read_state_source)
+        self.assertIn("Conversation.type == 'community'", read_state_source)
 
     def test_community_chat_routes_are_single_source_of_truth(self):
         with open('app/routers/communities.py', 'r', encoding='utf-8') as f:
@@ -245,21 +247,29 @@ class CommunityChatContractsTest(unittest.TestCase):
         with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
             source = f.read()
         mark_read_source = source.split('async def mark_conversation_as_read')[1].split('@router.get("/users/online")')[0]
+        with open('app/services/chat_read_state_service.py', 'r', encoding='utf-8') as f:
+            read_state_source = f.read()
+        participant_source = read_state_source.split('def get_community_participant')[1].split('def mark_community_conversation_read')[0]
 
-        self.assertIn('ConversationParticipant', mark_read_source)
-        self.assertIn('ConversationParticipant.conversation_id == conversation_id', mark_read_source)
-        self.assertIn('ConversationParticipant.user_id == user.id', mark_read_source)
-        self.assertIn('conversation.type == \'community\'', mark_read_source)
+        self.assertIn('get_community_participant(db, conversation_id, user.id)', mark_read_source)
+        self.assertIn("conversation.type == 'community'", mark_read_source)
+        self.assertIn('ConversationParticipant', participant_source)
+        self.assertIn('ConversationParticipant.conversation_id == conversation_id', participant_source)
+        self.assertIn('ConversationParticipant.user_id == user_id', participant_source)
 
     def test_mark_read_total_unread_includes_community_membership(self):
         with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
             source = f.read()
         mark_read_source = source.split('async def mark_conversation_as_read')[1].split('@router.get("/users/online")')[0]
+        with open('app/services/chat_read_state_service.py', 'r', encoding='utf-8') as f:
+            read_state_source = f.read()
+        participant_source = read_state_source.split('def get_community_participant')[1].split('def mark_community_conversation_read')[0]
 
-        self.assertIn('CommunityMember', mark_read_source)
-        self.assertIn("Conversation.type == 'community'", mark_read_source)
-        self.assertIn('CommunityMember.user_id == user.id', mark_read_source)
-        self.assertIn('CommunityMember.status == \'active\'', mark_read_source)
+        self.assertIn('get_total_unread_count(db, user.id)', mark_read_source)
+        self.assertIn('CommunityMember', participant_source)
+        self.assertIn("Conversation.type == 'community'", participant_source)
+        self.assertIn('CommunityMember.user_id == ConversationParticipant.user_id', participant_source)
+        self.assertIn('CommunityMember.status == \'active\'', participant_source)
 
     def test_message_to_dict_includes_client_msg_id_and_utc_z_timestamps(self):
         from datetime import datetime

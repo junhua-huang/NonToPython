@@ -123,27 +123,47 @@ class QuoteInjectTest(unittest.TestCase):
         db.query.return_value.filter.return_value.first.return_value = msg
         out = qs.inject_quote_preview(db, {
             "id": 1,
+            "conversation_id": 1,
             "quote_message_id": 99,
             "quote_preview": "陈旧的快照",  # 应被覆盖
         })
         self.assertEqual(out["quote_preview"], "实时")
 
-    def test_inject_missing_quote_target_yields_none(self):
+    def test_inject_missing_quote_target_yields_recalled_placeholder(self):
         db = Mock()
         db.query.return_value.filter.return_value.first.return_value = None
-        out = qs.inject_quote_preview(db, {"quote_message_id": 99})
-        self.assertIsNone(out["quote_preview"])
+        out = qs.inject_quote_preview(db, {
+            "conversation_id": 1,
+            "quote_message_id": 99,
+        })
+        self.assertEqual(out["quote_preview"], "消息已撤回")
+
+    def test_inject_cross_conversation_quote_does_not_leak_preview(self):
+        foreign_msg = _stub_message(
+            msg_id=99,
+            conversation_id=2,
+            content="other conversation secret",
+        )
+        db = Mock()
+        db.query.return_value.filter.return_value.first.return_value = foreign_msg
+        out = qs.inject_quote_preview(db, {
+            "conversation_id": 1,
+            "quote_message_id": 99,
+            "quote_preview": "陈旧的快照",
+        })
+        self.assertEqual(out["quote_preview"], "消息已撤回")
+        self.assertNotIn("secret", out["quote_preview"])
 
     def test_batch_single_query_for_multiple_ids(self):
-        msg10 = _stub_message(msg_id=10, content="a")
-        msg11 = _stub_message(msg_id=11, content="b")
+        msg10 = _stub_message(msg_id=10, conversation_id=1, content="a")
+        msg11 = _stub_message(msg_id=11, conversation_id=1, content="b")
         db = Mock()
         db.query.return_value.filter.return_value.all.return_value = [msg10, msg11]
         items = [
-            {"id": 1, "quote_message_id": 10},
-            {"id": 2, "quote_message_id": 11},
-            {"id": 3, "quote_message_id": 10},
-            {"id": 4},
+            {"id": 1, "conversation_id": 1, "quote_message_id": 10},
+            {"id": 2, "conversation_id": 1, "quote_message_id": 11},
+            {"id": 3, "conversation_id": 1, "quote_message_id": 10},
+            {"id": 4, "conversation_id": 1},
         ]
         out = qs.inject_quote_preview_batch(db, items)
         # 仅触发一次 db.query
@@ -152,6 +172,29 @@ class QuoteInjectTest(unittest.TestCase):
         self.assertEqual(out[1]["quote_preview"], "b")
         self.assertEqual(out[2]["quote_preview"], "a")
         self.assertIsNone(out[3]["quote_preview"])
+
+    def test_batch_missing_and_cross_conversation_quotes_use_safe_placeholder(self):
+        valid_msg = _stub_message(msg_id=10, conversation_id=1, content="safe")
+        foreign_msg = _stub_message(
+            msg_id=11,
+            conversation_id=2,
+            content="other conversation secret",
+        )
+        db = Mock()
+        db.query.return_value.filter.return_value.all.return_value = [
+            valid_msg,
+            foreign_msg,
+        ]
+        items = [
+            {"id": 1, "conversation_id": 1, "quote_message_id": 10},
+            {"id": 2, "conversation_id": 1, "quote_message_id": 11},
+            {"id": 3, "conversation_id": 1, "quote_message_id": 12},
+        ]
+        out = qs.inject_quote_preview_batch(db, items)
+        self.assertEqual(out[0]["quote_preview"], "safe")
+        self.assertEqual(out[1]["quote_preview"], "消息已撤回")
+        self.assertEqual(out[2]["quote_preview"], "消息已撤回")
+        self.assertNotIn("secret", out[1]["quote_preview"])
 
 
 if __name__ == "__main__":

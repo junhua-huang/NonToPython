@@ -19,6 +19,14 @@ from app.services.quote_service import (
     inject_quote_preview_batch,
     validate_quote,
 )
+from app.services.chat_read_state_service import (
+    can_access_conversation,
+    get_active_conversation_participant_ids,
+    get_community_participant,
+    get_community_unread_counts,
+    get_total_unread_count,
+    mark_community_conversation_read,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -101,11 +109,13 @@ def get_sessions(
     )
     last_msg_map = {m.conversation_id: m for m in last_messages}
 
-    # 获取未读计数
+    # 获取未读计数：私聊沿用 Message.is_read，群聊按成员 read cursor 计算。
     unread_counts = (
         db.query(Message.conversation_id, func.count(Message.id).label("cnt"))
+        .join(Conversation, Conversation.id == Message.conversation_id)
         .filter(
             Message.conversation_id.in_(conv_ids),
+            Conversation.type != 'community',
             Message.is_read == False,
             Message.sender_id != user.id,
         )
@@ -113,6 +123,7 @@ def get_sessions(
         .all()
     )
     unread_map = {row[0]: row[1] for row in unread_counts}
+    unread_map.update(get_community_unread_counts(db, user.id, conv_ids))
 
     # 批量取所有涉及的用户信息
     all_user_ids = set()
@@ -350,7 +361,7 @@ def get_messages(
     conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+    if not can_access_conversation(db, conversation, user.id):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     messages_query = (
@@ -406,7 +417,7 @@ def get_messages_batch(
         conv = conv_map.get(cid)
         if not conv:
             raise HTTPException(status_code=404, detail=f"Conversation {cid} not found")
-        if conv.user1_id != user.id and conv.user2_id != user.id:
+        if not can_access_conversation(db, conv, user.id):
             raise HTTPException(status_code=403, detail=f"Unauthorized for conversation {cid}")
 
     # 合并为单次 UNION ALL 查询：每个会话独立 LIMIT，一次往返
@@ -494,7 +505,7 @@ def get_messages_v2(
     conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+    if not can_access_conversation(db, conversation, user.id):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     messages_query = (
@@ -532,15 +543,17 @@ async def send_message(
     conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+    if not can_access_conversation(db, conversation, user.id):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 屏蔽检查（使用缓存）
-    receiver_id = conversation.user2_id if conversation.user1_id == user.id else conversation.user1_id
-    blocked_by_receiver = ws_manager.get_blocked_user_ids(receiver_id)
-    blocked_by_sender = ws_manager.get_blocked_user_ids(user.id)
-    if user.id in blocked_by_receiver or receiver_id in blocked_by_sender:
-        raise HTTPException(status_code=403, detail="Cannot send message to this user")
+    participant_ids = get_active_conversation_participant_ids(db, conversation)
+    if conversation.type != 'community':
+        # 屏蔽检查（使用缓存）
+        receiver_id = conversation.user2_id if conversation.user1_id == user.id else conversation.user1_id
+        blocked_by_receiver = ws_manager.get_blocked_user_ids(receiver_id)
+        blocked_by_sender = ws_manager.get_blocked_user_ids(user.id)
+        if user.id in blocked_by_receiver or receiver_id in blocked_by_sender:
+            raise HTTPException(status_code=403, detail="Cannot send message to this user")
 
     normalized = normalize_user_message_payload(payload, db)
     content = normalized["content"]
@@ -574,47 +587,41 @@ async def send_message(
         message_dict = inject_quote_preview(db, message.to_dict())
 
         # --- WebSocket 实时推送 ---
-        # 推送给接收方：未读消息总数
-        receiver_id = conversation.user2_id if conversation.user1_id == user.id else conversation.user1_id
-        receiver_unread = (
-            db.query(Message)
-            .filter(
-                Message.conversation_id == conversation_id,
-                Message.is_read == False,
-                Message.sender_id != receiver_id,
-            )
-            .count()
-        )
-        await ws_manager.send_with_seq(receiver_id, "new_message", {
-            "conversation_id": conversation_id,
-            "data": message_dict,
-            "unread_count": receiver_unread,
-        })
-        # 也推送给发送者：同步自己的未读（通常为0）
-        sender_unread = (
-            db.query(Message)
-            .filter(
-                Message.conversation_id == conversation_id,
-                Message.is_read == False,
-                Message.sender_id != user.id,
-            )
-            .count()
-        )
-        await ws_manager.send_with_seq(user.id, "new_message", {
-            "conversation_id": conversation_id,
-            "data": message_dict,
-            "unread_count": sender_unread,
-        })
+        if conversation.type == 'community':
+            unread_counts = {
+                pid: get_community_unread_counts(db, pid, [conversation_id]).get(conversation_id, 0)
+                for pid in participant_ids
+            }
+        else:
+            unread_counts = {}
+            for pid in participant_ids:
+                unread_counts[pid] = (
+                    db.query(Message)
+                    .filter(
+                        Message.conversation_id == conversation_id,
+                        Message.is_read == False,
+                        Message.sender_id != pid,
+                    )
+                    .count()
+                )
+
+        for pid in participant_ids:
+            await ws_manager.send_with_seq(pid, "new_message", {
+                "conversation_id": conversation_id,
+                "data": message_dict,
+                "unread_count": unread_counts.get(pid, 0),
+            })
 
         # --- 后台/离线通知中心 ---
         # 后台用户即使 WS 尚未断开，也需要系统通知入口。
-        if _should_create_message_notification(db, receiver_id):
-            from app.services.notification_service import NotificationService
-            preview = content[:50] + '...' if len(content) > 50 else content
-            NotificationService.notify_message(receiver_id, user.id, preview, conversation_id)
+        from app.services.notification_service import NotificationService
+        preview = content[:50] + '...' if len(content) > 50 else content
+        for pid in participant_ids:
+            if pid != user.id and _should_create_message_notification(db, pid):
+                NotificationService.notify_message(pid, user.id, preview, conversation_id)
 
         # 失效缓存（新消息导致 last_message / unread_count 变化）
-        ws_manager.invalidate_participant_caches([user.id, receiver_id])
+        ws_manager.invalidate_participant_caches(participant_ids)
 
         return {"message": "Message sent", "data": message_dict}
     except Exception as e:
@@ -634,51 +641,29 @@ async def mark_conversation_as_read(
     is_direct_participant = conversation.user1_id == user.id or conversation.user2_id == user.id
     community_participant = None
     if conversation.type == 'community':
-        community_participant = db.query(ConversationParticipant).filter(
-            ConversationParticipant.conversation_id == conversation_id,
-            ConversationParticipant.user_id == user.id,
-        ).first()
+        community_participant = get_community_participant(db, conversation_id, user.id)
     if not is_direct_participant and not community_participant:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    updated_count = (
-        db.query(Message)
-        .filter(
-            Message.conversation_id == conversation_id,
-            Message.is_read == False,
-            Message.sender_id != user.id,
+    if conversation.type == 'community':
+        updated_count = mark_community_conversation_read(db, conversation_id, user.id)
+    else:
+        updated_count = (
+            db.query(Message)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.is_read == False,
+                Message.sender_id != user.id,
+            )
+            .update({Message.is_read: True}, synchronize_session=False)
         )
-        .update({Message.is_read: True}, synchronize_session=False)
-    )
 
     try:
         db.commit()
 
         # --- WebSocket 实时推送 ---
-        # 计算该用户剩余的全局未读数量（包含私聊和已加入的群聊）
-        direct_conv_ids = [c.id for c in db.query(Conversation).filter(
-            (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
-        ).all()]
-        community_conv_ids = [c.id for c in db.query(Conversation).join(
-            CommunityMember,
-            CommunityMember.community_id == Conversation.community_id,
-        ).filter(
-            Conversation.type == 'community',
-            CommunityMember.user_id == user.id,
-            CommunityMember.status == 'active',
-        ).all()]
-        all_conv_ids = list(dict.fromkeys(direct_conv_ids + community_conv_ids))
-        total_unread = 0
-        if all_conv_ids:
-            total_unread = (
-                db.query(Message)
-                .filter(
-                    Message.conversation_id.in_(all_conv_ids),
-                    Message.is_read == False,
-                    Message.sender_id != user.id,
-                )
-                .count()
-            )
+        # 计算该用户剩余的全局未读数量（私聊 legacy + 群聊成员 read cursor）
+        total_unread = get_total_unread_count(db, user.id)
         await ws_manager.send_with_seq(user.id, "conversation_read", {
             "conversation_id": conversation_id,
             "unread_count": total_unread,
@@ -735,28 +720,8 @@ def get_unread_count(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取未读消息总数（单条 SQL 聚合）"""
-    from sqlalchemy import func
-
-    conversations = db.query(Conversation.id).filter(
-        (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
-    ).all()
-
-    if not conversations:
-        return {"total_unread": 0}
-
-    conv_ids = [c.id for c in conversations]
-    total_unread = (
-        db.query(func.count(Message.id))
-        .filter(
-            Message.conversation_id.in_(conv_ids),
-            Message.is_read == False,
-            Message.sender_id != user.id,
-        )
-        .scalar()
-    )
-
-    return {"total_unread": total_unread}
+    """获取未读消息总数（私聊 legacy + 群聊成员 read cursor）"""
+    return {"total_unread": get_total_unread_count(db, user.id)}
 
 
 # ============================================================
@@ -781,7 +746,7 @@ def get_messages_around(
     conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+    if not can_access_conversation(db, conversation, user.id):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     target = db.query(Message).filter(
@@ -854,13 +819,9 @@ def recall_message(
     db.commit()
     db.refresh(msg)
 
-    # 通过 WS 推送撤回事件给会话参与者
-    participant_ids = [
-        r.user_id
-        for r in db.query(ConversationParticipant)
-        .filter(ConversationParticipant.conversation_id == msg.conversation_id)
-        .all()
-    ]
+    # 通过 WS 推送撤回事件给可投递会话参与者
+    conversation = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
+    participant_ids = get_active_conversation_participant_ids(db, conversation) if conversation else []
     recall_data = {
         "message_id": msg.id,
         "conversation_id": msg.conversation_id,
