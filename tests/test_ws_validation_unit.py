@@ -53,6 +53,40 @@ class WebSocketValidationTests(unittest.TestCase):
         self.assertIn("Not a conversation participant", source)
         self.assertLess(source.index("ConversationParticipant"), source.index(".update("))
 
+    def test_websocket_endpoint_ignores_duplicate_auth_after_authenticated(self):
+        import inspect
+
+        source = inspect.getsource(ws.websocket_endpoint)
+        normal_loop_source = source.split("# ── 阶段 3: 正常收发 ──")[1]
+        unknown_source = normal_loop_source.split("# 未知类型")[0]
+
+        self.assertIn('if msg_type == "auth":', unknown_source)
+        self.assertIn('logger.debug(f"[WS AUTH] duplicate auth ignored uid={user_id}")', unknown_source)
+        self.assertLess(
+            unknown_source.index('if msg_type == "auth":'),
+            normal_loop_source.index('# 未知类型'),
+        )
+
+    def test_ws_session_list_uses_message_to_dict_for_last_message(self):
+        import inspect
+
+        source = inspect.getsource(ws._build_session_list)
+        last_message_source = source.split('last_messages = {}')[1].split('all_partner_ids = set()')[0]
+
+        self.assertIn('last_messages[conv_id] = msg.to_dict()', last_message_source)
+        self.assertNotIn('msg.created_at.isoformat()', last_message_source)
+
+    def test_ws_send_persists_client_msg_id_and_uses_message_to_dict(self):
+        import inspect
+
+        source = inspect.getsource(ws._handle_send_message)
+        persist_source = source.split('def _persist():')[1].split('loop = asyncio.get_event_loop()')[0]
+
+        self.assertIn('client_msg_id=client_msg_id', persist_source)
+        self.assertIn('msg_dict = inject_quote_preview(db, msg.to_dict())', persist_source)
+        self.assertIn('"msg": msg_dict', persist_source)
+        self.assertNotIn('msg.created_at.isoformat()', persist_source)
+
 
 if __name__ == "__main__":
     unittest.main()

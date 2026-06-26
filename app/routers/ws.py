@@ -21,6 +21,10 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.ws_manager import ws_manager
 from app.services.message_type_service import normalize_user_message_payload
+from app.services.quote_service import (
+    inject_quote_preview,
+    validate_quote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,17 +210,7 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
     for conv_id in conv_ids:
         msg = db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.desc()).first()
         if msg:
-            last_messages[conv_id] = {
-                'id': msg.id,
-                'conversation_id': msg.conversation_id,
-                'sender_id': msg.sender_id,
-                'content': msg.content,
-                'message_type': msg.message_type,
-                'media_url': msg.media_url,
-                'related_id': msg.related_id,
-                'is_read': msg.is_read,
-                'created_at': msg.created_at.isoformat() if msg.created_at else None,
-            }
+            last_messages[conv_id] = msg.to_dict()
 
     all_partner_ids = set()
     for conv in conversations:
@@ -432,7 +426,6 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     related_id = payload.get("related_id")
     message_type = payload.get("message_type", "text")
     quote_message_id = payload.get("quote_message_id")
-    quote_preview = payload.get("quote_preview")
 
     validation_error = _validate_send_message_payload(payload)
     if validation_error:
@@ -480,6 +473,11 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             related_id = normalized["related_id"]
             message_type = normalized["message_type"]
 
+            # 校验并生成引用预览（后端实时生成，不入库 quote_preview）
+            quoted = validate_quote(db, conv.id, quote_message_id)
+            from app.services.quote_service import build_quote_preview
+            quote_preview = build_quote_preview(quoted)
+
             msg = Message(
                 conversation_id=conv.id,
                 sender_id=user_id,
@@ -487,8 +485,8 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 message_type=message_type,
                 media_url=media_url,
                 related_id=related_id,
-                quote_message_id=quote_message_id,
-                quote_preview=quote_preview,
+                client_msg_id=client_msg_id,
+                quote_message_id=quote_message_id if quoted else None,
                 is_read=False,
             )
             db.add(msg)
@@ -509,21 +507,11 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                     .count()
                 )
 
+            msg_dict = inject_quote_preview(db, msg.to_dict())
+
             return {
                 "conv_id": conv.id,
-                "msg": {
-                    "id": msg.id,
-                    "conversation_id": conv.id,
-                    "sender_id": user_id,
-                    "content": msg.content,
-                    "message_type": msg.message_type,
-                    "media_url": msg.media_url,
-                    "related_id": msg.related_id,
-                    "quote_message_id": msg.quote_message_id,
-                    "quote_preview": msg.quote_preview,
-                    "is_read": False,
-                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                },
+                "msg": msg_dict,
                 "participant_ids": participant_ids,
                 "unread_counts": unread_counts,
             }
@@ -953,6 +941,10 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             msg_type = data.get("type", "")
             logger.debug(f"[WS RECV] uid={user_id} {msg_type} {json.dumps(data, ensure_ascii=False)}")
+
+            if msg_type == "auth":
+                logger.debug(f"[WS AUTH] duplicate auth ignored uid={user_id}")
+                continue
 
             if msg_type == "ping":
                 ws_manager.heartbeat(conn_id)

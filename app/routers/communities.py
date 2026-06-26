@@ -14,6 +14,12 @@ from app.models.models import User, Conversation, Message
 from app.models.community import Community, CommunityMember
 from app.services.community_service import CommunityService, CommunityError, MAX_ADMINS
 from app.services.message_type_service import normalize_user_message_payload
+from app.services.quote_service import (
+    build_quote_preview,
+    inject_quote_preview,
+    inject_quote_preview_batch,
+    validate_quote,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -419,10 +425,15 @@ def set_member_role(
 def get_community_chat(
     community_id: int,
     limit: int = Query(50, ge=1, le=100),
+    before_id: int = Query(None, ge=1),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取社群群聊会话 + 最近消息"""
+    """获取社群群聊会话 + 最近消息
+
+    - 不传 before_id：返回最近 limit 条（含撤回的也排除）
+    - 传 before_id：返回 id < before_id 的最近 limit 条，用于向上翻页
+    """
     c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
     if not c:
         raise HTTPException(status_code=404, detail="社群不存在")
@@ -443,14 +454,92 @@ def get_community_chat(
     if not conv:
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
-    messages = db.query(Message).filter(
+    query = db.query(Message).filter(
         Message.conversation_id == conv.id,
         Message.is_recalled == False,
-    ).order_by(Message.created_at.desc()).limit(limit).all()
+    )
+    if before_id is not None:
+        query = query.filter(Message.id < before_id)
+    messages = query.order_by(Message.created_at.desc()).limit(limit + 1).all()
+
+    has_more = len(messages) > limit
+    messages = messages[:limit]
 
     return {
         "conversation": conv.to_dict(),
-        "messages": [_community_message_to_dict(msg) for msg in reversed(messages)],
+        "messages": inject_quote_preview_batch(db, [_community_message_to_dict(msg) for msg in reversed(messages)]),
+        "has_more": has_more,
+    }
+
+
+@router.get("/{community_id}/chat/messages/around")
+def get_community_message_around(
+    community_id: int,
+    target_id: int = Query(..., ge=1),
+    before: int = Query(20, ge=1, le=50),
+    after: int = Query(20, ge=1, le=50),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """群聊内某条消息的上下文窗口（点击引用 → 定位原消息）。"""
+    c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
+    if not c:
+        raise HTTPException(status_code=404, detail="社群不存在")
+
+    m = db.query(CommunityMember).filter(
+        CommunityMember.community_id == community_id,
+        CommunityMember.user_id == user.id,
+        CommunityMember.status == 'active',
+    ).first()
+    if not m:
+        raise HTTPException(status_code=403, detail="你不是该社群成员")
+
+    conv = db.query(Conversation).filter(
+        Conversation.type == 'community',
+        Conversation.community_id == community_id,
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="群聊会话不存在")
+
+    target = db.query(Message).filter(
+        Message.id == target_id,
+        Message.conversation_id == conv.id,
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target message not found")
+
+    before_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conv.id,
+            Message.created_at < target.created_at,
+        )
+        .order_by(Message.created_at.desc())
+        .limit(before + 1)
+        .all()
+    )
+    has_more_before = len(before_msgs) > before
+    before_msgs = list(reversed(before_msgs[:before]))
+
+    after_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conv.id,
+            Message.created_at > target.created_at,
+        )
+        .order_by(Message.created_at.asc())
+        .limit(after + 1)
+        .all()
+    )
+    has_more_after = len(after_msgs) > after
+    after_msgs = after_msgs[:after]
+
+    window = before_msgs + [target] + after_msgs
+    return {
+        "messages": inject_quote_preview_batch(db, [_community_message_to_dict(msg) for msg in window]),
+        "target_id": target_id,
+        "has_more_before": has_more_before,
+        "has_more_after": has_more_after,
     }
 
 
@@ -485,6 +574,11 @@ async def send_community_message(
         _normalize_community_message_payload(payload, db)
     )
 
+    # 校验并生成引用预览（实时生成，不入库 quote_preview）
+    quote_message_id = payload.get("quote_message_id")
+    quoted = validate_quote(db, conv.id, quote_message_id)
+    client_msg_id = payload.get("client_msg_id")
+
     now = datetime.utcnow()
     msg = Message(
         conversation_id=conv.id,
@@ -493,6 +587,8 @@ async def send_community_message(
         message_type=message_type,
         media_url=media_url,
         related_id=related_id,
+        client_msg_id=client_msg_id,
+        quote_message_id=quote_message_id if quoted else None,
         created_at=now,
     )
     db.add(msg)
@@ -500,7 +596,7 @@ async def send_community_message(
     db.commit()
     db.refresh(msg)
 
-    msg_dict = _community_message_to_dict(msg)
+    msg_dict = inject_quote_preview(db, _community_message_to_dict(msg))
     msg_dict["community_id"] = community_id
     msg_dict["community_name"] = c.name
 

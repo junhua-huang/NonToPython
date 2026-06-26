@@ -2,7 +2,7 @@
 FastAPI 版本 - 数据模型定义
 从 Flask-SQLAlchemy 迁移至 SQLAlchemy 2.0+ Declarative
 """
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime, Float, ForeignKey,
@@ -16,6 +16,16 @@ def _get_ws_manager():
     """延迟导入，避免循环依赖"""
     from app.ws_manager import ws_manager
     return ws_manager
+
+
+def _utc_z(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace('+00:00', 'Z')
 
 
 BUSINESS_IDENTITY_ROLES = {
@@ -471,6 +481,7 @@ class Message(Base):
     message_type = Column(String(20), default='text')  # text, image, video, post, system
     media_url = Column(String(255))
     related_id = Column(Integer)
+    client_msg_id = Column(String(128), nullable=True, index=True)
     quote_message_id = Column(Integer, nullable=True)
     quote_preview = Column(Text, nullable=True)
     is_read = Column(Boolean, default=False)
@@ -491,12 +502,13 @@ class Message(Base):
             'message_type': self.message_type,
             'media_url': self.media_url,
             'related_id': self.related_id,
+            'client_msg_id': self.client_msg_id,
             'quote_message_id': self.quote_message_id,
             'quote_preview': self.quote_preview,
             'is_read': self.is_read,
             'is_recalled': self.is_recalled,
-            'recalled_at': self.recalled_at.isoformat() if self.recalled_at else None,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'recalled_at': _utc_z(self.recalled_at),
+            'created_at': _utc_z(self.created_at),
         }
 
 

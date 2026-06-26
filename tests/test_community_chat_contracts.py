@@ -220,6 +220,79 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('CommunityService._ensure_chat_participant(db, community_id, user_id)', source)
         self.assertIn('CommunityService._ensure_chat_participant(db, community_id, req.user_id)', source)
 
+    def test_batch_messages_preserves_quote_fields_for_reply_display(self):
+        with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        batch_source = source.split('def get_messages_batch')[1].split('# ============================================================')[0]
+
+        self.assertIn('quote_message_id', batch_source)
+        self.assertIn('quote_preview', batch_source)
+        self.assertIn('is_recalled', batch_source)
+        self.assertIn('inject_quote_preview_batch(db,', batch_source)
+
+    def test_batch_messages_preserves_client_msg_id_and_utc_z_timestamps(self):
+        with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        batch_source = source.split('def get_messages_batch')[1].split('# ============================================================')[0]
+
+        self.assertIn('client_msg_id', batch_source)
+        self.assertIn('"client_msg_id": msg.client_msg_id', batch_source)
+        self.assertIn('"created_at": _utc_z(msg.created_at)', batch_source)
+        self.assertIn('"updated_at": _utc_z(msg.created_at)', batch_source)
+        self.assertNotIn('msg.created_at.isoformat()', batch_source)
+
+    def test_mark_read_authorizes_community_participants(self):
+        with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        mark_read_source = source.split('async def mark_conversation_as_read')[1].split('@router.get("/users/online")')[0]
+
+        self.assertIn('ConversationParticipant', mark_read_source)
+        self.assertIn('ConversationParticipant.conversation_id == conversation_id', mark_read_source)
+        self.assertIn('ConversationParticipant.user_id == user.id', mark_read_source)
+        self.assertIn('conversation.type == \'community\'', mark_read_source)
+
+    def test_mark_read_total_unread_includes_community_membership(self):
+        with open('app/routers/chat.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        mark_read_source = source.split('async def mark_conversation_as_read')[1].split('@router.get("/users/online")')[0]
+
+        self.assertIn('CommunityMember', mark_read_source)
+        self.assertIn("Conversation.type == 'community'", mark_read_source)
+        self.assertIn('CommunityMember.user_id == user.id', mark_read_source)
+        self.assertIn('CommunityMember.status == \'active\'', mark_read_source)
+
+    def test_message_to_dict_includes_client_msg_id_and_utc_z_timestamps(self):
+        from datetime import datetime
+
+        from app.models.models import Message
+
+        msg = Message(
+            id=10,
+            conversation_id=20,
+            sender_id=30,
+            content='hello',
+            message_type='text',
+            created_at=datetime(2026, 6, 26, 13, 0, 0),
+        )
+        msg.client_msg_id = 'community-client-1'
+        msg.recalled_at = datetime(2026, 6, 26, 13, 1, 2)
+
+        data = msg.to_dict()
+
+        self.assertEqual(data['client_msg_id'], 'community-client-1')
+        self.assertEqual(data['created_at'], '2026-06-26T13:00:00Z')
+        self.assertEqual(data['recalled_at'], '2026-06-26T13:01:02Z')
+
+    def test_community_send_accepts_persists_and_broadcasts_client_msg_id(self):
+        with open('app/routers/communities.py', 'r', encoding='utf-8') as f:
+            source = f.read()
+        send_source = source.split('async def send_community_message')[1].split('@router.delete("/{community_id}/chat/messages/{message_id}")')[0]
+
+        self.assertIn('client_msg_id = payload.get("client_msg_id")', send_source)
+        self.assertIn('client_msg_id=client_msg_id', send_source)
+        self.assertIn('msg_dict = inject_quote_preview(db, _community_message_to_dict(msg))', send_source)
+        self.assertIn('"message": msg_dict', send_source)
+
 
 if __name__ == '__main__':
     unittest.main()

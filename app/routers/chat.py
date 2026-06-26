@@ -9,10 +9,16 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Conversation, Message, ConversationParticipant, Friendship
+from app.models.models import User, Conversation, Message, ConversationParticipant, Friendship, _utc_z
 from app.models.community import CommunityMember
 from app.ws_manager import ws_manager
 from app.services.message_type_service import normalize_user_message_payload
+from app.services.quote_service import (
+    build_quote_preview,
+    inject_quote_preview,
+    inject_quote_preview_batch,
+    validate_quote,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -122,9 +128,14 @@ def get_sessions(
         users = db.query(User).filter(User.id.in_(all_user_ids)).all()
         users_map = {u.id: u for u in users}
 
+    # 批量回填 last_message 的 quote_preview，保证全局口径一致
+    last_msg_dicts = [m.to_dict() for m in last_messages]
+    inject_quote_preview_batch(db, last_msg_dicts)
+    last_msg_dict_map = {d["conversation_id"]: d for d in last_msg_dicts}
+
     result = []
     for conv in conversations:
-        last_message = last_msg_map.get(conv.id)
+        last_message_dict = last_msg_dict_map.get(conv.id)
         updated_at = (
             conv.last_message_at.isoformat()
             if conv.last_message_at
@@ -142,7 +153,7 @@ def get_sessions(
                 "community_avatar": conv.community.avatar_url if conv.community else None,
                 "participants": [],
                 "other_user": None,
-                "last_message": last_message.to_dict() if last_message else None,
+                "last_message": last_message_dict,
                 "unread_count": unread_map.get(conv.id, 0),
                 "updated_at": updated_at,
                 "last_message_at": updated_at,
@@ -168,7 +179,7 @@ def get_sessions(
             "type": conv.type,
             "participants": participants,
             "other_user": other_user.to_dict() if other_user else None,
-            "last_message": last_message.to_dict() if last_message else None,
+            "last_message": last_message_dict,
             "unread_count": unread_map.get(conv.id, 0),
             "updated_at": updated_at,
             "last_message_at": updated_at,
@@ -253,11 +264,16 @@ def get_conversations(
         users = db.query(User).filter(User.id.in_(all_user_ids)).all()
         users_map = {u.id: u for u in users}
 
+    # 批量回填 last_message 的 quote_preview，保证全局口径一致
+    last_msg_dicts = [m.to_dict() for m in last_messages]
+    inject_quote_preview_batch(db, last_msg_dicts)
+    last_msg_dict_map = {d["conversation_id"]: d for d in last_msg_dicts}
+
     result = []
     for conv in conversations:
         other_id = conv.user2_id if conv.user1_id == user.id else conv.user1_id
         other_user = users_map.get(other_id)
-        last_message = last_msg_map.get(conv.id)
+        last_message_dict = last_msg_dict_map.get(conv.id)
 
         result.append({
             "id": conv.id,
@@ -266,7 +282,7 @@ def get_conversations(
             "user2_id": conv.user2_id,
             "type": "single",
             "other_user": other_user.to_dict() if other_user else None,
-            "last_message": last_message.to_dict() if last_message else None,
+            "last_message": last_message_dict,
             "unread_count": unread_map.get(conv.id, 0),
             "is_online": ws_manager.is_connected(other_user.id) if other_user else False,
             "last_message_at": (
@@ -317,7 +333,7 @@ def get_conversation_with_user(
     return {
         "conversation": conversation.to_dict(),
         "other_user": other_user.to_dict(),
-        "messages": [msg.to_dict() for msg in messages],
+        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
         'is_online': ws_manager.is_connected(user_id),
     }
 
@@ -347,7 +363,7 @@ def get_messages(
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
     return {
-        "messages": [msg.to_dict() for msg in messages],
+        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -402,7 +418,8 @@ def get_messages_batch(
     for cid in conv_id_list:
         union_parts.append(
             "(SELECT id, conversation_id, sender_id, content, message_type, "
-            "media_url, is_read, related_id, created_at "
+            "media_url, is_read, related_id, client_msg_id, quote_message_id, quote_preview, "
+            "is_recalled, created_at "
             f"FROM messages WHERE conversation_id = {cid} "
             "ORDER BY created_at DESC LIMIT :limit)"
         )
@@ -426,26 +443,31 @@ def get_messages_batch(
     for cid in conv_id_list:
         msgs = messages_by_conv[cid]
         msgs.reverse()  # DESC → ASC
+        message_dicts = [
+            {
+                "id": msg.id,
+                "conversation_id": msg.conversation_id,
+                "sender_id": msg.sender_id,
+                "content": msg.content,
+                "message_type": msg.message_type,
+                "media_url": msg.media_url,
+                "file_url": msg.media_url,
+                "file_name": None,
+                "file_size": None,
+                "is_read": msg.is_read,
+                "related_id": msg.related_id,
+                "client_msg_id": msg.client_msg_id,
+                "quote_message_id": msg.quote_message_id,
+                "quote_preview": msg.quote_preview,
+                "is_recalled": msg.is_recalled,
+                "created_at": _utc_z(msg.created_at),
+                "updated_at": _utc_z(msg.created_at),
+            }
+            for msg in msgs
+        ]
         result_conversations.append({
             "conversation_id": cid,
-            "messages": [
-                {
-                    "id": msg.id,
-                    "conversation_id": msg.conversation_id,
-                    "sender_id": msg.sender_id,
-                    "content": msg.content,
-                    "message_type": msg.message_type,
-                    "media_url": msg.media_url,
-                    "file_url": msg.media_url,
-                    "file_name": None,
-                    "file_size": None,
-                    "is_read": msg.is_read,
-                    "related_id": msg.related_id,
-                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                    "updated_at": msg.created_at.isoformat() if msg.created_at else None,
-                }
-                for msg in msgs
-            ],
+            "messages": inject_quote_preview_batch(db, message_dicts),
         })
 
     return {
@@ -489,7 +511,7 @@ def get_messages_v2(
         messages = messages[:limit]
 
     return {
-        "messages": [msg.to_dict() for msg in messages],
+        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
         "total": total,
         "has_more": has_more,
         "current_page": page,
@@ -526,6 +548,10 @@ async def send_message(
     media_url = normalized["media_url"]
     related_id = normalized["related_id"]
 
+    # 校验并生成引用预览（实时生成，不入库 quote_preview）
+    quote_message_id = payload.get("quote_message_id")
+    quoted = validate_quote(db, conversation_id, quote_message_id)
+
     message = Message(
         conversation_id=conversation_id,
         sender_id=user.id,
@@ -533,6 +559,7 @@ async def send_message(
         message_type=message_type,
         media_url=media_url,
         related_id=related_id,
+        quote_message_id=quote_message_id if quoted else None,
     )
 
     try:
@@ -542,6 +569,9 @@ async def send_message(
         db.commit()
         db.refresh(message)
         logger.info(f"Message sent in conversation {conversation_id} by user {user.id}")
+
+        # 预先序列化（含 quote_preview 实时回填）
+        message_dict = inject_quote_preview(db, message.to_dict())
 
         # --- WebSocket 实时推送 ---
         # 推送给接收方：未读消息总数
@@ -557,7 +587,7 @@ async def send_message(
         )
         await ws_manager.send_with_seq(receiver_id, "new_message", {
             "conversation_id": conversation_id,
-            "data": message.to_dict(),
+            "data": message_dict,
             "unread_count": receiver_unread,
         })
         # 也推送给发送者：同步自己的未读（通常为0）
@@ -572,7 +602,7 @@ async def send_message(
         )
         await ws_manager.send_with_seq(user.id, "new_message", {
             "conversation_id": conversation_id,
-            "data": message.to_dict(),
+            "data": message_dict,
             "unread_count": sender_unread,
         })
 
@@ -586,7 +616,7 @@ async def send_message(
         # 失效缓存（新消息导致 last_message / unread_count 变化）
         ws_manager.invalidate_participant_caches([user.id, receiver_id])
 
-        return {"message": "Message sent", "data": message.to_dict()}
+        return {"message": "Message sent", "data": message_dict}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -600,7 +630,15 @@ async def mark_conversation_as_read(
     conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+
+    is_direct_participant = conversation.user1_id == user.id or conversation.user2_id == user.id
+    community_participant = None
+    if conversation.type == 'community':
+        community_participant = db.query(ConversationParticipant).filter(
+            ConversationParticipant.conversation_id == conversation_id,
+            ConversationParticipant.user_id == user.id,
+        ).first()
+    if not is_direct_participant and not community_participant:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     updated_count = (
@@ -617,19 +655,30 @@ async def mark_conversation_as_read(
         db.commit()
 
         # --- WebSocket 实时推送 ---
-        # 计算该用户剩余的全局未读数量
-        all_conv_ids = [c.id for c in db.query(Conversation).filter(
+        # 计算该用户剩余的全局未读数量（包含私聊和已加入的群聊）
+        direct_conv_ids = [c.id for c in db.query(Conversation).filter(
             (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
         ).all()]
-        total_unread = (
-            db.query(Message)
-            .filter(
-                Message.conversation_id.in_(all_conv_ids),
-                Message.is_read == False,
-                Message.sender_id != user.id,
+        community_conv_ids = [c.id for c in db.query(Conversation).join(
+            CommunityMember,
+            CommunityMember.community_id == Conversation.community_id,
+        ).filter(
+            Conversation.type == 'community',
+            CommunityMember.user_id == user.id,
+            CommunityMember.status == 'active',
+        ).all()]
+        all_conv_ids = list(dict.fromkeys(direct_conv_ids + community_conv_ids))
+        total_unread = 0
+        if all_conv_ids:
+            total_unread = (
+                db.query(Message)
+                .filter(
+                    Message.conversation_id.in_(all_conv_ids),
+                    Message.is_read == False,
+                    Message.sender_id != user.id,
+                )
+                .count()
             )
-            .count()
-        )
         await ws_manager.send_with_seq(user.id, "conversation_read", {
             "conversation_id": conversation_id,
             "unread_count": total_unread,
@@ -713,6 +762,71 @@ def get_unread_count(
 # ============================================================
 # 消息撤回
 # ============================================================
+
+@router.get("/conversations/{conversation_id}/messages/around")
+def get_messages_around(
+    conversation_id: int,
+    target_id: int = Query(..., ge=1),
+    before: int = Query(20, ge=1, le=50),
+    after: int = Query(20, ge=1, le=50),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取某条消息在会话内的上下文窗口（用于"点击引用 → 定位原消息"）。
+
+    返回：
+      - messages: 升序，含 target 共 before+after+1 条
+      - has_more_before / has_more_after: 是否还有更早/更晚的消息
+    """
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.user1_id != user.id and conversation.user2_id != user.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    target = db.query(Message).filter(
+        Message.id == target_id,
+        Message.conversation_id == conversation_id,
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target message not found")
+
+    # before：target 之前（更早）的消息，按 created_at 降序取后反转为升序
+    before_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation_id,
+            Message.created_at < target.created_at,
+        )
+        .order_by(Message.created_at.desc())
+        .limit(before + 1)
+        .all()
+    )
+    has_more_before = len(before_msgs) > before
+    before_msgs = list(reversed(before_msgs[:before]))
+
+    # after：target 之后（更晚）的消息，按 created_at 升序
+    after_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation_id,
+            Message.created_at > target.created_at,
+        )
+        .order_by(Message.created_at.asc())
+        .limit(after + 1)
+        .all()
+    )
+    has_more_after = len(after_msgs) > after
+    after_msgs = after_msgs[:after]
+
+    window = before_msgs + [target] + after_msgs
+    return {
+        "messages": inject_quote_preview_batch(db, [m.to_dict() for m in window]),
+        "target_id": target_id,
+        "has_more_before": has_more_before,
+        "has_more_after": has_more_after,
+    }
+
 
 @router.post("/messages/{message_id}/recall")
 def recall_message(
