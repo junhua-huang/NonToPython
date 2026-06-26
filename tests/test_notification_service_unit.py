@@ -18,10 +18,11 @@ class NotificationServiceUnitTests(unittest.TestCase):
         self.assertIn("notification_dict = notification.to_dict()", source)
         self.assertIn("_push_new_notification(user_id, notification_dict)", source)
 
-    def test_push_new_notification_schedules_jpush_without_ws_connected_gate(self):
+    def test_push_new_notification_sends_jpush_inside_outer_task(self):
         source = inspect.getsource(NotificationService._push_new_notification)
 
-        self.assertIn("PushService.schedule_send_to_user", source)
+        self.assertIn("await PushService.send_to_user", source)
+        self.assertNotIn("PushService.schedule_send_to_user", source)
         self.assertNotIn("if not ws_manager.is_connected(user_id):", source)
 
 

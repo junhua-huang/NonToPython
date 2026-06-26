@@ -78,6 +78,13 @@ class PushDeviceStateContractTests(unittest.TestCase):
         self.assertNotIn("_should_create_message_notification(db, p)", source)
         self.assertIn("_get_message_notification_targets", source)
 
+    def test_config_defaults_enable_android_vendor_channels(self):
+        source = inspect.getsource(Config)
+
+        self.assertIn("JPUSH_ENABLE_THIRD_PARTY_CHANNEL", source)
+        self.assertIn("'true'", source)
+        self.assertIn("huawei,xiaomi,oppo,vivo,meizu", source)
+
     def test_payload_third_party_channel_is_config_gated(self):
         with patch.object(Config, "JPUSH_ENABLE_THIRD_PARTY_CHANNEL", False):
             payload = PushService.build_android_payload(

@@ -73,10 +73,10 @@ class Config:
     JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
     # iOS: true=生产环境 APNs，false=开发环境；Android 忽略此参数
     JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'false').lower() == 'true'
-    JPUSH_ENABLE_THIRD_PARTY_CHANNEL = os.environ.get('JPUSH_ENABLE_THIRD_PARTY_CHANNEL', 'false').lower() == 'true'
+    JPUSH_ENABLE_THIRD_PARTY_CHANNEL = os.environ.get('JPUSH_ENABLE_THIRD_PARTY_CHANNEL', 'true').lower() == 'true'
     JPUSH_THIRD_PARTY_CHANNELS = {
         item.strip().lower()
-        for item in os.environ.get('JPUSH_THIRD_PARTY_CHANNELS', '').split(',')
+        for item in os.environ.get('JPUSH_THIRD_PARTY_CHANNELS', 'huawei,xiaomi,oppo,vivo,meizu').split(',')
         if item.strip()
     }
     PUSH_FOREGROUND_ACTIVE_SECONDS = int(os.environ.get('PUSH_FOREGROUND_ACTIVE_SECONDS', '120'))

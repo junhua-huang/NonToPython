@@ -63,7 +63,7 @@ class NotificationService:
                 related_type = notification_dict.get("related_type")
                 alert_title = (notification_dict.get("title") or "南图")[:40]
                 alert_content = (notification_dict.get("content") or "你有一条新通知")[:80]
-                PushService.schedule_send_to_user(
+                await PushService.send_to_user(
                     user_id,
                     alert_title=alert_title,
                     alert_content=alert_content,
