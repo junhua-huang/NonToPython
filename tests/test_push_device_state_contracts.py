@@ -109,6 +109,14 @@ class PushDeviceStateContractTests(unittest.TestCase):
         self.assertEqual(channels["oppo"]["channel_id"], "nonto_message")
         self.assertEqual(channels["vivo"]["classification"], 1)
 
+    def test_jpush_send_logs_include_third_party_channel_diagnostics(self):
+        source = inspect.getsource(PushService.send_to_user)
+
+        self.assertIn('channels=%s', source)
+        self.assertIn('Config.JPUSH_THIRD_PARTY_CHANNELS', source)
+        self.assertIn('third_party=%s', source)
+        self.assertIn('resp.text[:300]', source)
+
 
 if __name__ == "__main__":
     unittest.main()

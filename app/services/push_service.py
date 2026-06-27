@@ -193,6 +193,7 @@ class PushService:
             alert_content=alert_content,
             extras=extras,
         )
+        enabled_channels = sorted(Config.JPUSH_THIRD_PARTY_CHANNELS)
 
         try:
             client = await cls._get_client()
@@ -203,18 +204,21 @@ class PushService:
             )
             if resp.status_code == 200:
                 logger.info(
-                    "[JPUSH] pushed uid=%s targets=%s type=%s third_party=%s",
+                    "[JPUSH] pushed uid=%s targets=%s type=%s third_party=%s channels=%s",
                     user_id,
                     len(reg_ids),
                     extras.get("type"),
                     Config.JPUSH_ENABLE_THIRD_PARTY_CHANNEL,
+                    enabled_channels,
                 )
                 return True
             logger.warning(
-                "[JPUSH] push failed uid=%s targets=%s status=%s body=%s",
+                "[JPUSH] push failed uid=%s targets=%s status=%s third_party=%s channels=%s body=%s",
                 user_id,
                 len(reg_ids),
                 resp.status_code,
+                Config.JPUSH_ENABLE_THIRD_PARTY_CHANNEL,
+                enabled_channels,
                 resp.text[:300],
             )
             return False
