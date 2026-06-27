@@ -126,6 +126,18 @@ class IdentityRoleContractTests(unittest.TestCase):
         self.assertIn("contact_info", source)
         self.assertIn("extra_note", source)
 
+    def test_roles_router_limits_identity_proof_images_to_nine(self):
+        source = inspect.getsource(roles_router.RoleApplyRequest)
+        self.assertIn("max_length=9", source)
+        self.assertIn("proof_images", source)
+
+    def test_role_application_notifies_admin_email_in_background(self):
+        source = inspect.getsource(roles_router.apply_role)
+        self.assertIn("BackgroundTasks", source)
+        self.assertIn("background_tasks.add_task", source)
+        self.assertIn("2531830689@qq.com", inspect.getsource(roles_router))
+        self.assertIn("send_email", inspect.getsource(roles_router))
+
     def test_create_post_accepts_identity_form_fields(self):
         source = inspect.getsource(posts_router.create_post)
         self.assertIn('content_category: Optional[str] = Form(None)', source)

@@ -4,11 +4,14 @@
 - 角色申请（用户自主申请 → 管理员审核）
 - 角色资料管理（Coser / 摄影师 / 服务商）
 """
+import html
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
+
+from app.services.email_service import EmailService
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_admin, require_role
@@ -21,6 +24,8 @@ from app.models.models import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/roles", tags=["Roles"])
 
+IDENTITY_APPLICATION_NOTIFY_EMAIL = "2531830689@qq.com"
+
 
 # ============================================================
 # Pydantic Schemas
@@ -30,7 +35,7 @@ class RoleApplyRequest(BaseModel):
     role_name: str
     reason: str = ""
     application_text: str = ""
-    proof_images: list[str] = Field(default_factory=list)
+    proof_images: list[str] = Field(default_factory=list, max_length=9)
     portfolio_links: list[str] = Field(default_factory=list)
     contact_info: str = ""
     extra_note: str = ""
@@ -72,6 +77,33 @@ class ServiceProfileUpdate(BaseModel):
     portfolio_images: str | None = None
 
 
+async def _send_role_application_email(
+    *,
+    application_id: int,
+    username: str,
+    user_id: int,
+    role_label: str,
+    role_name: str,
+    application_text: str,
+    proof_image_count: int,
+    contact_info: str,
+):
+    subject = f"【南图】新的身份认证申请 #{application_id}"
+    body = f"""\
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:640px;margin:0 auto;padding:24px;">
+  <h2 style="color:#1DA1F2;margin:0 0 16px;">新的身份认证申请</h2>
+  <p><strong>申请编号：</strong>{application_id}</p>
+  <p><strong>用户：</strong>{html.escape(username)} (ID: {user_id})</p>
+  <p><strong>申请身份：</strong>{html.escape(role_label)} / {html.escape(role_name)}</p>
+  <p><strong>证明图片：</strong>{proof_image_count} 张</p>
+  <p><strong>联系方式：</strong>{html.escape(contact_info or '未填写')}</p>
+  <p><strong>认证说明：</strong></p>
+  <blockquote style="margin:12px 0;padding:12px;background:#f7f9fa;border-left:4px solid #1DA1F2;white-space:pre-wrap;">{html.escape(application_text or '未填写')}</blockquote>
+  <p style="color:#8899a6;font-size:12px;margin-top:24px;">请登录后台审核该身份认证申请。</p>
+</div>"""
+    await EmailService.send_email(IDENTITY_APPLICATION_NOTIFY_EMAIL, subject, body)
+
+
 # ============================================================
 # 角色查询
 # ============================================================
@@ -105,6 +137,7 @@ def get_my_roles(
 @router.post("/apply")
 def apply_role(
     data: RoleApplyRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -150,6 +183,18 @@ def apply_role(
     db.add(application)
     db.commit()
     db.refresh(application)
+
+    background_tasks.add_task(
+        _send_role_application_email,
+        application_id=application.id,
+        username=user.username,
+        user_id=user.id,
+        role_label=role.label,
+        role_name=role.name,
+        application_text=application_text,
+        proof_image_count=len(data.proof_images),
+        contact_info=data.contact_info.strip(),
+    )
 
     logger.info(f"User {user.username} applied for role: {role_name}")
     return {
