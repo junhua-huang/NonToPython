@@ -16,8 +16,7 @@ from app.core.config import Config
 from app.database import init_db
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
-from app.routers import push
-from app.routers import communities
+from app.routers import communities, push
 
 # 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
 # 通过 LOG_LEVEL 环境变量覆盖（DEBUG/INFO/WARNING）。
@@ -146,8 +145,8 @@ app.include_router(health.router, prefix="", tags=["Health"])
 app.include_router(admin.router, prefix="", tags=["Admin"])
 app.include_router(comic.router, prefix="/api/comic", tags=["Comic"])
 app.include_router(roles.router, tags=["Roles"])
-app.include_router(push.router, prefix="/api/push", tags=["Push"])
 app.include_router(communities.router, prefix="/api/communities", tags=["Communities"])
+app.include_router(push.router, prefix="/api/push", tags=["Push"])
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 

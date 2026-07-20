@@ -22,6 +22,8 @@ from werkzeug.security import check_password_hash
 from app.dependencies import get_current_user, get_optional_user
 from app.services.email_service import EmailService
 from app.services.otp_service import OtpService
+from app.services.block_service import has_block_between
+from app.serializers.user import serialize_user_profile, serialize_user_self
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Auth"])
@@ -229,32 +231,11 @@ class PrivacySettingsUpdateRequest(BaseModel):
 # ============================================================
 
 def _build_user_response(user: User) -> dict:
-    roles = user.get_role_names() if hasattr(user, 'get_role_names') else []
-    role_labels = user.get_role_labels() if hasattr(user, 'get_role_labels') else []
-    return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "display_name": user.username,
-        "bio": user.bio,
-        "avatar_url": user.avatar_url,
-        "cover_photo_url": user.cover_photo_url,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "roles": roles,
-        "role_labels": role_labels,
-    }
+    return serialize_user_self(user)
 
 
-def _build_public_user_response(user: User) -> dict:
-    return {
-        "id": user.id,
-        "username": user.username,
-        "display_name": user.username,
-        "bio": user.bio,
-        "avatar_url": user.avatar_url,
-        "cover_photo_url": user.cover_photo_url,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-    }
+def _build_public_user_response(user: User, viewer_user_id: int | None = None) -> dict:
+    return serialize_user_profile(user, viewer_user_id=viewer_user_id)
 
 
 # ============================================================
@@ -524,9 +505,9 @@ def get_user_info(
 ):
     """获取用户公开信息（需登录，防止未授权枚举用户）"""
     target = db.query(User).filter(User.id == user_id).first()
-    if not target:
+    if not target or has_block_between(db, current_user.id, user_id):
         raise HTTPException(status_code=404, detail="User not found")
-    return _build_public_user_response(target)
+    return _build_public_user_response(target, viewer_user_id=current_user.id)
 
 
 # ============================================================

@@ -2,6 +2,7 @@
 话题服务 - FastAPI 重构版（Session 参数传递模式）
 """
 from app.models.models import Topic, Post, User, post_topics, topic_followers
+from app.services.post_visibility_service import post_visibility_predicate
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -73,28 +74,32 @@ class TopicService:
             return False
 
     @staticmethod
-    def get_topic_posts(db: Session, topic_id: int, page: int = 1, per_page: int = 20):
+    def get_topic_posts(
+        db: Session,
+        topic_id: int,
+        page: int = 1,
+        per_page: int = 20,
+        current_user_id: int | None = None,
+    ):
         offset = (page - 1) * per_page
-        total = db.execute(
-            text('SELECT COUNT(*) FROM post_topics WHERE topic_id = :topic_id'),
-            {'topic_id': topic_id}
-        ).scalar() or 0
-
-        result = db.execute(
-            text('''SELECT p.id FROM posts p 
-                JOIN post_topics pt ON p.id = pt.post_id 
-                WHERE pt.topic_id = :topic_id AND p.is_public = true
-                ORDER BY p.created_at DESC
-                LIMIT :limit OFFSET :offset'''),
-            {'topic_id': topic_id, 'limit': per_page, 'offset': offset}
+        post_query = (
+            db.query(Post)
+            .join(post_topics, Post.id == post_topics.c.post_id)
+            .filter(
+                post_topics.c.topic_id == topic_id,
+                post_visibility_predicate(current_user_id),
+            )
         )
-        post_ids = [row[0] for row in result]
-        posts = db.query(Post).filter(Post.id.in_(post_ids)).all() if post_ids else []
-        post_map = {p.id: p for p in posts}
-        posts = [post_map[pid] for pid in post_ids if pid in post_map]
+        total = post_query.count()
+        posts = (
+            post_query.order_by(Post.created_at.desc())
+            .offset(offset)
+            .limit(per_page)
+            .all()
+        )
 
         from app.services.recommendation_service import RecommendationService
-        batch_data = RecommendationService._batch_load_post_data(db, posts, None)
+        batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
 
         return {
             'posts': RecommendationService._serialize_posts(posts, batch_data),
@@ -197,26 +202,30 @@ class TopicService:
         }
 
     @staticmethod
-    def get_trending_topics(db: Session, limit: int = 10):
+    def get_trending_topics(
+        db: Session,
+        limit: int = 10,
+        current_user_id: int | None = None,
+    ):
         thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-        result = db.execute(
-            text('''SELECT t.id, COUNT(pt.post_id) as recent_post_count
-                FROM topics t
-                JOIN post_topics pt ON t.id = pt.topic_id
-                JOIN posts p ON pt.post_id = p.id
-                WHERE p.created_at >= :thirty_days_ago AND p.is_public = true
-                GROUP BY t.id
-                ORDER BY recent_post_count DESC
-                LIMIT :limit'''),
-            {'thirty_days_ago': thirty_days_ago, 'limit': limit}
+        rows = (
+            db.query(Topic, func.count(post_topics.c.post_id).label('recent_post_count'))
+            .join(post_topics, Topic.id == post_topics.c.topic_id)
+            .join(Post, Post.id == post_topics.c.post_id)
+            .filter(
+                Post.created_at >= thirty_days_ago,
+                post_visibility_predicate(current_user_id),
+            )
+            .group_by(Topic.id)
+            .order_by(func.count(post_topics.c.post_id).desc())
+            .limit(limit)
+            .all()
         )
         trending = []
-        for row in result:
-            topic = db.query(Topic).filter(Topic.id == row[0]).first()
-            if topic:
-                topic_data = topic.to_dict()
-                topic_data['recent_post_count'] = row[1]
-                trending.append(topic_data)
+        for topic, recent_post_count in rows:
+            topic_data = topic.to_dict()
+            topic_data['recent_post_count'] = recent_post_count
+            trending.append(topic_data)
         return trending
 
     @staticmethod

@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.models import Message
+from app.services.block_service import visible_user_predicate
 
 # 预览文案截断长度
 _PREVIEW_TEXT_LIMIT = 50
@@ -87,7 +88,11 @@ def _is_same_conversation_quote(quoted: Optional[Message], msg_dict: dict) -> bo
     return conversation_id is not None and quoted.conversation_id == conversation_id
 
 
-def inject_quote_preview(db: Session, msg_dict: dict) -> dict:
+def inject_quote_preview(
+    db: Session,
+    msg_dict: dict,
+    viewer_user_id: int | None = None,
+) -> dict:
     """序列化消息时实时回填 quote_preview。
 
     - 无 quote_message_id → preview 置 None。
@@ -101,7 +106,12 @@ def inject_quote_preview(db: Session, msg_dict: dict) -> dict:
         msg_dict["quote_preview"] = None
         return msg_dict
 
-    quoted = db.query(Message).filter(Message.id == quote_id).first()
+    quoted_query = db.query(Message).filter(Message.id == quote_id)
+    if viewer_user_id is not None:
+        quoted_query = quoted_query.filter(
+            visible_user_predicate(viewer_user_id, Message.sender_id)
+        )
+    quoted = quoted_query.first()
     if not _is_same_conversation_quote(quoted, msg_dict):
         msg_dict["quote_preview"] = _UNAVAILABLE_QUOTE_PREVIEW
         return msg_dict
@@ -110,7 +120,11 @@ def inject_quote_preview(db: Session, msg_dict: dict) -> dict:
     return msg_dict
 
 
-def inject_quote_preview_batch(db: Session, msg_dicts: list[dict]) -> list[dict]:
+def inject_quote_preview_batch(
+    db: Session,
+    msg_dicts: list[dict],
+    viewer_user_id: int | None = None,
+) -> list[dict]:
     """批量回填 quote_preview。
 
     一次查出所有被引消息，避免 N+1。
@@ -121,9 +135,12 @@ def inject_quote_preview_batch(db: Session, msg_dicts: list[dict]) -> list[dict]
             d["quote_preview"] = None
         return msg_dicts
 
-    quoted_map: dict[int, Message] = {
-        m.id: m for m in db.query(Message).filter(Message.id.in_(quote_ids)).all()
-    }
+    quoted_query = db.query(Message).filter(Message.id.in_(quote_ids))
+    if viewer_user_id is not None:
+        quoted_query = quoted_query.filter(
+            visible_user_predicate(viewer_user_id, Message.sender_id)
+        )
+    quoted_map: dict[int, Message] = {m.id: m for m in quoted_query.all()}
     for d in msg_dicts:
         qid = d.get("quote_message_id")
         if not qid:

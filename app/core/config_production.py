@@ -44,11 +44,6 @@ class ProductionConfig:
     DEBUG = False
     TESTING = False
 
-    # 极光推送 (JPush) 配置 - Master Secret 仅服务端使用，不可下发到客户端
-    JPUSH_APP_KEY = os.environ.get('JPUSH_APP_KEY', '')
-    JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
-    JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'true').lower() == 'true'
-
     # 邮件 (SMTP) 配置
     SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.qq.com')
     SMTP_PORT = int(os.environ.get('SMTP_PORT', '465'))

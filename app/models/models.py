@@ -162,24 +162,10 @@ class User(Base):
         return role_name in self.get_role_names()
 
     def to_dict(self):
-        ws_manager = _get_ws_manager()
-        is_online = ws_manager.is_connected(self.id) if self.id else False
-        return {
-            'id': self.id,
-            'username': self.username,
-            'email': self.email,
-            'display_name': self.username,
-            'bio': self.bio,
-            'avatar': self.avatar_url,
-            'avatar_url': self.avatar_url,
-            'cover_photo_url': self.cover_photo_url,
-            'is_online': is_online,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'roles': self.get_verified_identity_roles(),
-            'role_labels': self.get_verified_identity_labels(),
-            'verified_roles': self.get_verified_identity_roles(),
-            'verified_role_labels': self.get_verified_identity_labels(),
-        }
+        """Safe card serialization for list and nested response contexts."""
+        from app.serializers.user import serialize_user_card
+
+        return serialize_user_card(self)
 
 
 class Post(Base):
@@ -548,6 +534,79 @@ class Notification(Base):
             'is_read': self.is_read,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class PushDevice(Base):
+    """阿里云推送设备绑定。"""
+    __tablename__ = 'push_devices'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    platform = Column(String(20), default='android')
+    provider = Column(String(30), default='aliyun')
+    device_id = Column(String(128), unique=True, nullable=False, index=True)
+    manufacturer = Column(String(80))
+    model = Column(String(120))
+    app_version = Column(String(50))
+    enabled = Column(Boolean, default=True)
+    app_state = Column(String(20), default='unknown')
+    app_state_updated_at = Column(DateTime, default=datetime.utcnow)
+    last_foreground_at = Column(DateTime)
+    last_background_at = Column(DateTime)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'platform': self.platform,
+            'provider': self.provider,
+            'device_id': self.device_id,
+            'manufacturer': self.manufacturer,
+            'model': self.model,
+            'app_version': self.app_version,
+            'enabled': self.enabled,
+            'app_state': self.app_state,
+            'app_state_updated_at': self.app_state_updated_at.isoformat() if self.app_state_updated_at else None,
+            'last_foreground_at': self.last_foreground_at.isoformat() if self.last_foreground_at else None,
+            'last_background_at': self.last_background_at.isoformat() if self.last_background_at else None,
+            'last_seen_at': self.last_seen_at.isoformat() if self.last_seen_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PushLog(Base):
+    """One delivery-state row for a notification/device pair."""
+    __tablename__ = 'push_logs'
+    __table_args__ = (
+        UniqueConstraint(
+            'notification_id',
+            'device_id',
+            name='uq_push_logs_notification_device',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    device_id = Column(String(128), nullable=False)
+    notification_id = Column(Integer, nullable=False, index=True)
+    notification_type = Column(String(50))
+    title = Column(String(200))
+    status = Column(String(30))
+    claim_token = Column(String(36))
+    claimed_at = Column(DateTime)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    request_id = Column(String(128))
+    message_id = Column(String(128))
+    error_code = Column(String(80))
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Topic(Base):
@@ -1069,7 +1128,9 @@ class RoleApplication(Base):
     role = relationship('Role')
     reviewer = relationship('User', foreign_keys=[reviewer_id])
 
-    def to_dict(self):
+    def to_dict(self, include_private_user=False):
+        from app.serializers.user import serialize_user_self
+
         return {
             'id': self.id,
             'user_id': self.user_id,
@@ -1084,39 +1145,15 @@ class RoleApplication(Base):
             'extra_note': self.extra_note,
             'review_comment': self.review_comment,
             'reviewer_id': self.reviewer_id,
-            'user': self.user.to_dict() if self.user else None,
+            'user': (
+                serialize_user_self(self.user)
+                if self.user and include_private_user
+                else self.user.to_dict() if self.user else None
+            ),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
         }
 
-
-class UserDevice(Base):
-    """用户设备 - 存储极光推送 registrationId，支持多设备登录"""
-    __tablename__ = 'user_devices'
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
-    registration_id = Column(String(255), nullable=False, index=True)
-    platform = Column(String(20), default='android')  # android / ios / harmony
-    app_version = Column(String(50))
-    last_active_at = Column(DateTime, default=datetime.utcnow)
-    app_state = Column(String(20), default='unknown')  # foreground / background / unknown
-    app_state_updated_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    is_active = Column(Boolean, default=True)
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'user_id': self.user_id,
-            'registration_id': self.registration_id,
-            'platform': self.platform,
-            'app_version': self.app_version,
-            'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
-            'app_state': self.app_state,
-            'app_state_updated_at': self.app_state_updated_at.isoformat() if self.app_state_updated_at else None,
-            'is_active': self.is_active,
-        }
 
 
 class EmailOtp(Base):

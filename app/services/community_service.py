@@ -412,11 +412,22 @@ class CommunityService:
     # ---------- 查询 ----------
 
     @staticmethod
-    def list_members(db: Session, community_id: int, limit: int = 50, offset: int = 0):
+    def list_members(
+        db: Session,
+        community_id: int,
+        limit: int = 50,
+        offset: int = 0,
+        viewer_user_id: int | None = None,
+    ):
         q = db.query(CommunityMember).filter(
             CommunityMember.community_id == community_id,
             CommunityMember.status == 'active',
-        ).order_by(
+        )
+        if viewer_user_id is not None:
+            from app.services.block_service import visible_user_predicate
+
+            q = q.filter(visible_user_predicate(viewer_user_id, CommunityMember.user_id))
+        q = q.order_by(
             # owner 在前，admin 次之，member 最后，再按加入时间
             CommunityMember.role.asc(), CommunityMember.joined_at.asc()
         )
@@ -658,19 +669,26 @@ class CommunityService:
     # ==================== 热门排序 ====================
 
     @staticmethod
-    def list_hot_posts(db: Session, community_id: int, limit: int = 20):
+    def list_hot_posts(
+        db: Session,
+        community_id: int,
+        limit: int = 20,
+        current_user_id: int | None = None,
+    ):
         """按热度排序社群帖子：热度 = (like_count*2 + comment_count*3) / hours_ago。
         公式简单易懂，筛选近 72 小时的帖子。"""
         from math import ceil
         from app.models.models import Post
+        from app.services.post_visibility_service import post_visibility_predicate
         from sqlalchemy import func
 
         # 近 72 小时的帖子
         cutoff = datetime.utcnow() - timedelta(hours=72)
         posts = db.query(Post).filter(
             Post.community_id == community_id,
-            Post.hidden_by_admin == False,
+            Post.hidden_by_admin.is_not(True),
             Post.created_at >= cutoff,
+            post_visibility_predicate(current_user_id),
         ).all()
 
         now = datetime.utcnow()

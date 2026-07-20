@@ -8,8 +8,15 @@ import logging
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import BUSINESS_IDENTITY_ROLES, User, Post, Like, Comment, Friendship, PostView, Notification, Role, UserRole, post_visibility
+from app.models.models import BUSINESS_IDENTITY_ROLES, User, Post, Like, Comment, PostView, Notification, Role, UserRole
 from sqlalchemy import or_, select
+from app.services.block_service import has_block_between
+from app.services.post_visibility_service import (
+    can_view_post,
+    load_visible_post,
+    post_visibility_predicate,
+    validate_post_visibility_write,
+)
 from app.core.config import Config
 from app.utils import FileUploader
 from app.services.topic_service import TopicService
@@ -34,6 +41,34 @@ def resolve_display_role_type(user: User, requested_role: Optional[str], db: Ses
     return role_name if row else None
 
 
+def _validate_post_community_write(
+    db: Session,
+    user_id: int,
+    community_id: int | None,
+    community_only: bool,
+) -> None:
+    if community_only and community_id is None:
+        raise HTTPException(status_code=422, detail="community_only requires community_id")
+    if community_id is None:
+        return
+
+    from app.models.community import Community, CommunityMember
+
+    community = db.query(Community).filter(
+        Community.id == community_id,
+        Community.status == "active",
+    ).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="社群不存在")
+    member = db.query(CommunityMember).filter(
+        CommunityMember.community_id == community_id,
+        CommunityMember.user_id == user_id,
+        CommunityMember.status == "active",
+    ).first()
+    if not member:
+        raise HTTPException(status_code=403, detail="你不是该社群成员，无法发帖")
+
+
 @router.post("")
 async def create_post(
     image: Optional[UploadFile] = File(None),
@@ -53,6 +88,17 @@ async def create_post(
     """创建新帖子（支持文件上传 + 多图 URL）"""
     import json as _json
     current_user_id = user.id
+    try:
+        visibility = validate_post_visibility_write(visibility, visible_user_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _validate_post_community_write(
+        db,
+        current_user_id,
+        community_id,
+        community_only is True,
+    )
+
     final_image_url = None
     final_video_url = video_url_input
     images_json = None
@@ -125,27 +171,12 @@ async def create_post(
             })
         content = moderation_result["filtered_text"]
 
-    # 社群发帖校验
-    if community_id:
-        from app.models.community import Community, CommunityMember
-        c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
-        if not c:
-            raise HTTPException(status_code=404, detail="社群不存在")
-        m = db.query(CommunityMember).filter(
-            CommunityMember.community_id == community_id,
-            CommunityMember.user_id == current_user_id,
-            CommunityMember.status == 'active',
-        ).first()
-        if not m:
-            raise HTTPException(status_code=403, detail="你不是该社群成员，无法发帖")
-
     post = Post(
         content=content,
         images=images_json,
         video_url=final_video_url,
         post_type=post_type,
         user_id=current_user_id,
-        content_category=content_category.strip() if content_category else None,
         display_role_type=resolve_display_role_type(user, display_role_type, db),
         visibility=visibility,
         is_public=(visibility == "public"),
@@ -156,13 +187,6 @@ async def create_post(
     try:
         db.add(post)
         db.flush()
-
-        if visibility == "custom" and visible_user_ids:
-            uids = [int(uid.strip()) for uid in visible_user_ids.split(",") if uid.strip()]
-            for uid in uids:
-                stmt = post_visibility.insert().values(post_id=post.id, user_id=uid)
-                db.execute(stmt)
-
         db.commit()
 
         if post.content:
@@ -196,39 +220,22 @@ def get_posts(
 
         posts_query = (
             db.query(Post)
-            .filter(Post.community_id == community_id, Post.hidden_by_admin == False)
+            .filter(
+                Post.community_id == community_id,
+                Post.hidden_by_admin.is_not(True),
+                post_visibility_predicate(current_user_id),
+            )
             .order_by(Post.created_at.desc())
         )
         offset = (page - 1) * per_page
     else:
         # 主信息流
-        friendships = db.query(Friendship).filter(
-            ((Friendship.sender_id == current_user_id) | (Friendship.receiver_id == current_user_id))
-            & (Friendship.status == "accepted")
-        ).all()
-        friend_ids = [
-            f.sender_id if f.receiver_id == current_user_id else f.receiver_id for f in friendships
-        ]
-        friend_ids.append(current_user_id)
-
-        # 过滤已屏蔽用户的帖子
-        from app.ws_manager import ws_manager
-        blocked_ids = ws_manager.get_blocked_user_ids(current_user_id)
-
         posts_query = (
             db.query(Post)
-            .filter(
-                or_(
-                    Post.visibility == "public",
-                    Post.user_id.in_(friend_ids),
-                )
-            )
+            .filter(post_visibility_predicate(current_user_id))
             .filter(or_(Post.community_only == False, Post.community_only == None))  # 主信息流排除仅社群可见帖
             .order_by(Post.created_at.desc())
         )
-
-        if blocked_ids:
-            posts_query = posts_query.filter(~Post.user_id.in_(blocked_ids))
 
         offset = (page - 1) * per_page
 
@@ -257,15 +264,12 @@ def get_user_posts(
     db: Session = Depends(get_db),
 ):
     """获取指定用户的帖子"""
-    # 屏蔽检查：当前用户屏蔽了目标用户，则无法查看
-    if user.id != user_id:
-        from app.ws_manager import ws_manager
-        if user_id in ws_manager.get_blocked_user_ids(user.id):
-            return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
+    if user.id != user_id and has_block_between(db, user.id, user_id):
+        return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
 
     posts_query = (
         db.query(Post)
-        .filter(Post.user_id == user_id, Post.is_public == True)
+        .filter(Post.user_id == user_id, post_visibility_predicate(user.id))
         .order_by(Post.created_at.desc())
     )
     offset = (page - 1) * per_page
@@ -289,7 +293,7 @@ def get_user_posts(
 def get_post(post_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """获取单个帖子详情"""
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
     is_liked = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first() is not None
     return {"post": post.to_dict(current_user_id=None, is_liked=is_liked)}
@@ -303,18 +307,40 @@ def update_post(
     db: Session = Depends(get_db),
 ):
     """更新帖子"""
-    post = db.query(Post).filter(Post.id == post_id).first()
+    post = load_visible_post(db, post_id, user.id)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     if post.user_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
+    next_community_id = payload.get("community_id", post.community_id)
+    next_community_only = payload.get("community_only", post.community_only) is True
+    _validate_post_community_write(
+        db,
+        user.id,
+        next_community_id,
+        next_community_only,
+    )
+
+    if "is_public" in payload:
+        raise HTTPException(status_code=422, detail="is_public is no longer a supported visibility selector")
+    if "visible_user_ids" in payload and payload["visible_user_ids"] not in (None, "", [], (), set()):
+        raise HTTPException(status_code=422, detail="visible_user_ids custom audiences are no longer supported")
+    if "visibility" in payload:
+        try:
+            post.visibility = validate_post_visibility_write(payload["visibility"], payload.get("visible_user_ids"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        post.is_public = post.visibility == "public"
+
     if "content" in payload:
         post.content = payload["content"]
     if "video_url" in payload:
         post.video_url = payload["video_url"]
-    if "is_public" in payload:
-        post.is_public = payload["is_public"]
+    if "community_id" in payload:
+        post.community_id = next_community_id
+    if "community_only" in payload:
+        post.community_only = next_community_only
 
     try:
         db.commit()
@@ -332,7 +358,7 @@ def update_post(
 @router.delete("/{post_id}")
 def delete_post(post_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """删除帖子"""
-    post = db.query(Post).filter(Post.id == post_id).first()
+    post = load_visible_post(db, post_id, user.id)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     if post.user_id != user.id:
@@ -397,9 +423,7 @@ def get_user_liked_posts(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 屏蔽检查
-    from app.ws_manager import ws_manager
-    if user_id in ws_manager.get_blocked_user_ids(user.id):
+    if user.id != user_id and has_block_between(db, user.id, user_id):
         return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
 
     try:
@@ -407,7 +431,7 @@ def get_user_liked_posts(
         liked_rows = (
             db.query(Post, Like.created_at.label("liked_at"))
             .join(Like, Like.post_id == Post.id)
-            .filter(Like.user_id == user_id)
+            .filter(Like.user_id == user_id, post_visibility_predicate(user.id))
             .order_by(Like.created_at.desc())
             .offset(offset)
             .limit(per_page + 1)
@@ -442,7 +466,7 @@ def record_post_view(post_id: int, user: User = Depends(get_current_user), db: S
     from app.models.models import PostView
 
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
     existing = db.query(PostView).filter(
@@ -470,7 +494,7 @@ def get_post_stats(post_id: int, user: User = Depends(get_current_user), db: Ses
     from app.models.models import PostView
 
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
     likes_count = db.query(Like).filter(Like.post_id == post_id).count()

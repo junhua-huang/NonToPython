@@ -33,13 +33,13 @@ class WebSocketValidationTests(unittest.TestCase):
         self.assertEqual(error, {"code": 403, "error": "系统消息不能由用户发送"})
 
     def test_existing_conversation_send_checks_block_state_between_participants(self):
-        with patch.object(ws.ws_manager, "get_blocked_user_ids", side_effect=lambda uid: {1} if uid == 2 else set()):
+        with patch.object(ws, "excluded_user_ids", return_value={2}):
             allowed = ws._can_send_to_participants(1, [1, 2])
 
         self.assertFalse(allowed)
 
     def test_existing_conversation_send_allows_unblocked_participants(self):
-        with patch.object(ws.ws_manager, "get_blocked_user_ids", return_value=set()):
+        with patch.object(ws, "excluded_user_ids", return_value=set()):
             allowed = ws._can_send_to_participants(1, [1, 2])
 
         self.assertTrue(allowed)
@@ -71,9 +71,9 @@ class WebSocketValidationTests(unittest.TestCase):
         import inspect
 
         source = inspect.getsource(ws._build_session_list)
-        last_message_source = source.split('last_messages = {}')[1].split('all_partner_ids = set()')[0]
+        last_message_source = source.split('last_messages = []')[1].split('all_partner_ids = set()')[0]
 
-        self.assertIn('last_messages[conv_id] = msg.to_dict()', last_message_source)
+        self.assertIn('last_messages.append(msg.to_dict())', last_message_source)
         self.assertNotIn('msg.created_at.isoformat()', last_message_source)
 
     def test_ws_send_persists_client_msg_id_and_uses_message_to_dict(self):
@@ -83,7 +83,9 @@ class WebSocketValidationTests(unittest.TestCase):
         persist_source = source.split('def _persist():')[1].split('loop = asyncio.get_event_loop()')[0]
 
         self.assertIn('client_msg_id=client_msg_id', persist_source)
-        self.assertIn('msg_dict = inject_quote_preview(db, msg.to_dict())', persist_source)
+        self.assertIn('msg_dict = inject_quote_preview(', persist_source)
+        self.assertIn('msg.to_dict(),', persist_source)
+        self.assertIn('viewer_user_id=user_id', persist_source)
         self.assertIn('"msg": msg_dict', persist_source)
         self.assertNotIn('msg.created_at.isoformat()', persist_source)
 

@@ -197,7 +197,7 @@ def list_all_applications(
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
     return {
-        "applications": [a.to_dict() for a in applications],
+        "applications": [a.to_dict(include_private_user=True) for a in applications],
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -234,7 +234,7 @@ def admin_approve_application(
 
     logger = __import__('logging').getLogger(__name__)
     logger.info(f"Admin {admin.username} approved role application #{application_id}")
-    return {"message": "Application approved", "application": app.to_dict()}
+    return {"message": "Application approved", "application": app.to_dict(include_private_user=True)}
 
 
 @router.post("/role-applications/{application_id}/reject")
@@ -260,7 +260,7 @@ def admin_reject_application(
 
     logger = __import__('logging').getLogger(__name__)
     logger.info(f"Admin {admin.username} rejected role application #{application_id}")
-    return {"message": "Application rejected", "application": app.to_dict()}
+    return {"message": "Application rejected", "application": app.to_dict(include_private_user=True)}
 
 
 @router.post("/role-applications/{application_id}/suspend")
@@ -291,4 +291,4 @@ def admin_suspend_application(
 
     logger = __import__('logging').getLogger(__name__)
     logger.info(f"Admin {admin.username} suspended role application #{application_id}")
-    return {"message": "Application suspended", "application": app.to_dict()}
+    return {"message": "Application suspended", "application": app.to_dict(include_private_user=True)}

@@ -90,18 +90,19 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('"conversation_id"', manager_source)
         self.assertIn('"user_id"', manager_source)
         self.assertIn('"is_online"', manager_source)
-        self.assertIn('self.is_connected(user_id) != is_online', manager_source)
+        self.assertIn('await self.is_product_online_async(user_id) != is_online', manager_source)
         self.assertIn('except Exception as e:', manager_source)
         self.assertIn('[WS PRESENCE] community presence failed', manager_source)
 
     def test_community_presence_online_only_on_first_app_connection(self):
         with open('app/routers/ws.py', 'r', encoding='utf-8') as f:
             source = f.read()
-        auth_source = source.split('async def _do_auth_init')[1].split('async def _notify_friends_online')[0]
+        auth_source = source.split('async def _do_auth_init')[1].split('# ================================================================\n# 业务处理器')[0]
 
-        self.assertIn('was_offline = not ws_manager.is_connected(user_id)', auth_source)
+        self.assertIn('was_raw_ws_offline = not ws_manager.is_connected(user_id)', auth_source)
+        self.assertIn('was_product_online = await ws_manager.is_product_online_async(user_id)', auth_source)
         self.assertIn('conn_id = await ws_manager.connect(user_id, websocket)', auth_source)
-        self.assertIn('if was_offline:', auth_source)
+        self.assertIn('if not was_product_online:', auth_source)
         self.assertIn('presence_generation = ws_manager.bump_presence_generation(user_id)', auth_source)
         self.assertIn('await ws_manager.notify_community_presence(user_id, True, presence_generation)', auth_source)
 
@@ -127,6 +128,7 @@ class CommunityChatContractsTest(unittest.TestCase):
 
         self.assertIn('if not self._connections[user_id]:', disconnect_source)
         self.assertIn('notify_community_presence(user_id, False, presence_generation)', disconnect_source)
+        self.assertIn('self.schedule_offline_presence_check(user_id, BACKGROUND_ACTIVE_SECONDS, presence_generation)', disconnect_source)
         self.assertIn('_connections[user_id].pop', disconnect_source)
 
     def test_friend_offline_presence_ignores_stale_reconnect_tasks(self):
@@ -149,7 +151,14 @@ class CommunityChatContractsTest(unittest.TestCase):
         self.assertIn('_is_presence_generation_current(user_id, expected_generation)', manager_source)
         self.assertIn('presence_generation = ws_manager.bump_presence_generation(user_id)', manager_source + ws_source)
         self.assertIn('async def _send_presence_with_seq', manager_source)
-        self.assertIn('self._next_seq_sync(recipient_id, full_payload)', manager_source)
+        self.assertIn('async def _next_seq_if_presence_generation_current', manager_source)
+        self.assertIn('def _next_seq_if_presence_generation_current_sync', manager_source)
+        self.assertIn('seq = await self._next_seq_if_presence_generation_current(', manager_source)
+        self.assertIn('with self._presence_generation_lock:', manager_source)
+        self.assertIn('self._presence_generation.get(subject_user_id, 0) != expected_generation', manager_source)
+        self.assertIn('seq = self._next_seq_sync(user_id, payload)', manager_source)
+        self.assertIn('self._delete_message_log_sync(user_id, seq)', manager_source)
+        self.assertIn('await self._delete_message_log(recipient_id, seq)', manager_source)
         self.assertIn('_send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)', manager_source)
 
     def test_my_communities_response_includes_current_membership_for_share_targets(self):
@@ -300,8 +309,9 @@ class CommunityChatContractsTest(unittest.TestCase):
 
         self.assertIn('client_msg_id = payload.get("client_msg_id")', send_source)
         self.assertIn('client_msg_id=client_msg_id', send_source)
-        self.assertIn('msg_dict = inject_quote_preview(db, _community_message_to_dict(msg))', send_source)
-        self.assertIn('"message": msg_dict', send_source)
+        self.assertIn('_community_message_to_dict(msg),', send_source)
+        self.assertIn('viewer_user_id=user.id', send_source)
+        self.assertIn('"message": delivered_message', send_source)
 
 
 if __name__ == '__main__':

@@ -32,7 +32,7 @@ def get_trending_topics(
     db: Session = Depends(get_db),
 ):
     """获取热门话题"""
-    trending = TopicService.get_trending_topics(db, limit=limit)
+    trending = TopicService.get_trending_topics(db, limit=limit, current_user_id=user.id)
     topic_ids = [topic["id"] for topic in trending]
     followed_topic_ids = set()
     if topic_ids:
@@ -177,7 +177,13 @@ def get_topic_posts(
     db: Session = Depends(get_db),
 ):
     """获取话题下的帖子"""
-    results = TopicService.get_topic_posts(db, topic_id=topic_id, page=page, per_page=per_page)
+    results = TopicService.get_topic_posts(
+        db,
+        topic_id=topic_id,
+        page=page,
+        per_page=per_page,
+        current_user_id=user.id,
+    )
     return results
 
 

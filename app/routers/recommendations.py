@@ -41,7 +41,12 @@ def get_trending_posts(
     db: Session = Depends(get_db),
 ):
     """获取热门帖子"""
-    result = RecommendationService.get_trending_posts(db, limit=limit, hours=hours)
+    result = RecommendationService.get_trending_posts(
+        db,
+        limit=limit,
+        hours=hours,
+        current_user_id=user.id,
+    )
     return result
 
 
@@ -75,5 +80,10 @@ def get_related_posts(
     db: Session = Depends(get_db),
 ):
     """获取相关帖子推荐"""
-    result = RecommendationService.get_related_posts(db, post_id=post_id, limit=limit)
+    result = RecommendationService.get_related_posts(
+        db,
+        post_id=post_id,
+        limit=limit,
+        current_user_id=user.id,
+    )
     return result

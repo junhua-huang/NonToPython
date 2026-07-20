@@ -4,6 +4,8 @@
 from sqlalchemy import or_, and_, func
 from sqlalchemy.orm import Session
 from app.models.models import User, Post, ComicEvent, ComicCity
+from app.services.post_visibility_service import post_visibility_predicate
+from app.services.block_service import visible_user_predicate
 
 
 class SearchService:
@@ -30,9 +32,13 @@ class SearchService:
                     email_conditions.append(User.email.ilike(f'%{domain_part}%'))
 
         user_query = db.query(User).filter(
-            or_(User.username.ilike(search_term), *email_conditions),
+            or_(
+                User.username.ilike(search_term),
+                and_(User.show_email.is_(True), or_(*email_conditions)),
+            ),
             User.is_active == True,
-            User.allow_search == True
+            User.allow_search == True,
+            visible_user_predicate(current_user_id, User.id) if current_user_id is not None else True,
         ).order_by(
             User.username.ilike(search_term).desc(),
             User.created_at.desc()
@@ -60,7 +66,15 @@ class SearchService:
         return RecommendationService._serialize_posts(posts, batch_data)
 
     @staticmethod
-    def search_posts(db: Session, query: str, page: int = 1, per_page: int = 20, user_id: int = None, is_public: bool = True):
+    def search_posts(
+        db: Session,
+        query: str,
+        page: int = 1,
+        per_page: int = 20,
+        user_id: int = None,
+        is_public: bool = True,
+        current_user_id: int = None,
+    ):
         if not query or len(query.strip()) < 1:
             return {
                 'posts': [], 'total': 0, 'pages': 0,
@@ -70,7 +84,7 @@ class SearchService:
         search_term = f'%{query}%'
         post_query = db.query(Post).filter(
             Post.content.ilike(search_term),
-            Post.is_public == is_public
+            post_visibility_predicate(current_user_id),
         )
         if user_id:
             post_query = post_query.filter(Post.user_id == user_id)
@@ -81,7 +95,7 @@ class SearchService:
         pages = (total + per_page - 1) // per_page if total > 0 else 0
 
         return {
-            'posts': SearchService._batch_serialize_posts(db, posts),
+            'posts': SearchService._batch_serialize_posts(db, posts, current_user_id),
             'total': total,
             'pages': pages,
             'current_page': page,
@@ -97,7 +111,14 @@ class SearchService:
             }
 
         user_results = SearchService.search_users(db, query, page, per_page, current_user_id)
-        post_results = SearchService.search_posts(db, query, page, per_page, is_public=True)
+        post_results = SearchService.search_posts(
+            db,
+            query,
+            page,
+            per_page,
+            is_public=True,
+            current_user_id=current_user_id,
+        )
         event_results = SearchService.search_comic_events(db, query, per_page=per_page, user_id=current_user_id)
 
         return {
@@ -201,7 +222,13 @@ class SearchService:
         return {'events': result, 'total': total}
 
     @staticmethod
-    def search_posts_by_hashtag(db: Session, hashtag: str, page: int = 1, per_page: int = 20):
+    def search_posts_by_hashtag(
+        db: Session,
+        hashtag: str,
+        page: int = 1,
+        per_page: int = 20,
+        current_user_id: int = None,
+    ):
         if not hashtag:
             return {
                 'posts': [], 'total': 0, 'pages': 0,
@@ -211,7 +238,7 @@ class SearchService:
         search_term = f'%#{hashtag}%'
         post_query = db.query(Post).filter(
             Post.content.ilike(search_term),
-            Post.is_public == True
+            post_visibility_predicate(current_user_id),
         ).order_by(Post.created_at.desc())
 
         total = post_query.count()
@@ -220,7 +247,7 @@ class SearchService:
 
         return {
             'hashtag': hashtag,
-            'posts': [post.to_dict() for post in posts],
+            'posts': SearchService._batch_serialize_posts(db, posts, current_user_id),
             'total': total,
             'pages': pages,
             'current_page': page,
@@ -228,9 +255,9 @@ class SearchService:
         }
 
     @staticmethod
-    def get_trending_hashtags(db: Session, limit: int = 10):
+    def get_trending_hashtags(db: Session, limit: int = 10, current_user_id: int = None):
         recent_posts = db.query(Post).filter(
-            Post.is_public == True
+            post_visibility_predicate(current_user_id)
         ).order_by(Post.created_at.desc()).limit(1000).all()
 
         hashtag_count = {}
@@ -255,7 +282,8 @@ class SearchService:
         users = db.query(User).filter(
             or_(User.username.ilike(search_term)),
             User.is_active == True,
-            User.allow_search == True
+            User.allow_search == True,
+            visible_user_predicate(current_user_id, User.id) if current_user_id is not None else True,
         ).limit(limit).all()
 
         return [

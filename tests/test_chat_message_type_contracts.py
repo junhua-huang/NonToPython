@@ -52,10 +52,12 @@ class ChatMessageTypeContractsTest(unittest.TestCase):
         db = Mock()
         db.query.return_value = query
 
-        result = mts.normalize_user_message_payload(
-            {"message_type": "post", "related_id": "42"},
-            db,
-        )
+        with unittest.mock.patch.object(mts, "can_view_post", return_value=True):
+            result = mts.normalize_user_message_payload(
+                {"message_type": "post", "related_id": "42"},
+                db,
+                viewer_user_id=1,
+            )
 
         self.assertEqual(result["message_type"], "post")
         self.assertEqual(result["related_id"], 42)

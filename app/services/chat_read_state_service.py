@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.community import CommunityMember
 from app.models.models import Conversation, ConversationParticipant, Message
+from app.services.block_service import has_block_between, no_block_between_predicate, visible_user_predicate
 
 
 def get_community_participant(
@@ -46,7 +47,10 @@ def can_access_conversation(db: Session, conversation: Conversation | None, user
         return False
     if getattr(conversation, 'type', 'direct') == 'community':
         return get_community_participant(db, conversation.id, user_id) is not None
-    return conversation.user1_id == user_id or conversation.user2_id == user_id
+    if conversation.user1_id != user_id and conversation.user2_id != user_id:
+        return False
+    other_user_id = conversation.user2_id if conversation.user1_id == user_id else conversation.user1_id
+    return other_user_id is not None and not has_block_between(db, user_id, other_user_id)
 
 
 def get_active_conversation_participant_ids(db: Session, conversation: Conversation) -> list[int]:
@@ -70,12 +74,18 @@ def get_active_conversation_participant_ids(db: Session, conversation: Conversat
             )
             .all()
         ]
-    return [
+    participant_ids = {
         row.user_id
-        for row in db.query(ConversationParticipant)
+        for row in db.query(ConversationParticipant.user_id)
         .filter(ConversationParticipant.conversation_id == conversation.id)
         .all()
-    ]
+    }
+    participant_ids.update(
+        user_id
+        for user_id in (conversation.user1_id, conversation.user2_id)
+        if user_id is not None
+    )
+    return sorted(participant_ids)
 
 
 def mark_community_conversation_read(
@@ -107,6 +117,10 @@ def get_direct_unread_count(db: Session, user_id: int) -> int:
         .filter(
             Conversation.type != 'community',
             (Conversation.user1_id == user_id) | (Conversation.user2_id == user_id),
+            no_block_between_predicate(user_id, func.coalesce(
+                func.nullif(Conversation.user1_id, user_id),
+                Conversation.user2_id,
+            )),
         )
         .all()
     ]
@@ -146,6 +160,7 @@ def get_community_unread_counts(
             ConversationParticipant.user_id == user_id,
             CommunityMember.status == 'active',
             Message.sender_id != user_id,
+            visible_user_predicate(user_id, Message.sender_id),
             or_(
                 ConversationParticipant.last_read_message_id.is_(None),
                 Message.id > ConversationParticipant.last_read_message_id,

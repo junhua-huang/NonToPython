@@ -13,7 +13,13 @@ from app.dependencies import get_current_user, get_optional_user
 from app.models.models import User, Conversation, Message
 from app.models.community import Community, CommunityMember
 from app.services.community_service import CommunityService, CommunityError, MAX_ADMINS
-from app.services.message_type_service import normalize_user_message_payload
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
+from app.ws_manager import ws_manager
+from app.services.message_type_service import (
+    normalize_user_message_payload,
+    redact_unavailable_post_card,
+    redact_unavailable_post_cards_batch,
+)
 from app.services.quote_service import (
     build_quote_preview,
     inject_quote_preview,
@@ -40,8 +46,27 @@ def _community_message_to_dict(message: Message):
     }
 
 
-def _normalize_community_message_payload(payload: dict, db: Session):
-    normalized = normalize_user_message_payload(payload, db)
+def _serialize_community_messages_for_viewer(
+    db: Session,
+    messages: list[dict],
+    viewer_user_id: int,
+) -> list[dict]:
+    inject_quote_preview_batch(db, messages, viewer_user_id=viewer_user_id)
+    return redact_unavailable_post_cards_batch(db, messages, viewer_user_id)
+
+
+def _normalize_community_message_payload(
+    payload: dict,
+    db: Session,
+    sender_user_id: int,
+    community_id: int,
+):
+    normalized = normalize_user_message_payload(
+        payload,
+        db,
+        viewer_user_id=sender_user_id,
+        destination_community_id=community_id,
+    )
     mention_user_ids = payload.get("mention_user_ids", [])
     if not isinstance(mention_user_ids, list):
         mention_user_ids = []
@@ -237,10 +262,11 @@ def list_members(
     community_id: int,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """成员列表"""
-    items = CommunityService.list_members(db, community_id, limit, offset)
+    items = CommunityService.list_members(db, community_id, limit, offset, viewer_user_id=user.id)
     return {"members": [m.to_dict() for m in items]}
 
 
@@ -395,10 +421,16 @@ def unban_user(
 def list_hot_posts(
     community_id: int,
     limit: int = Query(20, ge=1, le=50),
+    user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    """社群热门帖子（公开）"""
-    posts = CommunityService.list_hot_posts(db, community_id, limit=limit)
+    """社群热门帖子（公开帖子匿名可见，仅社群帖子要求活跃成员身份）。"""
+    posts = CommunityService.list_hot_posts(
+        db,
+        community_id,
+        limit=limit,
+        current_user_id=user.id if user else None,
+    )
     return {"posts": [p.to_dict() for p in posts]}
 
 
@@ -457,6 +489,7 @@ def get_community_chat(
     query = db.query(Message).filter(
         Message.conversation_id == conv.id,
         Message.is_recalled == False,
+        visible_user_predicate(user.id, Message.sender_id),
     )
     if before_id is not None:
         query = query.filter(Message.id < before_id)
@@ -467,7 +500,11 @@ def get_community_chat(
 
     return {
         "conversation": conv.to_dict(),
-        "messages": inject_quote_preview_batch(db, [_community_message_to_dict(msg) for msg in reversed(messages)]),
+        "messages": _serialize_community_messages_for_viewer(
+            db,
+            [_community_message_to_dict(msg) for msg in reversed(messages)],
+            user.id,
+        ),
         "has_more": has_more,
     }
 
@@ -504,6 +541,7 @@ def get_community_message_around(
     target = db.query(Message).filter(
         Message.id == target_id,
         Message.conversation_id == conv.id,
+        visible_user_predicate(user.id, Message.sender_id),
     ).first()
     if not target:
         raise HTTPException(status_code=404, detail="Target message not found")
@@ -513,6 +551,7 @@ def get_community_message_around(
         .filter(
             Message.conversation_id == conv.id,
             Message.created_at < target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
         )
         .order_by(Message.created_at.desc())
         .limit(before + 1)
@@ -526,6 +565,7 @@ def get_community_message_around(
         .filter(
             Message.conversation_id == conv.id,
             Message.created_at > target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
         )
         .order_by(Message.created_at.asc())
         .limit(after + 1)
@@ -536,7 +576,11 @@ def get_community_message_around(
 
     window = before_msgs + [target] + after_msgs
     return {
-        "messages": inject_quote_preview_batch(db, [_community_message_to_dict(msg) for msg in window]),
+        "messages": _serialize_community_messages_for_viewer(
+            db,
+            [_community_message_to_dict(msg) for msg in window],
+            user.id,
+        ),
         "target_id": target_id,
         "has_more_before": has_more_before,
         "has_more_after": has_more_after,
@@ -571,7 +615,7 @@ async def send_community_message(
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
     content, message_type, media_url, related_id, mention_user_ids = (
-        _normalize_community_message_payload(payload, db)
+        _normalize_community_message_payload(payload, db, user.id, community_id)
     )
 
     # 校验并生成引用预览（实时生成，不入库 quote_preview）
@@ -596,20 +640,40 @@ async def send_community_message(
     db.commit()
     db.refresh(msg)
 
-    msg_dict = inject_quote_preview(db, _community_message_to_dict(msg))
+    msg_dict = inject_quote_preview(
+        db,
+        _community_message_to_dict(msg),
+        viewer_user_id=user.id,
+    )
+    redact_unavailable_post_card(db, msg_dict, user.id)
     msg_dict["community_id"] = community_id
     msg_dict["community_name"] = c.name
 
-    # WS 扇出给所有在线成员
-    from app.ws_manager import ws_manager
-    members = db.query(CommunityMember).filter(
+    # WS 扇出给未与发送者互相屏蔽的在线成员。
+    blocked_ids = excluded_user_ids(db, user.id)
+    members_query = db.query(CommunityMember).filter(
         CommunityMember.community_id == community_id,
         CommunityMember.status == 'active',
-    ).all()
+    )
+    if blocked_ids:
+        members_query = members_query.filter(~CommunityMember.user_id.in_(blocked_ids))
+    members = members_query.all()
     for member in members:
         if ws_manager.is_connected(member.user_id):
+            delivered_message = (
+                msg_dict
+                if member.user_id == user.id
+                else inject_quote_preview(
+                    db,
+                    _community_message_to_dict(msg),
+                    viewer_user_id=member.user_id,
+                )
+            )
+            redact_unavailable_post_card(db, delivered_message, member.user_id)
+            delivered_message["community_id"] = community_id
+            delivered_message["community_name"] = c.name
             await ws_manager.send_with_seq(member.user_id, "new_message", {
-                "message": msg_dict,
+                "message": delivered_message,
                 "conversation_id": conv.id,
                 "community_id": community_id,
             })
@@ -617,7 +681,7 @@ async def send_community_message(
     # @提及通知（离线/在线都推）
     if mention_user_ids:
         for uid in mention_user_ids:
-            if uid == user.id:
+            if uid == user.id or uid in blocked_ids:
                 continue
             # 验证被 @ 者是成员
             tm = db.query(CommunityMember).filter(

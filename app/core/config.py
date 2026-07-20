@@ -68,18 +68,14 @@ class Config:
     COS_BUCKET_NAME = os.environ.get('COS_BUCKET_NAME', os.environ.get('COS_BUCKET', ''))
     COS_DOMAIN = os.environ.get('COS_DOMAIN', '')
 
-    # 极光推送 (JPush) 配置 - Master Secret 仅服务端使用，不可下发到客户端
-    JPUSH_APP_KEY = os.environ.get('JPUSH_APP_KEY', '')
-    JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
-    # iOS: true=生产环境 APNs，false=开发环境；Android 忽略此参数
-    JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'false').lower() == 'true'
-    JPUSH_ENABLE_THIRD_PARTY_CHANNEL = os.environ.get('JPUSH_ENABLE_THIRD_PARTY_CHANNEL', 'true').lower() == 'true'
-    JPUSH_THIRD_PARTY_CHANNELS = {
-        item.strip().lower()
-        for item in os.environ.get('JPUSH_THIRD_PARTY_CHANNELS', 'huawei,xiaomi,oppo,vivo,meizu').split(',')
-        if item.strip()
-    }
-    PUSH_FOREGROUND_ACTIVE_SECONDS = int(os.environ.get('PUSH_FOREGROUND_ACTIVE_SECONDS', '120'))
+    # 阿里云移动推送配置 - 仅从环境变量读取，禁止在代码中写入真实密钥
+    ALIYUN_ACCESS_KEY_ID = os.environ.get('ALIYUN_ACCESS_KEY_ID', '')
+    ALIYUN_ACCESS_KEY_SECRET = os.environ.get('ALIYUN_ACCESS_KEY_SECRET', '')
+    ALIYUN_PUSH_APP_KEY_ANDROID = os.environ.get('ALIYUN_PUSH_APP_KEY_ANDROID', '')
+    ALIYUN_PUSH_ENDPOINT = os.environ.get('ALIYUN_PUSH_ENDPOINT', 'https://cloudpush.aliyuncs.com')
+    ALIYUN_PUSH_REGION_ID = os.environ.get('ALIYUN_PUSH_REGION_ID', 'cn-hangzhou')
+    ALIYUN_PUSH_ANDROID_ACTIVITY = os.environ.get('ALIYUN_PUSH_ANDROID_ACTIVITY', 'com.nonto.nonto.MainActivity')
+    ALIYUN_PUSH_ANDROID_CHANNEL_ID = os.environ.get('ALIYUN_PUSH_ANDROID_CHANNEL_ID', 'nonto_message_alerts')
 
     # 邮件 (SMTP) 配置 - 用于发送邮箱验证码
     # QQ 邮箱用 SSL 465 端口，授权码非登录密码
@@ -97,6 +93,6 @@ class Config:
     OTP_EXPIRE_MINUTES = 10               # 验证码有效期 10 分钟
     LOGIN_FAIL_THRESHOLD = 5              # 登录失败 N 次后要求邮箱验证码
 
-    DEBUG = True
+    DEBUG = os.environ.get('DEBUG', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
     TESTING = False
     CORS_HEADERS = 'Content-Type'

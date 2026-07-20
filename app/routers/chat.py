@@ -12,7 +12,13 @@ from app.dependencies import get_current_user
 from app.models.models import User, Conversation, Message, ConversationParticipant, Friendship, _utc_z
 from app.models.community import CommunityMember
 from app.ws_manager import ws_manager
-from app.services.message_type_service import normalize_user_message_payload
+from app.services.message_type_service import (
+    normalize_user_message_payload,
+    redact_unavailable_post_card,
+    redact_unavailable_post_cards_batch,
+)
+from app.services.presence_service import is_user_product_online
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
 from app.services.quote_service import (
     build_quote_preview,
     inject_quote_preview,
@@ -33,11 +39,26 @@ router = APIRouter()
 
 
 def _should_create_message_notification(db: Session, user_id: int) -> bool:
-    """后台/离线用户需要通知中心记录和系统推送入口。"""
-    if not ws_manager.is_connected(user_id):
-        return True
-    from app.services.push_service import PushService
-    return PushService.has_push_target(db, user_id)
+    """消息始终创建通知中心记录；移动推送由设备 app_state 决定。"""
+    return True
+
+
+def _serialize_messages_for_viewer(
+    db: Session,
+    messages: list[dict],
+    viewer_user_id: int,
+) -> list[dict]:
+    inject_quote_preview_batch(db, messages, viewer_user_id=viewer_user_id)
+    return redact_unavailable_post_cards_batch(db, messages, viewer_user_id)
+
+
+def _serialize_message_for_viewer(
+    db: Session,
+    message: dict,
+    viewer_user_id: int,
+) -> dict:
+    inject_quote_preview(db, message, viewer_user_id=viewer_user_id)
+    return redact_unavailable_post_card(db, message, viewer_user_id)
 
 
 # ============================================================
@@ -59,7 +80,7 @@ def get_sessions(
         (Conversation.user1_id == user.id, Conversation.user2_id),
         else_=Conversation.user1_id,
     )
-    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+    blocked_ids = excluded_user_ids(db, user.id)
     direct_membership = (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
     community_membership = (
         (Conversation.type == 'community')
@@ -91,7 +112,10 @@ def get_sessions(
             Message.conversation_id,
             func.max(Message.created_at).label("max_time"),
         )
-        .filter(Message.conversation_id.in_(conv_ids))
+        .filter(
+            Message.conversation_id.in_(conv_ids),
+            visible_user_predicate(user.id, Message.sender_id),
+        )
         .group_by(Message.conversation_id)
         .subquery()
     )
@@ -141,7 +165,7 @@ def get_sessions(
 
     # 批量回填 last_message 的 quote_preview，保证全局口径一致
     last_msg_dicts = [m.to_dict() for m in last_messages]
-    inject_quote_preview_batch(db, last_msg_dicts)
+    _serialize_messages_for_viewer(db, last_msg_dicts, user.id)
     last_msg_dict_map = {d["conversation_id"]: d for d in last_msg_dicts}
 
     result = []
@@ -179,7 +203,11 @@ def get_sessions(
                 "user_id": other_user.id,
                 "username": other_user.username,
                 "avatar_url": other_user.avatar_url,
-                "is_online": ws_manager.is_connected(other_user.id),
+                "is_online": is_user_product_online(
+                    db,
+                    other_user.id,
+                    raw_ws_online=ws_manager.is_connected(other_user.id),
+                ),
             })
 
         result.append({
@@ -210,13 +238,20 @@ def get_conversations(
     db: Session = Depends(get_db),
 ):
     """获取当前用户的所有会话列表（扁平结构，与 /sessions 同构）"""
-    from sqlalchemy import func, and_
+    from sqlalchemy import func, and_, case
 
+    blocked_ids = excluded_user_ids(db, user.id)
+    other_user_expr = case(
+        (Conversation.user1_id == user.id, Conversation.user2_id),
+        else_=Conversation.user1_id,
+    )
+    conversations_query = db.query(Conversation).filter(
+        (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
+    )
+    if blocked_ids:
+        conversations_query = conversations_query.filter(~other_user_expr.in_(blocked_ids))
     conversations = (
-        db.query(Conversation)
-        .filter(
-            (Conversation.user1_id == user.id) | (Conversation.user2_id == user.id)
-        )
+        conversations_query
         .order_by(func.coalesce(Conversation.last_message_at, Conversation.created_at).desc())
         .all()
     )
@@ -231,7 +266,10 @@ def get_conversations(
             Message.conversation_id,
             func.max(Message.created_at).label("max_time"),
         )
-        .filter(Message.conversation_id.in_(conv_ids))
+        .filter(
+            Message.conversation_id.in_(conv_ids),
+            visible_user_predicate(user.id, Message.sender_id),
+        )
         .group_by(Message.conversation_id)
         .subquery()
     )
@@ -277,7 +315,7 @@ def get_conversations(
 
     # 批量回填 last_message 的 quote_preview，保证全局口径一致
     last_msg_dicts = [m.to_dict() for m in last_messages]
-    inject_quote_preview_batch(db, last_msg_dicts)
+    _serialize_messages_for_viewer(db, last_msg_dicts, user.id)
     last_msg_dict_map = {d["conversation_id"]: d for d in last_msg_dicts}
 
     result = []
@@ -295,7 +333,15 @@ def get_conversations(
             "other_user": other_user.to_dict() if other_user else None,
             "last_message": last_message_dict,
             "unread_count": unread_map.get(conv.id, 0),
-            "is_online": ws_manager.is_connected(other_user.id) if other_user else False,
+            "is_online": (
+                is_user_product_online(
+                    db,
+                    other_user.id,
+                    raw_ws_online=ws_manager.is_connected(other_user.id),
+                )
+                if other_user
+                else False
+            ),
             "last_message_at": (
                 conv.last_message_at.isoformat()
                 if conv.last_message_at
@@ -314,7 +360,7 @@ def get_conversation_with_user(
 ):
     """获取与特定用户的会话（如不存在则自动创建）"""
     other_user = db.query(User).filter(User.id == user_id).first()
-    if not other_user:
+    if not other_user or has_block_between(db, user.id, user_id):
         raise HTTPException(status_code=404, detail="User not found")
 
     uid1, uid2 = min(user.id, user_id), max(user.id, user_id)
@@ -344,8 +390,14 @@ def get_conversation_with_user(
     return {
         "conversation": conversation.to_dict(),
         "other_user": other_user.to_dict(),
-        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
-        'is_online': ws_manager.is_connected(user_id),
+        "messages": _serialize_messages_for_viewer(
+            db, [msg.to_dict() for msg in messages], user.id,
+        ),
+        'is_online': is_user_product_online(
+            db,
+            user_id,
+            raw_ws_online=ws_manager.is_connected(user_id),
+        ),
     }
 
 
@@ -366,7 +418,10 @@ def get_messages(
 
     messages_query = (
         db.query(Message)
-        .filter(Message.conversation_id == conversation_id)
+        .filter(
+            Message.conversation_id == conversation_id,
+            visible_user_predicate(user.id, Message.sender_id),
+        )
         .order_by(Message.created_at.desc())
     )
     total = messages_query.count()
@@ -374,7 +429,9 @@ def get_messages(
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
     return {
-        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
+        "messages": _serialize_messages_for_viewer(
+            db, [msg.to_dict() for msg in messages], user.id,
+        ),
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -420,34 +477,43 @@ def get_messages_batch(
         if not can_access_conversation(db, conv, user.id):
             raise HTTPException(status_code=403, detail=f"Unauthorized for conversation {cid}")
 
-    # 合并为单次 UNION ALL 查询：每个会话独立 LIMIT，一次往返
-    from sqlalchemy import text
+    # 单次窗口查询：先应用双向屏蔽，再对每个会话独立 LIMIT。
+    from sqlalchemy import func
     from collections import OrderedDict
 
-    # 构建原生 UNION ALL SQL，规避 sqlalchemy union_all() 的 subquery 类型兼容问题
-    union_parts = []
-    for cid in conv_id_list:
-        union_parts.append(
-            "(SELECT id, conversation_id, sender_id, content, message_type, "
-            "media_url, is_read, related_id, client_msg_id, quote_message_id, quote_preview, "
-            "is_recalled, created_at "
-            f"FROM messages WHERE conversation_id = {cid} "
-            "ORDER BY created_at DESC LIMIT :limit)"
-        )
-    union_sql = " UNION ALL ".join(union_parts)
-    union_sql += " ORDER BY conversation_id, created_at DESC"
+    ranked_messages = db.query(
+        Message.id.label("id"),
+        Message.conversation_id.label("conversation_id"),
+        Message.sender_id.label("sender_id"),
+        Message.content.label("content"),
+        Message.message_type.label("message_type"),
+        Message.media_url.label("media_url"),
+        Message.is_read.label("is_read"),
+        Message.related_id.label("related_id"),
+        Message.client_msg_id.label("client_msg_id"),
+        Message.quote_message_id.label("quote_message_id"),
+        Message.quote_preview.label("quote_preview"),
+        Message.is_recalled.label("is_recalled"),
+        Message.created_at.label("created_at"),
+        func.row_number().over(
+            partition_by=Message.conversation_id,
+            order_by=Message.created_at.desc(),
+        ).label("row_num"),
+    ).filter(
+        Message.conversation_id.in_(conv_id_list),
+        visible_user_predicate(user.id, Message.sender_id),
+    ).subquery()
 
-    messages_by_conv: dict = OrderedDict()
-    for cid in conv_id_list:
-        messages_by_conv[cid] = []
+    all_rows = db.query(ranked_messages).filter(
+        ranked_messages.c.row_num <= per_page
+    ).order_by(
+        ranked_messages.c.conversation_id,
+        ranked_messages.c.created_at.desc(),
+    ).all()
 
-    if union_parts:
-        all_rows = db.execute(text(union_sql), {"limit": per_page}).fetchall()
-
-        for row in all_rows:
-            bucket = messages_by_conv.get(row.conversation_id)
-            if bucket is not None and len(bucket) < per_page:
-                bucket.append(row)
+    messages_by_conv: dict = OrderedDict((cid, []) for cid in conv_id_list)
+    for row in all_rows:
+        messages_by_conv[row.conversation_id].append(row)
 
     # 组装响应（按 conv_id_list 原始顺序，消息按时间升序）
     result_conversations = []
@@ -476,9 +542,11 @@ def get_messages_batch(
             }
             for msg in msgs
         ]
+        inject_quote_preview_batch(db, message_dicts, viewer_user_id=user.id)
+        redact_unavailable_post_cards_batch(db, message_dicts, user.id)
         result_conversations.append({
             "conversation_id": cid,
-            "messages": inject_quote_preview_batch(db, message_dicts),
+            "messages": message_dicts,
         })
 
     return {
@@ -510,7 +578,10 @@ def get_messages_v2(
 
     messages_query = (
         db.query(Message)
-        .filter(Message.conversation_id == conversation_id)
+        .filter(
+            Message.conversation_id == conversation_id,
+            visible_user_predicate(user.id, Message.sender_id),
+        )
         .order_by(Message.created_at.desc())
     )
     total = messages_query.count()
@@ -522,7 +593,9 @@ def get_messages_v2(
         messages = messages[:limit]
 
     return {
-        "messages": inject_quote_preview_batch(db, [msg.to_dict() for msg in messages]),
+        "messages": _serialize_messages_for_viewer(
+            db, [msg.to_dict() for msg in messages], user.id,
+        ),
         "total": total,
         "has_more": has_more,
         "current_page": page,
@@ -547,15 +620,23 @@ async def send_message(
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     participant_ids = get_active_conversation_participant_ids(db, conversation)
-    if conversation.type != 'community':
-        # 屏蔽检查（使用缓存）
-        receiver_id = conversation.user2_id if conversation.user1_id == user.id else conversation.user1_id
-        blocked_by_receiver = ws_manager.get_blocked_user_ids(receiver_id)
-        blocked_by_sender = ws_manager.get_blocked_user_ids(user.id)
-        if user.id in blocked_by_receiver or receiver_id in blocked_by_sender:
-            raise HTTPException(status_code=403, detail="Cannot send message to this user")
+    if conversation.type == 'community':
+        blocked_ids = excluded_user_ids(db, user.id)
+        participant_ids = [
+            participant_id
+            for participant_id in participant_ids
+            if participant_id == user.id or participant_id not in blocked_ids
+        ]
 
-    normalized = normalize_user_message_payload(payload, db)
+    normalized = normalize_user_message_payload(
+        payload,
+        db,
+        viewer_user_id=user.id,
+        recipient_user_ids=participant_ids,
+        destination_community_id=(
+            conversation.community_id if conversation.type == "community" else None
+        ),
+    )
     content = normalized["content"]
     message_type = normalized["message_type"]
     media_url = normalized["media_url"]
@@ -584,7 +665,7 @@ async def send_message(
         logger.info(f"Message sent in conversation {conversation_id} by user {user.id}")
 
         # 预先序列化（含 quote_preview 实时回填）
-        message_dict = inject_quote_preview(db, message.to_dict())
+        message_dict = _serialize_message_for_viewer(db, message.to_dict(), user.id)
 
         # --- WebSocket 实时推送 ---
         if conversation.type == 'community':
@@ -606,14 +687,19 @@ async def send_message(
                 )
 
         for pid in participant_ids:
+            delivered_message = (
+                message_dict
+                if pid == user.id
+                else _serialize_message_for_viewer(db, message.to_dict(), pid)
+            )
             await ws_manager.send_with_seq(pid, "new_message", {
                 "conversation_id": conversation_id,
-                "data": message_dict,
+                "data": delivered_message,
                 "unread_count": unread_counts.get(pid, 0),
             })
 
-        # --- 后台/离线通知中心 ---
-        # 后台用户即使 WS 尚未断开，也需要系统通知入口。
+        # --- 通知中心记录 ---
+        # 消息始终创建通知中心记录；移动推送由设备 app_state 决定。
         from app.services.notification_service import NotificationService
         preview = content[:50] + '...' if len(content) > 50 else content
         for pid in participant_ids:
@@ -639,6 +725,8 @@ async def mark_conversation_as_read(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     is_direct_participant = conversation.user1_id == user.id or conversation.user2_id == user.id
+    if conversation.type != 'community' and not can_access_conversation(db, conversation, user.id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
     community_participant = None
     if conversation.type == 'community':
         community_participant = get_community_participant(db, conversation_id, user.id)
@@ -683,13 +771,41 @@ def get_online_users_list(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取在线用户列表"""
-    online_ids = ws_manager.get_online_user_ids()
-    if not online_ids:
+    """获取产品级在线好友列表。"""
+    blocked_ids = excluded_user_ids(db, user.id)
+    friendships_query = db.query(Friendship).filter(
+        Friendship.status == 'accepted',
+        ((Friendship.sender_id == user.id) & (Friendship.receiver_id != user.id))
+        | ((Friendship.receiver_id == user.id) & (Friendship.sender_id != user.id)),
+    )
+    if blocked_ids:
+        friendships_query = friendships_query.filter(
+            ~Friendship.sender_id.in_(blocked_ids),
+            ~Friendship.receiver_id.in_(blocked_ids),
+        )
+    friendships = friendships_query.all()
+    friend_ids = {
+        f.sender_id if f.receiver_id == user.id else f.receiver_id
+        for f in friendships
+    }
+    if not friend_ids:
         return {"online_users": [], "total": 0}
 
-    users = db.query(User).filter(User.id.in_(online_ids)).all()
-    return {"online_users": [u.to_dict() for u in users], "total": len(users)}
+    raw_online_ids = set(ws_manager.get_online_user_ids()) & friend_ids
+    candidate_ids = friend_ids | raw_online_ids
+    users = db.query(User).filter(User.id.in_(candidate_ids)).all()
+    online_users = []
+    for candidate in users:
+        if is_user_product_online(
+            db,
+            candidate.id,
+            raw_ws_online=ws_manager.is_connected(candidate.id),
+        ):
+            data = candidate.to_dict()
+            data["is_online"] = True
+            online_users.append(data)
+
+    return {"online_users": online_users, "total": len(online_users)}
 
 
 @router.get("/users/{user_id}/status")
@@ -700,7 +816,7 @@ def get_user_status(
 ):
     """获取用户在线状态（仅好友可查）"""
     target = db.query(User).filter(User.id == user_id).first()
-    if not target:
+    if not target or has_block_between(db, user.id, user_id):
         raise HTTPException(status_code=404, detail="User not found")
 
     # 隐私保护：非好友不允许查看在线状态
@@ -712,7 +828,15 @@ def get_user_status(
     if not is_friend:
         raise HTTPException(status_code=403, detail="Only friends can view online status")
 
-    return {"user_id": user_id, "is_online": ws_manager.is_connected(user_id), "user": target.to_dict()}
+    return {
+        "user_id": user_id,
+        "is_online": is_user_product_online(
+            db,
+            user_id,
+            raw_ws_online=ws_manager.is_connected(user_id),
+        ),
+        "user": target.to_dict(),
+    }
 
 
 @router.get("/unread-count")
@@ -752,6 +876,7 @@ def get_messages_around(
     target = db.query(Message).filter(
         Message.id == target_id,
         Message.conversation_id == conversation_id,
+        visible_user_predicate(user.id, Message.sender_id),
     ).first()
     if not target:
         raise HTTPException(status_code=404, detail="Target message not found")
@@ -762,6 +887,7 @@ def get_messages_around(
         .filter(
             Message.conversation_id == conversation_id,
             Message.created_at < target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
         )
         .order_by(Message.created_at.desc())
         .limit(before + 1)
@@ -776,6 +902,7 @@ def get_messages_around(
         .filter(
             Message.conversation_id == conversation_id,
             Message.created_at > target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
         )
         .order_by(Message.created_at.asc())
         .limit(after + 1)
@@ -786,7 +913,9 @@ def get_messages_around(
 
     window = before_msgs + [target] + after_msgs
     return {
-        "messages": inject_quote_preview_batch(db, [m.to_dict() for m in window]),
+        "messages": _serialize_messages_for_viewer(
+            db, [m.to_dict() for m in window], user.id,
+        ),
         "target_id": target_id,
         "has_more_before": has_more_before,
         "has_more_after": has_more_after,
@@ -805,6 +934,9 @@ def recall_message(
     msg = db.query(Message).filter(Message.id == message_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
+    conversation = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
+    if not can_access_conversation(db, conversation, user.id):
+        raise HTTPException(status_code=404, detail="Message not found")
     if msg.sender_id != user.id:
         raise HTTPException(status_code=403, detail="Cannot recall other's message")
     if msg.is_recalled:
@@ -822,9 +954,16 @@ def recall_message(
     # 通过 WS 推送撤回事件给可投递会话参与者
     conversation = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
     participant_ids = get_active_conversation_participant_ids(db, conversation) if conversation else []
+    blocked_ids = excluded_user_ids(db, user.id)
+    participant_ids = [
+        participant_id
+        for participant_id in participant_ids
+        if participant_id == user.id or participant_id not in blocked_ids
+    ]
     recall_data = {
         "message_id": msg.id,
         "conversation_id": msg.conversation_id,
+        "sender_id": user.id,
         "is_recalled": True,
         "recalled_at": msg.recalled_at.isoformat() if msg.recalled_at else None,
     }

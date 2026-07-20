@@ -3,15 +3,29 @@
 """
 import asyncio
 import logging
+import re
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models.models import Notification, User
+from app.services.aliyun_push_service import AliyunPushService
+from app.services.block_service import has_block_between
+from app.services.notification_query_service import (
+    is_notification_visible,
+    visible_unread_count,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationService:
+
+    SAFE_EXCEPTION_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+    @staticmethod
+    def _safe_exception_type(exc: BaseException) -> str:
+        name = exc.__class__.__name__
+        return name if NotificationService.SAFE_EXCEPTION_TYPE.fullmatch(name) else "Exception"
 
     @staticmethod
     def _get_session() -> Session:
@@ -25,12 +39,13 @@ class NotificationService:
         async def _push():
             db = SessionLocal()
             try:
-                sender_id = notification_dict.get("sender_id")
+                notification_id = notification_dict.get("id")
+                if notification_id is None or not is_notification_visible(
+                    db, user_id, notification_id
+                ):
+                    return
 
-                # 屏蔽检查：接收者屏蔽了发送者，则不推送
-                if sender_id and user_id != sender_id:
-                    if sender_id in ws_manager.get_blocked_user_ids(user_id):
-                        return
+                sender_id = notification_dict.get("sender_id")
 
                 # 查询发送者信息
                 sender = None
@@ -39,14 +54,7 @@ class NotificationService:
                     if s:
                         sender = {"username": s.username, "avatar_url": s.avatar_url}
 
-                unread_count = (
-                    db.query(Notification)
-                    .filter(
-                        Notification.user_id == user_id,
-                        Notification.is_read == False,
-                    )
-                    .count()
-                )
+                unread_count = visible_unread_count(db, user_id)
                 notification_payload = dict(notification_dict)
                 notification_payload["sender"] = sender
 
@@ -54,27 +62,13 @@ class NotificationService:
                     "notification": notification_payload,
                     "unread_count": unread_count,
                 })
-
-                # 系统通知由 PushService 根据设备前后台状态筛选目标；
-                # 不能只用 WebSocket 在线状态判断，否则移动端后台半连接会漏推。
-                from app.services.push_service import PushService
-                notif_type = notification_dict.get("notification_type") or "notification"
-                related_id = notification_dict.get("related_id")
-                related_type = notification_dict.get("related_type")
-                alert_title = (notification_dict.get("title") or "南图")[:40]
-                alert_content = (notification_dict.get("content") or "你有一条新通知")[:80]
-                await PushService.send_to_user(
+            except Exception as exc:
+                logger.warning(
+                    "[NOTIFY WS] delivery failed uid=%s error_code=%s exception_type=%s",
                     user_id,
-                    alert_title=alert_title,
-                    alert_content=alert_content,
-                    extras={
-                        "type": notif_type,
-                        "related_id": str(related_id) if related_id is not None else "",
-                        "related_type": related_type or "",
-                    },
+                    "WS_DELIVERY_ERROR",
+                    NotificationService._safe_exception_type(exc),
                 )
-            except Exception as e:
-                logger.warning(f"[NOTIFY PUSH] failed uid={user_id}: {e}", exc_info=True)
             finally:
                 db.close()
 
@@ -87,28 +81,57 @@ class NotificationService:
         if own_db:
             db = NotificationService._get_session()
         try:
-            notification = Notification(
-                user_id=user_id,
-                sender_id=sender_id,
-                notification_type=notification_type,
-                title=title,
-                content=content,
-                related_id=related_id,
-                related_type=related_type
-            )
-            db.add(notification)
-            db.commit()
-            db.refresh(notification)
+            if sender_id is not None and has_block_between(db, user_id, sender_id):
+                # Match this method's existing transaction boundary without
+                # persisting or scheduling sender-backed hidden notifications.
+                db.commit()
+                return None
+            try:
+                notification = Notification(
+                    user_id=user_id,
+                    sender_id=sender_id,
+                    notification_type=notification_type,
+                    title=title,
+                    content=content,
+                    related_id=related_id,
+                    related_type=related_type
+                )
+                db.add(notification)
+                db.flush()
+                notification_dict = notification.to_dict()
+                db.commit()
+            except Exception as persistence_error:
+                db.rollback()
+                logger.error(
+                    "[NOTIFY DB] notification persistence failed error_code=%s exception_type=%s",
+                    "DB_PERSISTENCE_ERROR",
+                    NotificationService._safe_exception_type(persistence_error),
+                )
+                return None
 
-            # --- WebSocket 推送 ---
-            notification_dict = notification.to_dict()
-            NotificationService._push_new_notification(user_id, notification_dict)
+            # --- WebSocket push (best effort) ---
+            try:
+                NotificationService._push_new_notification(user_id, notification_dict)
+            except Exception as ws_error:
+                logger.warning(
+                    "[NOTIFY WS] scheduling failed uid=%s error_code=%s exception_type=%s",
+                    user_id,
+                    "WS_SCHEDULING_ERROR",
+                    NotificationService._safe_exception_type(ws_error),
+                )
+
+            # --- Mobile push (best effort; respects notify_push/block checks internally) ---
+            try:
+                AliyunPushService.schedule_notification_push(user_id, notification_dict)
+            except Exception as push_error:
+                logger.warning(
+                    "[NOTIFY PUSH] scheduling failed uid=%s error_code=%s exception_type=%s",
+                    user_id,
+                    "PUSH_SCHEDULING_ERROR",
+                    NotificationService._safe_exception_type(push_error),
+                )
 
             return notification
-        except Exception as e:
-            db.rollback()
-            print(f"Error creating notification: {e}")
-            return None
         finally:
             if own_db:
                 db.close()
@@ -126,20 +149,19 @@ class NotificationService:
                 return
             title = f"{liker.username} 赞了你的帖子"
             content = f"{liker.username} 赞了你的帖子"
+            return NotificationService.create_notification(
+                user_id=post_owner_id,
+                notification_type="like",
+                title=title,
+                content=content,
+                sender_id=liker_id,
+                related_id=post_id,
+                related_type='post',
+                db=db,
+            )
         finally:
             if own_db:
                 db.close()
-
-        NotificationService.create_notification(
-            user_id=post_owner_id,
-            notification_type="like",
-            title=title,
-            content=content,
-            sender_id=liker_id,
-            related_id=post_id,
-            related_type='post',
-            db=db,
-        )
 
     @staticmethod
     def notify_comment(post_owner_id, commenter_id, post_id, comment_content, db=None):
@@ -155,69 +177,76 @@ class NotificationService:
             preview = comment_content[:50] + '...' if len(comment_content) > 50 else comment_content
             title = f"{commenter.username} 评论了你的帖子"
             content = f"{commenter.username}: {preview}"
+            return NotificationService.create_notification(
+                user_id=post_owner_id,
+                notification_type="comment",
+                title=title,
+                content=content,
+                sender_id=commenter_id,
+                related_id=post_id,
+                related_type='post',
+                db=db,
+            )
         finally:
             if own_db:
                 db.close()
 
-        NotificationService.create_notification(
-            user_id=post_owner_id,
-            notification_type="comment",
-            title=title,
-            content=content,
-            sender_id=commenter_id,
-            related_id=post_id,
-            related_type='post',
-            db=db,
-        )
-
     @staticmethod
-    def notify_friend_request(receiver_id, sender_id):
-        db = NotificationService._get_session()
+    def notify_friend_request(receiver_id, sender_id, db=None):
+        own_db = db is None
+        if own_db:
+            db = NotificationService._get_session()
         try:
             sender = db.query(User).filter(User.id == sender_id).first()
             if not sender:
                 return
             title = f"{sender.username} 想加你为好友"
             content = f"{sender.username} 发送了好友请求"
+            return NotificationService.create_notification(
+                user_id=receiver_id,
+                notification_type="friend_request",
+                title=title,
+                content=content,
+                sender_id=sender_id,
+                related_type='friendship',
+                db=db,
+            )
         finally:
-            db.close()
-
-        NotificationService.create_notification(
-            user_id=receiver_id,
-            notification_type="friend_request",
-            title=title,
-            content=content,
-            sender_id=sender_id,
-            related_type='friendship'
-        )
+            if own_db:
+                db.close()
 
     @staticmethod
-    def notify_friend_accepted(sender_id, receiver_id):
-        db = NotificationService._get_session()
+    def notify_friend_accepted(sender_id, receiver_id, db=None):
+        own_db = db is None
+        if own_db:
+            db = NotificationService._get_session()
         try:
             receiver = db.query(User).filter(User.id == receiver_id).first()
             if not receiver:
                 return
             title = f"{receiver.username} 接受了你的好友请求"
             content = f"{receiver.username} 现在是你的好友了"
+            return NotificationService.create_notification(
+                user_id=sender_id,
+                notification_type="friend_accept",
+                title=title,
+                content=content,
+                sender_id=receiver_id,
+                related_id=receiver_id,  # 对方的 user_id，前端可据此跳转聊天
+                related_type='friendship',
+                db=db,
+            )
         finally:
-            db.close()
-
-        NotificationService.create_notification(
-            user_id=sender_id,
-            notification_type="friend_accept",
-            title=title,
-            content=content,
-            sender_id=receiver_id,
-            related_id=receiver_id,  # 对方的 user_id，前端可据此跳转聊天
-            related_type='friendship'
-        )
+            if own_db:
+                db.close()
 
     @staticmethod
-    def notify_message(receiver_id, sender_id, message_content, conversation_id):
+    def notify_message(receiver_id, sender_id, message_content, conversation_id, db=None):
         if receiver_id == sender_id:
             return
-        db = NotificationService._get_session()
+        own_db = db is None
+        if own_db:
+            db = NotificationService._get_session()
         try:
             sender = db.query(User).filter(User.id == sender_id).first()
             if not sender:
@@ -225,39 +254,43 @@ class NotificationService:
             preview = message_content[:50] + '...' if len(message_content) > 50 else message_content
             title = f"来自 {sender.username} 的新消息"
             content = preview
+            return NotificationService.create_notification(
+                user_id=receiver_id,
+                notification_type="message",
+                title=title,
+                content=content,
+                sender_id=sender_id,
+                related_id=conversation_id,
+                related_type='conversation',
+                db=db,
+            )
         finally:
-            db.close()
-
-        NotificationService.create_notification(
-            user_id=receiver_id,
-            notification_type="message",
-            title=title,
-            content=content,
-            sender_id=sender_id,
-            related_id=conversation_id,
-            related_type='conversation'
-        )
+            if own_db:
+                db.close()
 
     @staticmethod
-    def notify_mention(mentioned_user_id, mentioner_id, post_id, context):
+    def notify_mention(mentioned_user_id, mentioner_id, post_id, context, db=None):
         if mentioned_user_id == mentioner_id:
             return
-        db = NotificationService._get_session()
+        own_db = db is None
+        if own_db:
+            db = NotificationService._get_session()
         try:
             mentioner = db.query(User).filter(User.id == mentioner_id).first()
             if not mentioner:
                 return
             title = f"{mentioner.username} 在帖子中提到了你"
             content = context[:100] if context else f"{mentioner.username} 提到了你"
+            return NotificationService.create_notification(
+                user_id=mentioned_user_id,
+                notification_type="mention",
+                title=title,
+                content=content,
+                sender_id=mentioner_id,
+                related_id=post_id,
+                related_type='post',
+                db=db,
+            )
         finally:
-            db.close()
-
-        NotificationService.create_notification(
-            user_id=mentioned_user_id,
-            notification_type="mention",
-            title=title,
-            content=content,
-            sender_id=mentioner_id,
-            related_id=post_id,
-            related_type='post'
-        )
+            if own_db:
+                db.close()

@@ -199,7 +199,7 @@ def apply_role(
     logger.info(f"User {user.username} applied for role: {role_name}")
     return {
         "message": f"Application for '{role.label}' submitted successfully",
-        "application": application.to_dict(),
+        "application": application.to_dict(include_private_user=True),
     }
 
 
@@ -220,7 +220,7 @@ def get_my_applications(
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
     return {
-        "applications": [a.to_dict() for a in applications],
+        "applications": [a.to_dict(include_private_user=True) for a in applications],
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -248,7 +248,7 @@ def list_pending_applications(
     pages = (total + per_page - 1) // per_page if total > 0 else 0
 
     return {
-        "applications": [a.to_dict() for a in applications],
+        "applications": [a.to_dict(include_private_user=True) for a in applications],
         "total": total,
         "pages": pages,
         "current_page": page,
@@ -285,7 +285,7 @@ def approve_application(
     db.commit()
 
     logger.info(f"Admin {user.username} approved role application #{application_id}")
-    return {"message": "Application approved", "application": app.to_dict()}
+    return {"message": "Application approved", "application": app.to_dict(include_private_user=True)}
 
 
 @router.post("/applications/{application_id}/reject")
@@ -310,7 +310,7 @@ def reject_application(
     db.commit()
 
     logger.info(f"Admin {user.username} rejected role application #{application_id}")
-    return {"message": "Application rejected", "application": app.to_dict()}
+    return {"message": "Application rejected", "application": app.to_dict(include_private_user=True)}
 
 
 @router.post("/applications/{application_id}/suspend")
@@ -340,7 +340,7 @@ def suspend_application(
     db.commit()
 
     logger.info(f"Admin {user.username} suspended role application #{application_id}")
-    return {"message": "Application suspended", "application": app.to_dict()}
+    return {"message": "Application suspended", "application": app.to_dict(include_private_user=True)}
 
 
 # ============================================================

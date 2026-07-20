@@ -75,6 +75,7 @@ class ChatAroundContractsTest(unittest.TestCase):
         self.db = Mock()
         self.db.query.side_effect = [
             _first_query(self.conv),
+            _first_query(None),  # 无双向屏蔽关系
             _first_query(self.target),
             _list_query(before_list),
             _list_query(after_list),
@@ -96,6 +97,7 @@ class ChatAroundContractsTest(unittest.TestCase):
         self._build()
         self.db.query.side_effect = [
             _first_query(self.conv),
+            _first_query(None),  # 无双向屏蔽关系
             _first_query(None),  # 跨会话找不到
         ]
         with self.assertRaises(HTTPException) as ctx:
@@ -122,6 +124,7 @@ class ChatAroundContractsTest(unittest.TestCase):
         after_list = [m for m in self.all_msgs if m.id > 1]
         self.db.query.side_effect = [
             _first_query(self.conv),
+            _first_query(None),  # 无双向屏蔽关系
             _first_query(self.target),
             _list_query([]),  # before 为空
             _list_query(after_list),
@@ -141,6 +144,7 @@ class ChatAroundContractsTest(unittest.TestCase):
         # 截断到 before+1 = 21 条以触发 has_more
         self.db.query.side_effect = [
             _first_query(self.conv),
+            _first_query(None),  # 无双向屏蔽关系
             _first_query(self.target),
             _list_query(extra_before[:21]),  # 21 条
             _list_query([]),

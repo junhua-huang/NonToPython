@@ -10,6 +10,7 @@ WebSocket 连接管理 + 序号机制
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -20,11 +21,47 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
+from app.services.block_service import excluded_user_ids, visible_user_predicate
+from app.services.notification_query_service import visible_notification_ids
+from app.services.presence_service import BACKGROUND_ACTIVE_SECONDS, is_user_product_online
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 120  # 120 秒无心跳视为断线
 PER_USER_BACKLOG_LIMIT = 50  # 单用户推送积压上限，超过则跳过实时推送（走 sync 补发）
+
+
+def _filter_social_sync_payload(payload: dict, blocked_ids: set[int]) -> dict | None:
+    """Drop or redact sequenced social events hidden by a later block."""
+    if not isinstance(payload, dict):
+        return None
+    event = payload.get("event")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+
+    identity_field = {
+        "new_message": "sender_id",
+        "message_recalled": "sender_id",
+        "friend_online": "user_id",
+        "friend_offline": "user_id",
+        "community_member_presence": "user_id",
+        "conversation_read": "read_by",
+    }.get(event)
+    if identity_field and data.get(identity_field) in blocked_ids:
+        return None
+
+    if event == "online_friends":
+        visible_ids = [
+            candidate_id
+            for candidate_id in data.get("user_ids", [])
+            if candidate_id not in blocked_ids
+        ]
+        if not visible_ids:
+            return None
+        return {**payload, "data": {**data, "user_ids": visible_ids}}
+
+    return payload
 
 
 class WSManager:
@@ -47,6 +84,7 @@ class WSManager:
             cls._instance._push_worker_started = False
             cls._instance._per_user_pending: dict[int, int] = {}
             cls._instance._presence_generation: dict[int, int] = {}
+            cls._instance._presence_generation_lock = threading.Lock()
         return cls._instance
 
     def __init__(self):
@@ -65,6 +103,9 @@ class WSManager:
             self._push_worker_started = False
             self._per_user_pending: dict[int, int] = {}
             self._presence_generation: dict[int, int] = {}
+            self._presence_generation_lock = threading.Lock()
+        elif not hasattr(self, "_presence_generation_lock"):
+            self._presence_generation_lock = threading.Lock()
         self._initialized = True
 
     # ================================================================
@@ -202,10 +243,13 @@ class WSManager:
             self.remove_user_from_all_conversations(user_id)
             self.invalidate_user_caches(user_id)
 
-            # 用户全部设备离线 → 通知相关社群成员和在线好友该用户已下线
             presence_generation = self.bump_presence_generation(user_id)
-            asyncio.ensure_future(self.notify_community_presence(user_id, False, presence_generation))
-            asyncio.ensure_future(self._notify_friends_offline(user_id, presence_generation))
+            # 用户产品级离线（无 WS 且无最近活跃 App 设备）→ 立即通知；否则在 App 活跃 TTL 后复查。
+            if not await self.is_product_online_async(user_id):
+                asyncio.ensure_future(self.notify_community_presence(user_id, False, presence_generation))
+                asyncio.ensure_future(self._notify_friends_offline(user_id, presence_generation))
+            else:
+                self.schedule_offline_presence_check(user_id, BACKGROUND_ACTIVE_SECONDS, presence_generation)
 
         logger.info(f"[WS -] uid={user_id} cid={conn_id[:8] if conn_id else 'all'} "
                      f"online_users={len(self._connections)} total_conns={self.total_connections}")
@@ -218,20 +262,109 @@ class WSManager:
         """检查用户是否有任一设备在线"""
         return user_id in self._connections and len(self._connections[user_id]) > 0
 
+    def is_product_online(self, user_id: int) -> bool:
+        """检查用户是否产品级在线（WS 在线或最近活跃 App 设备）。"""
+        db = SessionLocal()
+        try:
+            return is_user_product_online(
+                db,
+                user_id,
+                raw_ws_online=self.is_connected(user_id),
+            )
+        finally:
+            db.close()
+
+    async def is_product_online_async(self, user_id: int) -> bool:
+        """Async wrapper for product presence DB checks; keep sync helper canonical."""
+        return await asyncio.get_event_loop().run_in_executor(None, self.is_product_online, user_id)
+
+    def schedule_offline_presence_check(
+        self,
+        user_id: int,
+        delay_seconds: int = BACKGROUND_ACTIVE_SECONDS,
+        expected_generation: int | None = None,
+    ):
+        """Schedule a delayed product-offline re-check after active-device TTL expires."""
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._delayed_offline_presence_check(user_id, delay_seconds, expected_generation),
+                self._loop,
+            )
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            timer = threading.Timer(
+                delay_seconds,
+                lambda: asyncio.run(self._emit_offline_presence_if_still_offline(user_id, expected_generation)),
+            )
+            timer.daemon = True
+            timer.start()
+            return
+        loop.create_task(self._delayed_offline_presence_check(user_id, delay_seconds, expected_generation))
+
+    async def _delayed_offline_presence_check(
+        self,
+        user_id: int,
+        delay_seconds: int = BACKGROUND_ACTIVE_SECONDS,
+        expected_generation: int | None = None,
+    ):
+        await asyncio.sleep(delay_seconds)
+        await self._emit_offline_presence_if_still_offline(user_id, expected_generation)
+
+    async def _emit_offline_presence_if_still_offline(
+        self,
+        user_id: int,
+        expected_generation: int | None = None,
+    ):
+        if (
+            self.is_connected(user_id)
+            or not self._is_presence_generation_current(user_id, expected_generation)
+            or await self.is_product_online_async(user_id)
+        ):
+            return
+        presence_generation = self.bump_presence_generation(user_id)
+        await self.notify_community_presence(user_id, False, presence_generation)
+        await self._notify_friends_offline(user_id, presence_generation)
+
+    def schedule_presence_online_from_product_state(
+        self,
+        user_id: int,
+        expected_generation: int | None = None,
+    ):
+        """Schedule an online transition caused by app-state presence while raw WS is offline."""
+        self.schedule_push(self._notify_product_online_from_state(user_id, expected_generation))
+
+    async def _notify_product_online_from_state(
+        self,
+        user_id: int,
+        expected_generation: int | None = None,
+    ):
+        if (
+            self.is_connected(user_id)
+            or not self._is_presence_generation_current(user_id, expected_generation)
+            or not await self.is_product_online_async(user_id)
+        ):
+            return
+        await self.notify_community_presence(user_id, True, expected_generation)
+        await self._notify_friends_online(user_id, expected_generation)
+
     def get_online_user_ids(self) -> list[int]:
         """获取所有在线用户 ID 列表"""
         return list(self._connections.keys())
 
     def bump_presence_generation(self, user_id: int) -> int:
         """Increment and return the user's presence transition generation."""
-        generation = self._presence_generation.get(user_id, 0) + 1
-        self._presence_generation[user_id] = generation
-        return generation
+        with self._presence_generation_lock:
+            generation = self._presence_generation.get(user_id, 0) + 1
+            self._presence_generation[user_id] = generation
+            return generation
 
     def _is_presence_generation_current(self, user_id: int, expected_generation: int | None) -> bool:
         if expected_generation is None:
             return True
-        return self._presence_generation.get(user_id, 0) == expected_generation
+        with self._presence_generation_lock:
+            return self._presence_generation.get(user_id, 0) == expected_generation
 
     # ================================================================
     # 心跳超时检测
@@ -363,15 +496,18 @@ class WSManager:
             return
 
         full_payload = {"event": event, "data": data}
-        seq = self._next_seq_sync(recipient_id, full_payload)
+        seq = await self._next_seq_if_presence_generation_current(
+            recipient_id, full_payload, subject_user_id, expected_generation
+        )
         if seq is None:
-            logger.warning(f"[WS SEND] uid={recipient_id} {event} seq=FAILED")
+            logger.warning(f"[WS SEND] uid={recipient_id} {event} seq=SKIPPED_OR_FAILED")
             return
 
-        if (
-            self.is_connected(recipient_id)
-            and self._is_presence_generation_current(subject_user_id, expected_generation)
-        ):
+        if not self._is_presence_generation_current(subject_user_id, expected_generation):
+            await self._delete_message_log(recipient_id, seq)
+            return
+
+        if self.is_connected(recipient_id):
             logger.debug(f"[WS SEND] uid={recipient_id} {event} seq={seq} {json.dumps(full_payload, ensure_ascii=False)[:200]}")
             await self._raw_send_to_connections(recipient_id, {
                 "type": "message", "seq": seq, "payload": full_payload
@@ -402,30 +538,56 @@ class WSManager:
             return
         loop.create_task(coro)
 
-    async def _notify_friends_offline(self, user_id: int, expected_generation: int | None = None):
-        """用户全部设备离线时，通知在线好友该用户已下线"""
-        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
-            return
-
-        loop = asyncio.get_event_loop()
-
-        def _get_friend_ids():
-            db = SessionLocal()
-            try:
-                from app.models.models import Friendship
-                friends = db.query(Friendship).filter(
-                    ((Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)),
-                    Friendship.status == 'accepted'
-                ).all()
-                return [
+    def _get_friend_ids_sync(self, user_id: int) -> list[int]:
+        db = SessionLocal()
+        try:
+            from app.models.models import Friendship
+            friends = db.query(Friendship).filter(
+                ((Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)),
+                Friendship.status == 'accepted'
+            ).all()
+            blocked_ids = excluded_user_ids(db, user_id)
+            return [
+                friend_id
+                for friend_id in (
                     f.sender_id if f.receiver_id == user_id else f.receiver_id
                     for f in friends
-                ]
-            finally:
-                db.close()
+                )
+                if friend_id not in blocked_ids
+            ]
+        finally:
+            db.close()
 
-        friend_ids = await loop.run_in_executor(None, _get_friend_ids)
-        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
+    async def _get_friend_ids_async(self, user_id: int) -> list[int]:
+        return await asyncio.get_event_loop().run_in_executor(None, self._get_friend_ids_sync, user_id)
+
+    async def _notify_friends_online(self, user_id: int, expected_generation: int | None = None):
+        """用户产品级上线时，通知在线好友该用户已上线。"""
+        if not await self.is_product_online_async(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
+            return
+
+        friend_ids = await self._get_friend_ids_async(user_id)
+        if not await self.is_product_online_async(user_id) or not self._is_presence_generation_current(user_id, expected_generation):
+            return
+        for fid in friend_ids:
+            if not self._is_presence_generation_current(user_id, expected_generation):
+                return
+            if self.is_connected(fid):
+                await self._send_presence_with_seq(
+                    fid,
+                    "friend_online",
+                    {"user_id": user_id},
+                    user_id,
+                    expected_generation,
+                )
+
+    async def _notify_friends_offline(self, user_id: int, expected_generation: int | None = None):
+        """用户全部设备离线时，通知在线好友该用户已下线"""
+        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation) or await self.is_product_online_async(user_id):
+            return
+
+        friend_ids = await self._get_friend_ids_async(user_id)
+        if self.is_connected(user_id) or not self._is_presence_generation_current(user_id, expected_generation) or await self.is_product_online_async(user_id):
             return
         for fid in friend_ids:
             if not self._is_presence_generation_current(user_id, expected_generation):
@@ -481,6 +643,7 @@ class WSManager:
                     CommunityMember.community_id.in_(community_ids),
                     CommunityMember.status == 'active',
                     CommunityMember.user_id.in_(online_user_ids),
+                    visible_user_predicate(user_id, CommunityMember.user_id),
                 )
                 .all()
             )
@@ -506,7 +669,7 @@ class WSManager:
         """Notify active community members that a member's app-level presence changed."""
         try:
             if (
-                self.is_connected(user_id) != is_online
+                await self.is_product_online_async(user_id) != is_online
                 or not self._is_presence_generation_current(user_id, expected_generation)
             ):
                 return
@@ -515,7 +678,7 @@ class WSManager:
             online_user_ids = self.get_online_user_ids()
             targets = await loop.run_in_executor(None, self._get_community_presence_targets_sync, user_id, online_user_ids)
             if (
-                self.is_connected(user_id) != is_online
+                await self.is_product_online_async(user_id) != is_online
                 or not self._is_presence_generation_current(user_id, expected_generation)
             ):
                 return
@@ -615,10 +778,23 @@ class WSManager:
                 if not users:
                     del self._conversation_users[conv_id]
 
-    async def broadcast_to_conversation(self, conversation_id: int, data: dict, exclude: Optional[int] = None):
+    async def broadcast_to_conversation(
+        self,
+        conversation_id: int,
+        data: dict,
+        exclude: Optional[int] = None,
+        actor_user_id: Optional[int] = None,
+    ):
         user_ids = self._conversation_users.get(conversation_id, set())
+        blocked_ids: set[int] = set()
+        if actor_user_id is not None:
+            db = SessionLocal()
+            try:
+                blocked_ids = excluded_user_ids(db, actor_user_id)
+            finally:
+                db.close()
         for uid in user_ids:
-            if uid == exclude:
+            if uid == exclude or uid in blocked_ids:
                 continue
             await self._raw_send_to_connections(uid, data)
 
@@ -658,28 +834,142 @@ class WSManager:
         finally:
             db.close()
 
+    def _next_seq_if_presence_generation_current_sync(
+        self,
+        user_id: int,
+        payload: dict,
+        subject_user_id: int,
+        expected_generation: int | None,
+    ) -> Optional[int]:
+        if expected_generation is not None:
+            with self._presence_generation_lock:
+                if self._presence_generation.get(subject_user_id, 0) != expected_generation:
+                    return None
+
+        seq = self._next_seq_sync(user_id, payload)
+        if seq is None:
+            return None
+
+        if expected_generation is not None:
+            with self._presence_generation_lock:
+                is_stale = self._presence_generation.get(subject_user_id, 0) != expected_generation
+            if is_stale:
+                self._delete_message_log_sync(user_id, seq)
+                return None
+
+        return seq
+
+    async def _next_seq_if_presence_generation_current(
+        self,
+        user_id: int,
+        payload: dict,
+        subject_user_id: int,
+        expected_generation: int | None,
+    ) -> Optional[int]:
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            self._next_seq_if_presence_generation_current_sync,
+            user_id,
+            payload,
+            subject_user_id,
+            expected_generation,
+        )
+
     async def _next_seq(self, user_id: int, payload: dict) -> Optional[int]:
         return await asyncio.get_event_loop().run_in_executor(None, self._next_seq_sync, user_id, payload)
+
+    def _delete_message_log_sync(self, user_id: int, seq: int) -> None:
+        db: Session = SessionLocal()
+        try:
+            from app.models.models import WSMessageLog
+            db.query(WSMessageLog).filter(
+                WSMessageLog.user_id == user_id,
+                WSMessageLog.seq == seq,
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as e:
+            logger.error(f"[WS SEQ] failed to delete stale presence log uid={user_id} seq={seq}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    async def _delete_message_log(self, user_id: int, seq: int) -> None:
+        await asyncio.get_event_loop().run_in_executor(None, self._delete_message_log_sync, user_id, seq)
 
     async def get_messages_after_seq(self, user_id: int, last_received_seq: int, limit: int = 200) -> list[dict]:
         def _sync():
             db: Session = SessionLocal()
             try:
                 from app.models.models import WSMessageLog
-                rows = (
-                    db.query(WSMessageLog)
-                    .filter(WSMessageLog.user_id == user_id, WSMessageLog.seq > last_received_seq)
-                    .order_by(WSMessageLog.seq.asc())
-                    .limit(limit)
-                    .all()
-                )
                 result = []
-                for row in rows:
+                scan_after_seq = last_received_seq
+                batch_size = max(limit, 200)
+
+                while len(result) < limit:
+                    rows = (
+                        db.query(WSMessageLog)
+                        .filter(
+                            WSMessageLog.user_id == user_id,
+                            WSMessageLog.seq > scan_after_seq,
+                        )
+                        .order_by(WSMessageLog.seq.asc())
+                        .limit(batch_size)
+                        .all()
+                    )
+                    if not rows:
+                        break
+                    scan_after_seq = rows[-1].seq
+
+                    parsed_rows = []
+                    notification_ids = set()
                     try:
-                        payload = json.loads(row.payload)
-                    except (json.JSONDecodeError, TypeError):
-                        payload = {}
-                    result.append({"seq": row.seq, "payload": payload})
+                        blocked_ids = excluded_user_ids(db, user_id)
+                    except Exception as exc:
+                        logger.error("[WS SYNC] block visibility lookup failed uid=%s: %s", user_id, exc)
+                        return []
+
+                    for row in rows:
+                        try:
+                            payload = json.loads(row.payload)
+                        except (json.JSONDecodeError, TypeError):
+                            payload = {}
+
+                        notification_id = None
+                        if isinstance(payload, dict) and payload.get("event") == "new_notification":
+                            data = payload.get("data")
+                            notification = data.get("notification") if isinstance(data, dict) else None
+                            if isinstance(notification, dict):
+                                candidate_id = notification.get("id")
+                                if isinstance(candidate_id, int) and not isinstance(candidate_id, bool):
+                                    notification_id = candidate_id
+                                    notification_ids.add(notification_id)
+                        parsed_rows.append((row.seq, payload, notification_id))
+
+                    visible_ids = set()
+                    if notification_ids:
+                        try:
+                            visible_ids = visible_notification_ids(db, user_id, notification_ids)
+                        except Exception as e:
+                            logger.error(
+                                "[WS SYNC] notification visibility lookup failed uid=%s: %s",
+                                user_id,
+                                e,
+                            )
+
+                    for seq, payload, notification_id in parsed_rows:
+                        if isinstance(payload, dict) and payload.get("event") == "new_notification":
+                            if notification_id is None or notification_id not in visible_ids:
+                                continue
+                        payload = _filter_social_sync_payload(payload, blocked_ids)
+                        if payload is None:
+                            continue
+                        result.append({"seq": seq, "payload": payload})
+                        if len(result) >= limit:
+                            break
+
+                    if len(rows) < batch_size:
+                        break
+
                 return result
             except Exception as e:
                 logger.error(f"[WS SYNC] failed uid={user_id}: {e}")

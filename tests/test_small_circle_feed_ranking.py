@@ -119,7 +119,7 @@ class SmallCircleFeedRankingSourceTest(unittest.TestCase):
         self.assertIn('if blocked_ids:', query_source)
         self.assertIn('candidate_filters.append(~Post.user_id.in_(blocked_ids))', query_source)
         self.assertIn('def _get_blocked_feed_author_ids', source)
-        self.assertIn('Block.blocked_id == user_id', source)
+        self.assertIn('return excluded_user_ids(db, user_id)', source)
         self.assertIn('blocked_ids = RecommendationService._get_blocked_feed_author_ids(db, user_id)', feed_source)
         self.assertIn('blocked_ids=blocked_ids', feed_source)
 
