@@ -238,6 +238,42 @@ def test_regex_runtime_timeout_is_fail_closed_and_uses_locked_timeout():
     assert "redacted" not in caught.value.public_message
 
 
+def test_dynamic_regex_timeout_is_capped_by_remaining_evaluation_budget():
+    class SequenceClock:
+        def __init__(self):
+            self.values = iter((0.0, 0.0, 0.099, 0.099))
+
+        def __call__(self):
+            return next(self.values)
+
+    class RecordingPattern:
+        timeout = None
+
+        def search(self, text, timeout):
+            self.timeout = timeout
+            return None
+
+    pattern = RecordingPattern()
+    dynamic_rule = rule(rule_id=9, expression="private-regex", match_type="regex")
+    snapshot = ModerationSnapshot(
+        version=9,
+        literal_rules=(),
+        regex_rules=(CompiledRegexRule(rule=dynamic_rule, pattern=pattern),),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    remaining = local_text_moderator._DYNAMIC_EVALUATION_BUDGET - 0.099
+
+    result = LocalTextModerator(
+        lambda: snapshot, monotonic=SequenceClock()
+    ).moderate("hello")
+
+    assert result.decision is ModerationDecision.APPROVE
+    assert pattern.timeout is not None
+    assert 0 < pattern.timeout <= remaining + 1e-12
+    assert pattern.timeout == pytest.approx(remaining)
+
+
 @pytest.mark.parametrize(
     "expression", ["", " \t\n ", "\u2063\u034f\u200b"]
 )

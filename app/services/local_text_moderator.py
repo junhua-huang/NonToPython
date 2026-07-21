@@ -233,6 +233,7 @@ class LocalTextModerator:
         confidence = 1.0
         matched_rule_ids: list[int] = []
         started_at = self._monotonic()
+        deadline = started_at + _DYNAMIC_EVALUATION_BUDGET
         literal_matchers = self._dynamic_literal_matchers(snapshot)
         self._check_dynamic_budget(started_at)
 
@@ -273,10 +274,14 @@ class LocalTextModerator:
                         break
                 else:
                     for compiled_rule in snapshot.regex_rules:
-                        self._check_dynamic_budget(started_at)
+                        remaining = deadline - self._monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "dynamic moderation rule evaluation timed out"
+                            )
                         rule = compiled_rule.rule
                         matched = compiled_rule.pattern.search(
-                            normalized, timeout=_REGEX_TIMEOUT
+                            normalized, timeout=min(_REGEX_TIMEOUT, remaining)
                         )
                         self._check_dynamic_budget(started_at)
                         if matched:
