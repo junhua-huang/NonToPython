@@ -1,4 +1,6 @@
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, asdict, is_dataclass
+import math
 import re
 
 import pytest
@@ -64,31 +66,85 @@ def test_phase1_enums_have_exact_locked_values():
     }
 
 
-def test_result_is_immutable_slotted_and_requires_an_actual_int_rule_version():
-    result = approved_result()
+def make_result(**overrides) -> ModerationResult:
+    values = {
+        "decision": ModerationDecision.APPROVE,
+        "risk_category": RiskCategory.OTHER,
+        "severity": None,
+        "confidence": 1.0,
+        "policy_version": "phase1-local-v1",
+        "rule_version": 0,
+        "matched_rule_ids": (),
+    }
+    values.update(overrides)
+    return ModerationResult(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("decision", "approve", "decision must be ModerationDecision"),
+        ("risk_category", "other", "risk_category must be RiskCategory"),
+        ("severity", "high", "severity must be Severity or None"),
+        ("confidence", True, "confidence must be int or float"),
+        ("confidence", "1", "confidence must be int or float"),
+        ("policy_version", 1, "policy_version must be str"),
+        ("rule_version", "1", "rule_version must be int"),
+        ("rule_version", True, "rule_version must be int"),
+        ("matched_rule_ids", [1], "matched_rule_ids must be tuple"),
+        ("matched_rule_ids", (True,), "matched_rule_ids items must be int"),
+        ("matched_rule_ids", ("1",), "matched_rule_ids items must be int"),
+    ],
+)
+def test_result_rejects_wrong_runtime_types(field, value, message):
+    with pytest.raises(TypeError, match=f"^{message}$"):
+        make_result(**{field: value})
+
+
+@pytest.mark.parametrize("confidence", [math.nan, math.inf, -math.inf])
+def test_result_requires_finite_confidence(confidence):
+    with pytest.raises(ValueError, match="^confidence must be finite$"):
+        make_result(confidence=confidence)
+
+
+@pytest.mark.parametrize("confidence", [-0.01, 1.01, 10**1000])
+def test_result_requires_confidence_in_closed_unit_interval(confidence):
+    with pytest.raises(ValueError, match="^confidence must be between 0 and 1$"):
+        make_result(confidence=confidence)
+
+
+def test_result_requires_approve_severity_to_be_none_and_nonempty_policy_version():
+    with pytest.raises(
+        ValueError, match="^severity must be None when decision is APPROVE$"
+    ):
+        make_result(severity=Severity.LOW)
+    with pytest.raises(ValueError, match="^policy_version must not be empty$"):
+        make_result(policy_version="")
+
+
+class Confidence(int):
+    pass
+
+
+class RuleIds(tuple):
+    pass
+
+
+def test_result_accepts_numeric_and_tuple_subclasses():
+    result = make_result(confidence=Confidence(1), matched_rule_ids=RuleIds((1,)))
+
+    assert result.confidence == 1
+    assert result.matched_rule_ids == (1,)
+
+
+def test_result_accepts_integer_confidence_and_is_immutable_and_slotted():
+    result = make_result(confidence=1, matched_rule_ids=(1, 2))
 
     assert result.severity is None
     assert type(result.rule_version) is int
     assert type(asdict(result)["rule_version"]) is int
+    assert result.confidence == 1
     assert not hasattr(result, "__dict__")
-    with pytest.raises(TypeError, match="^rule_version must be int$"):
-        ModerationResult(
-            decision=ModerationDecision.APPROVE,
-            risk_category=RiskCategory.OTHER,
-            severity=None,
-            confidence=1.0,
-            policy_version="phase1-local-v1",
-            rule_version="1",  # type: ignore[arg-type]
-        )
-    with pytest.raises(TypeError, match="^rule_version must be int$"):
-        ModerationResult(
-            decision=ModerationDecision.APPROVE,
-            risk_category=RiskCategory.OTHER,
-            severity=None,
-            confidence=1.0,
-            policy_version="phase1-local-v1",
-            rule_version=True,
-        )
     with pytest.raises(FrozenInstanceError):
         result.confidence = 0.1  # type: ignore[misc]
 
@@ -143,9 +199,12 @@ def test_phase1_service_has_only_locked_public_entrypoints():
     assert not hasattr(ModerationService, "moderate_public_text")
 
 
+_DEFAULT_RESULT = object()
+
+
 class StubModerator:
-    def __init__(self, result=None, error=None):
-        self.result = result or approved_result()
+    def __init__(self, result=_DEFAULT_RESULT, error=None):
+        self.result = approved_result() if result is _DEFAULT_RESULT else result
         self.error = error
         self.seen = []
 
@@ -154,6 +213,22 @@ class StubModerator:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class StubPolicy:
+    def __init__(self, decision=ModerationDecision.APPROVE, error=None):
+        self.decision = decision
+        self.error = error
+        self.seen = []
+
+    def __bool__(self):
+        return False
+
+    def decide(self, context, result):
+        self.seen.append((context, result))
+        if self.error is not None:
+            raise self.error
+        return self.decision
 
 
 def test_service_fails_closed_when_local_moderator_is_missing_or_raises():
@@ -169,6 +244,30 @@ def test_service_fails_closed_when_local_moderator_is_missing_or_raises():
     assert failed.value.cause is internal
 
 
+def test_service_preserves_existing_contract_error_identity():
+    context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
+    unavailable = ModerationUnavailable(RuntimeError("moderator offline"))
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator(error=unavailable)).moderate_text(
+            "hello", context
+        )
+
+    assert raised.value is unavailable
+
+
+def test_service_uses_explicit_falsey_policy_and_propagates_its_contract_error():
+    context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
+    rejected = ContentRejected()
+    policy = StubPolicy(error=rejected)
+
+    with pytest.raises(ContentRejected) as raised:
+        ModerationService(StubModerator(), policy=policy).moderate_text("hello", context)
+
+    assert raised.value is rejected
+    assert len(policy.seen) == 1
+
+
 def test_service_raises_content_rejected_for_local_reject():
     context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
 
@@ -176,6 +275,29 @@ def test_service_raises_content_rejected_for_local_reject():
         ModerationService(StubModerator(result=rejected_result())).moderate_text(
             "blocked", context
         )
+
+
+@pytest.mark.parametrize("result", [None, "approve", object()])
+def test_service_fails_closed_on_malformed_local_result(result):
+    context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator(result=result)).moderate_text("hello", context)
+
+    assert isinstance(raised.value.cause, TypeError)
+    assert str(raised.value.cause) == "local moderator must return ModerationResult"
+
+
+@pytest.mark.parametrize("decision", ["approve", None, object()])
+def test_service_fails_closed_on_malformed_policy_decision(decision):
+    context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
+    policy = StubPolicy(decision=decision)
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator(), policy=policy).moderate_text("hello", context)
+
+    assert isinstance(raised.value.cause, ValueError)
+    assert str(raised.value.cause) == "policy must return APPROVE or REJECT"
 
 
 def test_service_moderates_only_nonblank_fields_and_preserves_result_order():
@@ -190,6 +312,95 @@ def test_service_moderates_only_nonblank_fields_and_preserves_result_order():
 
     assert moderator.seen == ["NanTu", "Hello"]
     assert results == (approved_result(), approved_result())
+
+
+class BrokenFields(Mapping):
+    def __init__(self, error, fail_during_iteration=False):
+        self.error = error
+        self.fail_during_iteration = fail_during_iteration
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def values(self):
+        if not self.fail_during_iteration:
+            raise self.error
+
+        error = self.error
+
+        def broken_values():
+            yield "first"
+            raise error
+
+        return broken_values()
+
+
+@pytest.mark.parametrize("fail_during_iteration", [False, True])
+def test_moderate_fields_wraps_values_access_and_iteration_errors(
+    fail_during_iteration,
+):
+    context = ModerationContext(target_type="profile", actor_user_id=7, is_public=True)
+    internal = RuntimeError("broken mapping")
+    moderator = StubModerator()
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(moderator).moderate_fields(
+            BrokenFields(internal, fail_during_iteration), context
+        )
+
+    assert raised.value.cause is internal
+    assert moderator.seen == (["first"] if fail_during_iteration else [])
+
+
+@pytest.mark.parametrize("value", [1, False, object()])
+def test_moderate_fields_fails_closed_on_non_string_values(value):
+    context = ModerationContext(target_type="profile", actor_user_id=7, is_public=True)
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator()).moderate_fields({"field": value}, context)
+
+    assert isinstance(raised.value.cause, TypeError)
+    assert str(raised.value.cause) == "moderation field values must be str or None"
+
+
+class BrokenString(str):
+    def __new__(cls, value, error):
+        instance = super().__new__(cls, value)
+        instance.error = error
+        return instance
+
+    def strip(self, *args, **kwargs):
+        raise self.error
+
+
+def test_moderate_fields_wraps_strip_errors():
+    context = ModerationContext(target_type="profile", actor_user_id=7, is_public=True)
+    internal = RuntimeError("broken strip")
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator()).moderate_fields(
+            {"field": BrokenString("hello", internal)}, context
+        )
+
+    assert raised.value.cause is internal
+
+
+def test_moderate_fields_propagates_contract_errors_without_rewrapping():
+    context = ModerationContext(target_type="profile", actor_user_id=7, is_public=True)
+    unavailable = ModerationUnavailable(RuntimeError("moderator offline"))
+
+    with pytest.raises(ModerationUnavailable) as raised:
+        ModerationService(StubModerator(error=unavailable)).moderate_fields(
+            {"name": None, "bio": "Hello"}, context
+        )
+
+    assert raised.value is unavailable
 
 
 @pytest.mark.parametrize(
