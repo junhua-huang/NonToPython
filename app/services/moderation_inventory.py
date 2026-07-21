@@ -81,7 +81,7 @@ EXCLUDED_TEXT_INPUTS: dict[str, tuple[str, ...]] = {
     "POST /api/auth/login": ("login", "email", "password", "email_code"),
     "POST /api/auth/change-password": ("old_password", "new_password"),
     "POST /api/auth/forgot-password": ("email",),
-    "POST /api/auth/reset-password": ("email", "email_code", "new_password"),
+    "POST /api/auth/reset-password": ("email", "code", "new_password"),
     "message media metadata": (
         "media_url",
         "avatar_url",

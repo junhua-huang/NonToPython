@@ -131,7 +131,14 @@ def test_policy_returns_local_binary_decision_without_pending_or_manual_review()
     assert "manual" not in {item.value for item in ModerationDecision}
 
 
-def test_phase1_service_does_not_predefine_phase2_entrypoints():
+def test_phase1_service_has_only_locked_public_entrypoints():
+    public_callables = {
+        name
+        for name, member in ModerationService.__dict__.items()
+        if not name.startswith("_") and callable(member)
+    }
+
+    assert public_callables == {"moderate_text", "moderate_fields"}
     assert not hasattr(ModerationService, "moderate_realtime_text")
     assert not hasattr(ModerationService, "moderate_public_text")
 
@@ -237,50 +244,107 @@ def test_error_codes_have_exact_locked_values():
     }
 
 
-def test_inventory_has_exact_complete_endpoint_key_set():
-    assert set(MODERATED_TEXT_FIELDS) == {
-        "POST /api/auth/register",
-        "PUT /api/auth/profile",
-        "POST /api/posts",
-        "PUT /api/posts/{post_id}",
-        "POST /api/posts/{post_id}/comments",
-        "PUT /api/comments/{comment_id}",
-        "POST /api/chat/conversations/{conversation_id}/messages",
-        "WS send_message",
-        "POST /api/communities",
-        "PATCH /api/communities/{community_id}",
-        "POST /api/communities/{community_id}/join",
-        "POST /api/communities/{community_id}/announcements",
-        "PATCH /api/communities/{community_id}/announcements/{announcement_id}",
-        "POST /api/communities/{community_id}/bans",
-        "POST /api/communities/{community_id}/chat/messages",
-        "POST /api/comic/events",
-        "PUT /api/comic/events/{event_id}",
-        "POST /api/comic/events/{event_id}/comments",
-        "POST /api/roles/apply",
-        "PUT /api/roles/profiles/coser",
-        "PUT /api/roles/profiles/photographer",
-        "PUT /api/roles/profiles/service",
-        "POST /api/roles/applications/{application_id}/approve",
-        "POST /api/roles/applications/{application_id}/reject",
-        "POST /api/roles/applications/{application_id}/suspend",
-        "POST /role-applications/{application_id}/approve",
-        "POST /role-applications/{application_id}/reject",
-        "POST /role-applications/{application_id}/suspend",
-        "POST /api/topics",
-        "PUT /api/topics/{topic_id}",
-        "POST /api/reports",
-        "POST /api/reports/post",
-        "POST /api/reports/comment",
-        "POST /api/reports/user",
+def test_inventory_has_exact_34_endpoint_to_field_contract():
+    expected = {
+        "POST /api/auth/register": ("username",),
+        "PUT /api/auth/profile": ("display_name", "bio"),
+        "POST /api/posts": ("content",),
+        "PUT /api/posts/{post_id}": ("content",),
+        "POST /api/posts/{post_id}/comments": ("content",),
+        "PUT /api/comments/{comment_id}": ("content",),
+        "POST /api/chat/conversations/{conversation_id}/messages": ("content",),
+        "WS send_message": ("content",),
+        "POST /api/communities": ("name", "description", "rules"),
+        "PATCH /api/communities/{community_id}": ("name", "description", "rules"),
+        "POST /api/communities/{community_id}/join": ("message",),
+        "POST /api/communities/{community_id}/announcements": ("title", "content"),
+        "PATCH /api/communities/{community_id}/announcements/{announcement_id}": (
+            "title",
+            "content",
+        ),
+        "POST /api/communities/{community_id}/bans": ("reason",),
+        "POST /api/communities/{community_id}/chat/messages": ("content",),
+        "POST /api/comic/events": (
+            "name",
+            "venue",
+            "ticket_info",
+            "website",
+            "intro",
+        ),
+        "PUT /api/comic/events/{event_id}": (
+            "name",
+            "venue",
+            "ticket_info",
+            "website",
+            "intro",
+        ),
+        "POST /api/comic/events/{event_id}/comments": ("content",),
+        "POST /api/roles/apply": (
+            "reason",
+            "application_text",
+            "contact_info",
+            "extra_note",
+            "portfolio_links[]",
+        ),
+        "PUT /api/roles/profiles/coser": (
+            "cosname",
+            "bio",
+            "styles",
+            "city",
+            "social_links",
+        ),
+        "PUT /api/roles/profiles/photographer": (
+            "equipment",
+            "styles",
+            "city",
+            "social_links",
+        ),
+        "PUT /api/roles/profiles/service": (
+            "service_type",
+            "description",
+            "city",
+            "price_info",
+        ),
+        "POST /api/roles/applications/{application_id}/approve": (
+            "review_comment",
+        ),
+        "POST /api/roles/applications/{application_id}/reject": (
+            "review_comment",
+        ),
+        "POST /api/roles/applications/{application_id}/suspend": (
+            "review_comment",
+        ),
+        "POST /role-applications/{application_id}/approve": ("review_comment",),
+        "POST /role-applications/{application_id}/reject": ("review_comment",),
+        "POST /role-applications/{application_id}/suspend": ("review_comment",),
+        "POST /api/topics": ("name", "description"),
+        "PUT /api/topics/{topic_id}": ("description",),
+        "POST /api/reports": ("reason",),
+        "POST /api/reports/post": ("reason",),
+        "POST /api/reports/comment": ("reason",),
+        "POST /api/reports/user": ("reason",),
     }
+
+    assert len(MODERATED_TEXT_FIELDS) == 34
+    assert MODERATED_TEXT_FIELDS == expected
 
 
 def test_inventory_has_no_media_fields_and_explicitly_records_exclusions():
     flattened = {field for fields in MODERATED_TEXT_FIELDS.values() for field in fields}
-    media_fields = {"image", "video", "avatar_url", "banner_url", "proof_images"}
+    media_fields = {
+        "image",
+        "video",
+        "avatar_url",
+        "banner_url",
+        "proof_images",
+        "media_url",
+        "video_url",
+        "image_urls",
+        "cover_photo_url",
+        "portfolio_images",
+    }
 
-    assert not flattened.intersection(media_fields)
+    assert flattened.isdisjoint(media_fields)
     assert set(EXCLUDED_TEXT_INPUTS) == {
         "POST /api/auth/register",
         "POST /api/auth/login",
@@ -292,21 +356,41 @@ def test_inventory_has_no_media_fields_and_explicitly_records_exclusions():
         "read-only queries",
         "system-generated text",
     }
-    assert {"email", "password", "email_code"} <= set(
-        EXCLUDED_TEXT_INPUTS["POST /api/auth/register"]
-    )
-    assert {"media_url", "avatar_url", "banner_url", "cover_photo_url"} <= set(
-        EXCLUDED_TEXT_INPUTS["message media metadata"]
-    )
-    assert {"proof_images", "portfolio_images"} <= set(
-        EXCLUDED_TEXT_INPUTS["role media evidence"]
-    )
-    assert {"keyword", "search_query", "pagination", "sort"} <= set(
-        EXCLUDED_TEXT_INPUTS["read-only queries"]
-    )
     assert {
+        endpoint: EXCLUDED_TEXT_INPUTS[endpoint]
+        for endpoint in (
+            "POST /api/auth/register",
+            "POST /api/auth/login",
+            "POST /api/auth/change-password",
+            "POST /api/auth/forgot-password",
+            "POST /api/auth/reset-password",
+        )
+    } == {
+        "POST /api/auth/register": ("email", "password", "email_code"),
+        "POST /api/auth/login": ("login", "email", "password", "email_code"),
+        "POST /api/auth/change-password": ("old_password", "new_password"),
+        "POST /api/auth/forgot-password": ("email",),
+        "POST /api/auth/reset-password": ("email", "code", "new_password"),
+    }
+    assert EXCLUDED_TEXT_INPUTS["message media metadata"] == (
+        "media_url",
+        "avatar_url",
+        "banner_url",
+        "cover_photo_url",
+    )
+    assert EXCLUDED_TEXT_INPUTS["role media evidence"] == (
+        "proof_images",
+        "portfolio_images",
+    )
+    assert EXCLUDED_TEXT_INPUTS["read-only queries"] == (
+        "keyword",
+        "search_query",
+        "pagination",
+        "sort",
+    )
+    assert EXCLUDED_TEXT_INPUTS["system-generated text"] == (
         "friend_acceptance_hi",
         "community_welcome_message",
         "notification_text",
         "recall_notice",
-    } <= set(EXCLUDED_TEXT_INPUTS["system-generated text"])
+    )
