@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime, Float, ForeignKey,
-    Table, Index, func, UniqueConstraint
+    Table, Index, func, UniqueConstraint, CheckConstraint
 )
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -743,19 +743,77 @@ class SearchHistory(Base):
 
 
 class SensitiveWord(Base):
-    """敏感词模型"""
+    """Versioned dynamic moderation rule."""
     __tablename__ = 'sensitive_words'
+    __table_args__ = (
+        UniqueConstraint(
+            'word', 'match_type', name='uq_sensitive_word_expression_type'
+        ),
+        CheckConstraint(
+            "match_type IN ('literal','regex')",
+            name='ck_sensitive_word_match_type',
+        ),
+        CheckConstraint(
+            "category IN ('sexual','violence','illegal','abuse','hate','spam','privacy','other')",
+            name='ck_sensitive_word_category',
+        ),
+        CheckConstraint(
+            "severity IN ('low','medium','high')",
+            name='ck_sensitive_word_severity',
+        ),
+        Index('ix_sensitive_word_active_version', 'is_active', 'row_version'),
+    )
 
     id = Column(Integer, primary_key=True)
-    word = Column(String(100), nullable=False, unique=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    word = Column(String(500), nullable=False)
+    match_type = Column(String(16), nullable=False, default='literal')
+    category = Column(String(32), nullable=False, default='other')
+    severity = Column(String(16), nullable=False, default='medium')
+    is_active = Column(Boolean, nullable=False, default=True)
+    row_version = Column(Integer, nullable=False, default=1)
+    created_by = Column(
+        Integer,
+        ForeignKey('users.id', name='fk_sensitive_words_creator'),
+        nullable=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
     def to_dict(self):
         return {
             'id': self.id,
             'word': self.word,
+            'match_type': self.match_type,
+            'category': self.category,
+            'severity': self.severity,
+            'is_active': bool(self.is_active),
+            'row_version': self.row_version,
+            'created_by': self.created_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class SensitiveWordVersion(Base):
+    """Singleton row used to invalidate cached moderation rules."""
+    __tablename__ = 'sensitive_word_versions'
+    __table_args__ = (
+        CheckConstraint('id = 1', name='ck_sensitive_word_version_singleton'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
 
 # ============================================================
