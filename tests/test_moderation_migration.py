@@ -1,4 +1,6 @@
 import importlib.util
+import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,112 @@ def _constraint_names(table, constraint_type):
         for constraint in table.constraints
         if isinstance(constraint, constraint_type)
     }
+
+
+def _normalize_reflected_check(sqltext):
+    return re.sub(r"[\s`\"\[\]()]", "", sqltext).lower()
+
+
+def _create_legacy_schema(engine, *, include_created_at=True):
+    legacy = sa.MetaData()
+    sa.Table(
+        "users",
+        legacy,
+        sa.Column("id", sa.Integer(), primary_key=True),
+    )
+    columns = [
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("word", sa.String(length=100), nullable=False, unique=True),
+    ]
+    if include_created_at:
+        columns.append(sa.Column("created_at", sa.DateTime(), nullable=True))
+    sensitive_words = sa.Table("sensitive_words", legacy, *columns)
+    legacy.create_all(engine)
+    return sensitive_words
+
+
+def _assert_upgraded_sqlite_schema(connection):
+    inspector = sa.inspect(connection)
+    sensitive_word_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("sensitive_words")
+    }
+    assert set(sensitive_word_columns) == {
+        "id",
+        "word",
+        "match_type",
+        "category",
+        "severity",
+        "is_active",
+        "row_version",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }
+    assert sensitive_word_columns["word"]["type"].length == 500
+    assert sensitive_word_columns["created_by"]["nullable"] is True
+    assert all(
+        not sensitive_word_columns[name]["nullable"]
+        for name in (
+            "id",
+            "word",
+            "match_type",
+            "category",
+            "severity",
+            "is_active",
+            "row_version",
+            "created_at",
+            "updated_at",
+        )
+    )
+
+    unique_constraints = inspector.get_unique_constraints("sensitive_words")
+    assert [
+        (constraint["name"], constraint["column_names"])
+        for constraint in unique_constraints
+    ] == [("uq_sensitive_word_expression_type", ["word", "match_type"])]
+    reflected_checks = {
+        check["name"]: _normalize_reflected_check(check["sqltext"])
+        for check in inspector.get_check_constraints("sensitive_words")
+    }
+    assert reflected_checks == {
+        "ck_sensitive_word_match_type": "match_typein'literal','regex'",
+        "ck_sensitive_word_category": (
+            "categoryin'sexual','violence','illegal','abuse','hate','spam','privacy','other'"
+        ),
+        "ck_sensitive_word_severity": "severityin'low','medium','high'",
+    }
+    foreign_keys = inspector.get_foreign_keys("sensitive_words")
+    assert len(foreign_keys) == 1
+    assert {
+        key: foreign_keys[0][key]
+        for key in (
+            "name",
+            "constrained_columns",
+            "referred_table",
+            "referred_columns",
+        )
+    } == {
+        "name": "fk_sensitive_words_creator",
+        "constrained_columns": ["created_by"],
+        "referred_table": "users",
+        "referred_columns": ["id"],
+    }
+    assert {
+        index["name"]: index["column_names"]
+        for index in inspector.get_indexes("sensitive_words")
+    } == {"ix_sensitive_word_active_version": ["is_active", "row_version"]}
+
+    version_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("sensitive_word_versions")
+    }
+    assert set(version_columns) == {"id", "version", "updated_at"}
+    assert all(not version_columns[name]["nullable"] for name in version_columns)
+    assert {
+        check["name"]: _normalize_reflected_check(check["sqltext"])
+        for check in inspector.get_check_constraints("sensitive_word_versions")
+    } == {"ck_sensitive_word_version_singleton": "id=1"}
 
 
 def test_sensitive_word_model_has_exact_versioned_rule_shape():
@@ -178,9 +286,10 @@ def test_migration_is_locked_to_the_observed_single_head():
     assert migration.depends_on is None
 
 
-def test_migration_backfill_statements_compile_for_mysql_and_sqlite():
+def test_migration_backfill_sql_compilation_contract_for_mysql_and_sqlite_dialects():
     migration = _load_migration()
 
+    # This checks dialect SQL compilation only; it is not a real MySQL round trip.
     for dialect in (mysql.dialect(), sqlite.dialect()):
         sql = str(
             migration._backfill_sensitive_words_statement().compile(
@@ -302,7 +411,10 @@ def test_migration_source_preserves_rows_and_reverses_dependencies_safely():
     ) < downgrade_source.index("_alter_word_length(connection, 100)")
     downgrade_entry = downgrade_source[downgrade_source.index("def downgrade") :]
     assert downgrade_entry.index(
-        'drop_table("sensitive_word_versions")'
+        "_assert_word_length_safe_for_downgrade"
+    ) < downgrade_entry.index('drop_table("sensitive_word_versions")')
+    assert downgrade_entry.index(
+        "_assert_word_length_safe_for_downgrade"
     ) < downgrade_entry.index("_downgrade_sensitive_words")
     assert downgrade_source.index(
         'drop_constraint(\n                "fk_sensitive_words_creator"'
@@ -313,7 +425,113 @@ def test_migration_source_preserves_rows_and_reverses_dependencies_safely():
     assert "create_unique_constraint" in downgrade_source
 
 
-def test_migration_round_trips_legacy_rows_on_temporary_sqlite(monkeypatch):
+def test_real_sqlite_upgrade_reflects_and_enforces_migration_contract(monkeypatch):
+    migration = _load_migration()
+    engine = sa.create_engine("sqlite://")
+
+    @sa.event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    sensitive_words = _create_legacy_schema(engine)
+    with engine.begin() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        connection.execute(
+            sensitive_words.insert().values(id=7, word="legacy", created_at=None)
+        )
+        context = MigrationContext.configure(connection)
+        monkeypatch.setattr(migration, "op", Operations(context))
+        migration.upgrade()
+
+        _assert_upgraded_sqlite_schema(connection)
+        reflected = sa.MetaData()
+        upgraded_words = sa.Table(
+            "sensitive_words", reflected, autoload_with=connection
+        )
+        versions = sa.Table(
+            "sensitive_word_versions", reflected, autoload_with=connection
+        )
+        now = datetime(2026, 7, 21, 12, 0, 0)
+        valid_word = {
+            "word": "duplicate",
+            "match_type": "literal",
+            "category": "other",
+            "severity": "medium",
+            "is_active": True,
+            "row_version": 1,
+            "created_by": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        connection.execute(upgraded_words.insert().values(**valid_word))
+
+        invalid_words = [
+            {**valid_word, "word": "bad-match", "match_type": "glob"},
+            {**valid_word, "word": "bad-category", "category": "unknown"},
+            {**valid_word, "word": "bad-severity", "severity": "critical"},
+            valid_word,
+            {**valid_word, "word": "missing-creator", "created_by": 999},
+        ]
+        for invalid_word in invalid_words:
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(upgraded_words.insert().values(**invalid_word))
+
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(
+                    versions.insert().values(id=2, version=2, updated_at=now)
+                )
+
+        assert connection.execute(
+            sa.select(sa.func.count()).select_from(upgraded_words)
+        ).scalar_one() == 2
+        assert connection.execute(
+            sa.select(sa.func.count()).select_from(versions)
+        ).scalar_one() == 1
+
+
+def test_real_sqlite_failed_downgrade_is_atomic_before_any_schema_change(monkeypatch):
+    migration = _load_migration()
+    engine = sa.create_engine("sqlite://")
+
+    @sa.event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    sensitive_words = _create_legacy_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sensitive_words.insert().values(id=7, word="legacy", created_at=None)
+        )
+        context = MigrationContext.configure(connection)
+        monkeypatch.setattr(migration, "op", Operations(context))
+        migration.upgrade()
+        connection.execute(
+            sa.text(
+                "INSERT INTO sensitive_words "
+                "(word, match_type, category, severity, is_active, row_version, "
+                "created_by, created_at, updated_at) "
+                "VALUES (:word, 'literal', 'other', 'medium', 1, 1, NULL, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"word": "x" * 101},
+        )
+
+        with pytest.raises(RuntimeError, match="exceeds 100 characters"):
+            migration.downgrade()
+
+        _assert_upgraded_sqlite_schema(connection)
+        assert connection.execute(
+            sa.text("SELECT word FROM sensitive_words WHERE length(word) = 101")
+        ).scalar_one() == "x" * 101
+
+
+def test_migration_round_trips_legacy_rows_on_real_temporary_sqlite(monkeypatch):
     migration = _load_migration()
     engine = sa.create_engine("sqlite://")
     legacy = sa.MetaData()
@@ -405,7 +623,7 @@ def test_migration_round_trips_legacy_rows_on_temporary_sqlite(monkeypatch):
         ).one() == (7, "legacy")
 
 
-def test_migration_restores_legacy_schema_when_created_at_was_missing(monkeypatch):
+def test_real_sqlite_round_trip_restores_schema_when_created_at_was_missing(monkeypatch):
     migration = _load_migration()
     engine = sa.create_engine("sqlite://")
     legacy = sa.MetaData()
