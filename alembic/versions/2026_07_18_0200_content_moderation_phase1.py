@@ -20,6 +20,32 @@ depends_on: Union[str, Sequence[str], None] = None
 _SQLITE_NAMING_CONVENTION = {
     "uq": "uq_%(table_name)s_%(column_0_name)s",
 }
+_SUPPORTED_DIALECTS = {"mysql", "sqlite"}
+_MYSQL_MINIMUM_VERSION = (8, 0, 16)
+_MYSQL_INDEX_BYTE_BUDGET = 3072
+_MYSQL_UTF8MB4_BYTES_PER_CHARACTER = 4
+_MYSQL_COMPOSITE_UNIQUE_BYTES = (
+    (500 + 16) * _MYSQL_UTF8MB4_BYTES_PER_CHARACTER
+)
+_TARGET_COLUMNS = {
+    "match_type",
+    "category",
+    "severity",
+    "is_active",
+    "row_version",
+    "created_by",
+    "updated_at",
+}
+_TARGET_OBJECT_NAMES = {
+    "uq_sensitive_word_expression_type",
+    "fk_sensitive_words_creator",
+    "ck_sensitive_word_match_type",
+    "ck_sensitive_word_category",
+    "ck_sensitive_word_severity",
+    "ck_sensitive_word_migration_added_created_at",
+    "ix_sensitive_word_active_version",
+    "ck_sensitive_word_version_singleton",
+}
 _RULE_COLUMNS = {
     "match_type": sa.String(length=16),
     "category": sa.String(length=32),
@@ -46,9 +72,17 @@ def _sensitive_words_table() -> sa.TableClause:
     )
 
 
-def _backfill_sensitive_words_statement():
+def _utc_now(dialect_name: str):
+    if dialect_name == "mysql":
+        return sa.func.utc_timestamp()
+    if dialect_name == "sqlite":
+        return sa.func.current_timestamp()
+    raise RuntimeError("unsupported database dialect for moderation migration")
+
+
+def _backfill_sensitive_words_statement(dialect_name: str):
     sensitive_words = _sensitive_words_table()
-    now = sa.func.current_timestamp()
+    now = _utc_now(dialect_name)
     created_at = sa.func.coalesce(sensitive_words.c.created_at, now)
     return sensitive_words.update().values(
         match_type="literal",
@@ -61,7 +95,7 @@ def _backfill_sensitive_words_statement():
     )
 
 
-def _insert_initial_version_statement():
+def _insert_initial_version_statement(dialect_name: str):
     versions = sa.table(
         "sensitive_word_versions",
         sa.column("id", sa.Integer()),
@@ -71,12 +105,13 @@ def _insert_initial_version_statement():
     return versions.insert().values(
         id=1,
         version=1,
-        updated_at=sa.func.current_timestamp(),
+        updated_at=_utc_now(dialect_name),
     )
 
 
-def _find_legacy_word_unique_name(connection) -> str:
-    constraints = sa.inspect(connection).get_unique_constraints("sensitive_words")
+def _find_legacy_word_unique_name(connection, inspector=None) -> str:
+    inspector = inspector or sa.inspect(connection)
+    constraints = inspector.get_unique_constraints("sensitive_words")
     matches = [
         constraint
         for constraint in constraints
@@ -97,6 +132,152 @@ def _find_legacy_word_unique_name(connection) -> str:
     raise RuntimeError("legacy sensitive_words.word unique constraint is unnamed")
 
 
+def _validate_dialect_and_version(connection) -> str:
+    dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+    if dialect_name not in _SUPPORTED_DIALECTS:
+        raise RuntimeError(
+            "unsupported database dialect for moderation migration; "
+            "only sqlite and mysql are supported"
+        )
+    if dialect_name == "mysql":
+        if getattr(connection.dialect, "is_mariadb", False):
+            raise RuntimeError(
+                "MariaDB is not supported by the moderation migration"
+            )
+        version = getattr(connection.dialect, "server_version_info", None)
+        if not version:
+            raise RuntimeError(
+                "MySQL server version is unknown; moderation migration requires "
+                "MySQL 8.0.16 or newer"
+            )
+        if tuple(version[:3]) < _MYSQL_MINIMUM_VERSION:
+            raise RuntimeError(
+                "moderation migration requires MySQL 8.0.16 or newer so CHECK "
+                "constraints are enforced"
+            )
+    return dialect_name
+
+
+def _assert_mysql_index_strategy_safe(inspector, word_column) -> None:
+    if _MYSQL_COMPOSITE_UNIQUE_BYTES > _MYSQL_INDEX_BYTE_BUDGET:
+        raise RuntimeError(
+            "moderation composite unique index exceeds the MySQL 3072-byte budget"
+        )
+
+    options = inspector.get_table_options("sensitive_words")
+    table_charset = options.get("mysql_charset") or options.get(
+        "mysql_default charset"
+    )
+    table_collation = options.get("mysql_collate")
+    column_collation = getattr(word_column["type"], "collation", None)
+    if table_charset != "utf8mb4":
+        raise RuntimeError(
+            "sensitive_words must use utf8mb4 for the moderation index budget"
+        )
+    if table_collation and not table_collation.startswith("utf8mb4_"):
+        raise RuntimeError(
+            "sensitive_words collation must use utf8mb4 for the moderation index budget"
+        )
+    if column_collation and not column_collation.startswith("utf8mb4_"):
+        raise RuntimeError(
+            "sensitive_words.word collation must use utf8mb4 for the moderation index budget"
+        )
+
+
+def _assert_target_names_available(inspector, table_names: list[str]) -> None:
+    found_names = set()
+    for table_name in table_names:
+        for getter_name in (
+            "get_unique_constraints",
+            "get_check_constraints",
+            "get_foreign_keys",
+            "get_indexes",
+        ):
+            for item in getattr(inspector, getter_name)(table_name):
+                name = item.get("name")
+                if name:
+                    found_names.add(name)
+    conflicts = found_names & _TARGET_OBJECT_NAMES
+    if conflicts:
+        raise RuntimeError(
+            "target database object name already exists for moderation migration"
+        )
+
+
+def _preflight_upgrade(connection):
+    # Front-load predictable failures before MySQL's non-transactional DDL.
+    # Permissions, connectivity, and other runtime DDL failures remain possible.
+    dialect_name = _validate_dialect_and_version(connection)
+    inspector = sa.inspect(connection)
+    table_names = inspector.get_table_names()
+    if "sensitive_words" not in table_names:
+        raise RuntimeError("required source table sensitive_words does not exist")
+    if "users" not in table_names:
+        raise RuntimeError("required source table users does not exist")
+    if "sensitive_word_versions" in table_names:
+        raise RuntimeError(
+            "target table sensitive_word_versions already exists"
+        )
+    users_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("users")
+    }
+    if "id" not in users_columns or not isinstance(
+        users_columns["id"]["type"], sa.Integer
+    ):
+        raise RuntimeError(
+            "users.id must be an integer column for the moderation creator foreign key"
+        )
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("sensitive_words")
+    }
+    required_columns = {"id", "word"}
+    if not required_columns <= columns.keys():
+        raise RuntimeError(
+            "sensitive_words source table is missing required id or word column"
+        )
+    if not isinstance(columns["id"]["type"], sa.Integer):
+        raise RuntimeError(
+            "sensitive_words.id column must be an integer before migration"
+        )
+    word_type = columns["word"]["type"]
+    if not isinstance(word_type, sa.String) or word_type.length != 100:
+        raise RuntimeError(
+            "sensitive_words.word column must be VARCHAR(100) before migration"
+        )
+    if columns["word"].get("nullable", True):
+        raise RuntimeError(
+            "sensitive_words.word column must be non-nullable before migration"
+        )
+
+    conflicts = _TARGET_COLUMNS & columns.keys()
+    if conflicts:
+        raise RuntimeError(
+            "target column already exists on sensitive_words"
+        )
+    if "created_at" in columns and not isinstance(
+        columns["created_at"]["type"], sa.DateTime
+    ):
+        raise RuntimeError(
+            "sensitive_words.created_at column must be a datetime when present"
+        )
+
+    legacy_word_unique_name = _find_legacy_word_unique_name(
+        connection, inspector
+    )
+    _assert_target_names_available(inspector, table_names)
+    if dialect_name == "mysql":
+        _assert_mysql_index_strategy_safe(inspector, columns["word"])
+
+    return {
+        "dialect_name": dialect_name,
+        "existing_columns": set(columns),
+        "legacy_word_unique_name": legacy_word_unique_name,
+    }
+
+
 def _max_word_length_statement(dialect_name: str):
     sensitive_words = _sensitive_words_table()
     length_function = (
@@ -115,6 +296,120 @@ def _assert_word_length_safe_for_downgrade(connection) -> None:
         raise RuntimeError(
             "cannot downgrade sensitive_words.word: existing value exceeds 100 characters"
         )
+
+
+def _duplicate_word_statement():
+    # GROUP BY deliberately delegates equality to the database's active collation;
+    # Python normalization would not reproduce either SQLite or MySQL semantics.
+    return sa.text(
+        "SELECT word FROM sensitive_words "
+        "GROUP BY word HAVING COUNT(*) > 1 LIMIT 1"
+    )
+
+
+def _assert_legacy_word_unique_is_expressible(connection) -> None:
+    duplicate = connection.execute(_duplicate_word_statement()).first()
+    if duplicate is not None:
+        raise RuntimeError(
+            "cannot downgrade sensitive_words: duplicate word values cannot be "
+            "represented by the legacy unique constraint"
+        )
+
+
+def _preflight_downgrade(connection) -> bool:
+    dialect_name = _validate_dialect_and_version(connection)
+    inspector = sa.inspect(connection)
+    table_names = inspector.get_table_names()
+    if "sensitive_words" not in table_names:
+        raise RuntimeError(
+            "required downgrade source table sensitive_words does not exist"
+        )
+    if "sensitive_word_versions" not in table_names:
+        raise RuntimeError(
+            "required downgrade source table sensitive_word_versions does not exist"
+        )
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("sensitive_words")
+    }
+    expected_columns = {"id", "word", "created_at"} | set(_RULE_COLUMNS)
+    if set(columns) != expected_columns:
+        raise RuntimeError(
+            "sensitive_words does not match the expected moderation downgrade schema"
+        )
+    word_type = columns["word"]["type"]
+    if not isinstance(word_type, sa.String) or word_type.length != 500:
+        raise RuntimeError(
+            "sensitive_words.word must be VARCHAR(500) before moderation downgrade"
+        )
+
+    unique_constraints = inspector.get_unique_constraints("sensitive_words")
+    if not any(
+        constraint.get("name") == "uq_sensitive_word_expression_type"
+        and list(constraint.get("column_names") or ())
+        == ["word", "match_type"]
+        for constraint in unique_constraints
+    ):
+        raise RuntimeError(
+            "required moderation unique constraint is missing before downgrade"
+        )
+    check_names = {
+        constraint.get("name")
+        for constraint in inspector.get_check_constraints("sensitive_words")
+    }
+    required_checks = {
+        "ck_sensitive_word_match_type",
+        "ck_sensitive_word_category",
+        "ck_sensitive_word_severity",
+    }
+    if not required_checks <= check_names:
+        raise RuntimeError(
+            "required moderation check constraint is missing before downgrade"
+        )
+    if not any(
+        foreign_key.get("name") == "fk_sensitive_words_creator"
+        and list(foreign_key.get("constrained_columns") or ()) == ["created_by"]
+        and foreign_key.get("referred_table") == "users"
+        and list(foreign_key.get("referred_columns") or ()) == ["id"]
+        for foreign_key in inspector.get_foreign_keys("sensitive_words")
+    ):
+        raise RuntimeError(
+            "required moderation foreign key is missing before downgrade"
+        )
+    if not any(
+        index.get("name") == "ix_sensitive_word_active_version"
+        and list(index.get("column_names") or ())
+        == ["is_active", "row_version"]
+        for index in inspector.get_indexes("sensitive_words")
+    ):
+        raise RuntimeError(
+            "required moderation index is missing before downgrade"
+        )
+
+    version_columns = {
+        column["name"]
+        for column in inspector.get_columns("sensitive_word_versions")
+    }
+    if version_columns != {"id", "version", "updated_at"}:
+        raise RuntimeError(
+            "sensitive_word_versions does not match the expected downgrade schema"
+        )
+    if not any(
+        constraint.get("name") == "ck_sensitive_word_version_singleton"
+        for constraint in inspector.get_check_constraints(
+            "sensitive_word_versions"
+        )
+    ):
+        raise RuntimeError(
+            "required moderation version check constraint is missing before downgrade"
+        )
+
+    if dialect_name == "mysql":
+        _assert_mysql_index_strategy_safe(inspector, columns["word"])
+    _assert_word_length_safe_for_downgrade(connection)
+    _assert_legacy_word_unique_is_expressible(connection)
+    return "ck_sensitive_word_migration_added_created_at" in check_names
 
 
 def _add_nullable_rule_columns(existing_columns: set[str]) -> None:
@@ -271,19 +566,17 @@ def _upgrade_constraints_and_nullability(
 
 def upgrade() -> None:
     connection = op.get_bind()
-    inspector = sa.inspect(connection)
-    existing_columns = {
-        column["name"] for column in inspector.get_columns("sensitive_words")
-    }
+    preflight = _preflight_upgrade(connection)
+    dialect_name = preflight["dialect_name"]
+    existing_columns = preflight["existing_columns"]
     created_at_was_missing = "created_at" not in existing_columns
-    legacy_word_unique_name = _find_legacy_word_unique_name(connection)
 
     _add_nullable_rule_columns(existing_columns)
     _alter_word_length(connection, 500)
-    connection.execute(_backfill_sensitive_words_statement())
+    connection.execute(_backfill_sensitive_words_statement(dialect_name))
     _upgrade_constraints_and_nullability(
         connection,
-        legacy_word_unique_name,
+        preflight["legacy_word_unique_name"],
         created_at_was_missing,
     )
 
@@ -297,7 +590,7 @@ def upgrade() -> None:
             name="ck_sensitive_word_version_singleton",
         ),
     )
-    connection.execute(_insert_initial_version_statement())
+    connection.execute(_insert_initial_version_statement(dialect_name))
 
 
 def _created_at_was_added_by_upgrade(connection) -> bool:
@@ -409,8 +702,7 @@ def _downgrade_sensitive_words(
 
 def downgrade() -> None:
     connection = op.get_bind()
-    _assert_word_length_safe_for_downgrade(connection)
-    created_at_was_added = _created_at_was_added_by_upgrade(connection)
+    created_at_was_added = _preflight_downgrade(connection)
     op.drop_table("sensitive_word_versions")
     _downgrade_sensitive_words(connection, created_at_was_added)
     _alter_word_length(connection, 100)
