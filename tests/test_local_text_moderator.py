@@ -54,6 +54,11 @@ def test_unicode_zero_width_case_and_whitespace_are_normalized():
     assert normalize_text("") == ""
 
 
+def test_all_default_ignorable_code_points_are_removed_without_dropping_spaces():
+    assert normalize_text("Ａ\u2063Ｂ\u034fＣ") == "abc"
+    assert normalize_text("foo bar") == "foo bar"
+
+
 @pytest.mark.parametrize(
     ("text", "category"),
     [
@@ -73,6 +78,52 @@ def test_baseline_categories_are_preserved(text, category):
     assert result.severity is Severity.HIGH
     assert result.confidence == 1.0
     assert result.matched_rule_ids == ()
+
+
+@pytest.mark.parametrize("text", ["黄\u2063色网站", "黄 色 网 站"])
+def test_obfuscated_cjk_baseline_literals_are_rejected(text):
+    result = LocalTextModerator(empty_snapshot).moderate(text)
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.risk_category is RiskCategory.SEXUAL
+
+
+@pytest.mark.parametrize("text", ["something", "paradox", "escorted", "前meth后"])
+def test_ascii_baseline_literals_do_not_match_inside_words(text):
+    result = LocalTextModerator(empty_snapshot).moderate(text)
+
+    assert result.decision is ModerationDecision.APPROVE
+    assert result.risk_category is RiskCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        ("meth", RiskCategory.ILLEGAL),
+        ("dox", RiskCategory.ABUSE),
+        ("escort", RiskCategory.SEXUAL),
+        ("kill yourself", RiskCategory.ABUSE),
+    ],
+)
+def test_standalone_ascii_baseline_literals_are_rejected(text, category):
+    result = LocalTextModerator(empty_snapshot).moderate(text)
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.risk_category is category
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        ("去死，恐怖袭击", RiskCategory.VIOLENCE),
+        ("种族歧视，去死", RiskCategory.HATE),
+    ],
+)
+def test_baseline_group_priority_is_strict(text, category):
+    result = LocalTextModerator(empty_snapshot).moderate(text)
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.risk_category is category
 
 
 @pytest.mark.parametrize("text", ["normal fictional text", "", "普通的 Unicode 文本"])
@@ -189,6 +240,51 @@ def test_dynamic_literal_uses_current_snapshot_and_records_actual_integer_id():
     assert result.severity is Severity.MEDIUM
     assert result.rule_version == 21
     assert result.matched_rule_ids == (12,)
+
+
+def test_dynamic_cjk_literal_matches_unicode_whitespace_between_characters():
+    dynamic_rule = rule(
+        rule_id=13,
+        expression="禁止词",
+        match_type="literal",
+        category=RiskCategory.PRIVACY,
+        severity=Severity.MEDIUM,
+    )
+    snapshot = ModerationSnapshot(
+        version=21,
+        literal_rules=(dynamic_rule,),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+
+    result = LocalTextModerator(lambda: snapshot).moderate("这是禁\u3000止\t词内容")
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.risk_category is RiskCategory.PRIVACY
+    assert result.severity is Severity.MEDIUM
+    assert result.matched_rule_ids == (13,)
+
+
+def test_dynamic_english_literal_keeps_substring_semantics():
+    dynamic_rule = rule(
+        rule_id=14,
+        expression="custom",
+        match_type="literal",
+        category=RiskCategory.PRIVACY,
+    )
+    snapshot = ModerationSnapshot(
+        version=21,
+        literal_rules=(dynamic_rule,),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+
+    result = LocalTextModerator(lambda: snapshot).moderate("customized")
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.matched_rule_ids == (14,)
 
 
 def test_dynamic_regex_uses_third_party_regex_and_records_no_id_for_none():

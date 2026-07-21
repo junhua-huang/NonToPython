@@ -12,7 +12,9 @@ from app.services.moderation_types import (
 )
 
 
-_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
+_REGEX_TIMEOUT = 0.02
+_DEFAULT_IGNORABLE = regex.compile(r"\p{Default_Ignorable_Code_Point}+")
+_HAS_CJK = regex.compile(r"\p{Script=Han}")
 _BASELINE_LITERAL_GROUPS = (
     (
         frozenset(
@@ -67,11 +69,6 @@ _BASELINE_LITERAL_GROUPS = (
         Severity.HIGH,
     ),
     (
-        frozenset({"kill yourself", "去死", "弄死你", "人肉", "人身攻击", "dox"}),
-        RiskCategory.ABUSE,
-        Severity.HIGH,
-    ),
-    (
         frozenset(
             {
                 "杀人",
@@ -104,6 +101,11 @@ _BASELINE_LITERAL_GROUPS = (
         RiskCategory.HATE,
         Severity.HIGH,
     ),
+    (
+        frozenset({"kill yourself", "去死", "弄死你", "人肉", "人身攻击", "dox"}),
+        RiskCategory.ABUSE,
+        Severity.HIGH,
+    ),
 )
 _SPAM = regex.compile(
     r"(?:加\s*(?:微\s*信|v)|wx)\s*[:：-]?\s*[a-z0-9_-]{5,}",
@@ -113,8 +115,23 @@ _HATE = regex.compile(r"(?:全部|都)\s*(?:滚|去死)", regex.IGNORECASE)
 
 
 def normalize_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", text).translate(_ZERO_WIDTH).casefold()
-    return " ".join(normalized.split())
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = _DEFAULT_IGNORABLE.sub("", normalized, timeout=_REGEX_TIMEOUT)
+    return " ".join(normalized.casefold().split())
+
+
+def _literal_matches(text: str, expression: str, *, baseline: bool) -> bool:
+    literal = normalize_text(expression)
+    if _HAS_CJK.search(literal, timeout=_REGEX_TIMEOUT):
+        characters = [character for character in literal if not character.isspace()]
+        pattern = r"\s*".join(regex.escape(character) for character in characters)
+        return bool(regex.search(pattern, text, timeout=_REGEX_TIMEOUT))
+    if baseline and literal.isascii() and all(
+        character.isalnum() or character.isspace() for character in literal
+    ):
+        pattern = rf"(?<![\p{{L}}\p{{N}}]){regex.escape(literal)}(?![\p{{L}}\p{{N}}])"
+        return bool(regex.search(pattern, text, timeout=_REGEX_TIMEOUT))
+    return literal in text
 
 
 class LocalTextModerator:
@@ -133,23 +150,25 @@ class LocalTextModerator:
         matched_rule_ids: list[int] = []
 
         for literals, literal_category, literal_severity in _BASELINE_LITERAL_GROUPS:
-            if any(literal in normalized for literal in literals):
+            if any(
+                _literal_matches(normalized, literal, baseline=True)
+                for literal in literals
+            ):
                 category = literal_category
                 severity = literal_severity
                 break
         else:
-            if _SPAM.search(normalized, timeout=0.02):
+            if _SPAM.search(normalized, timeout=_REGEX_TIMEOUT):
                 category = RiskCategory.SPAM
                 severity = Severity.MEDIUM
                 confidence = 0.98
-            elif _HATE.search(normalized, timeout=0.02):
+            elif _HATE.search(normalized, timeout=_REGEX_TIMEOUT):
                 category = RiskCategory.HATE
                 severity = Severity.HIGH
                 confidence = 0.98
             else:
                 for rule in snapshot.literal_rules:
-                    expression = normalize_text(rule.expression)
-                    if expression in normalized:
+                    if _literal_matches(normalized, rule.expression, baseline=False):
                         category = rule.category
                         severity = rule.severity
                         confidence = 1.0
@@ -161,7 +180,9 @@ class LocalTextModerator:
                 else:
                     for compiled_rule in snapshot.regex_rules:
                         rule = compiled_rule.rule
-                        if compiled_rule.pattern.search(normalized, timeout=0.02):
+                        if compiled_rule.pattern.search(
+                            normalized, timeout=_REGEX_TIMEOUT
+                        ):
                             category = rule.category
                             severity = rule.severity
                             confidence = 0.99
