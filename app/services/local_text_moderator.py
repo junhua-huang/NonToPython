@@ -1,5 +1,10 @@
+import threading
+import time
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import regex
 
@@ -13,8 +18,14 @@ from app.services.moderation_types import (
 
 
 _REGEX_TIMEOUT = 0.02
+_DYNAMIC_EVALUATION_BUDGET = 0.1
+_DYNAMIC_LITERAL_CACHE_SIZE = 8
 _DEFAULT_IGNORABLE = regex.compile(r"\p{Default_Ignorable_Code_Point}+")
-_HAS_CJK = regex.compile(r"\p{Script=Han}")
+_HAS_EAST_ASIAN = regex.compile(
+    r"[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}"
+    r"\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}]"
+)
+_WORD_CHARACTER = r"\p{L}\p{M}\p{N}\p{Connector_Punctuation}"
 _BASELINE_LITERAL_GROUPS = (
     (
         frozenset(
@@ -120,26 +131,99 @@ def normalize_text(text: str) -> str:
     return " ".join(normalized.casefold().split())
 
 
-def _literal_matches(text: str, expression: str, *, baseline: bool) -> bool:
+@dataclass(frozen=True, slots=True)
+class _LiteralMatcher:
+    literal: str
+    pattern: Any | None = None
+    ignores_whitespace: bool = False
+
+    def matches(self, text: str, text_without_whitespace: str | None = None) -> bool:
+        if self.pattern is not None:
+            return bool(self.pattern.search(text, timeout=_REGEX_TIMEOUT))
+        if self.ignores_whitespace:
+            compact_text = (
+                text.replace(" ", "")
+                if text_without_whitespace is None
+                else text_without_whitespace
+            )
+            return self.literal in compact_text
+        return self.literal in text
+
+
+def _prepare_literal_matcher(expression: str, *, baseline: bool) -> _LiteralMatcher:
     literal = normalize_text(expression)
-    if _HAS_CJK.search(literal, timeout=_REGEX_TIMEOUT):
-        characters = [character for character in literal if not character.isspace()]
-        pattern = r"\s*".join(regex.escape(character) for character in characters)
-        return bool(regex.search(pattern, text, timeout=_REGEX_TIMEOUT))
+    if not literal:
+        raise ValueError("literal rule must not normalize to empty")
+    if _HAS_EAST_ASIAN.search(literal, timeout=_REGEX_TIMEOUT):
+        return _LiteralMatcher(literal.replace(" ", ""), ignores_whitespace=True)
     if baseline and literal.isascii() and all(
         character.isalnum() or character.isspace() for character in literal
     ):
-        pattern = rf"(?<![\p{{L}}\p{{N}}]){regex.escape(literal)}(?![\p{{L}}\p{{N}}])"
-        return bool(regex.search(pattern, text, timeout=_REGEX_TIMEOUT))
-    return literal in text
+        pattern = regex.compile(
+            rf"(?<![{_WORD_CHARACTER}]){regex.escape(literal)}"
+            rf"(?![{_WORD_CHARACTER}])"
+        )
+        return _LiteralMatcher(literal, pattern)
+    return _LiteralMatcher(literal)
+
+
+def _literal_matches(text: str, expression: str, *, baseline: bool) -> bool:
+    return _prepare_literal_matcher(expression, baseline=baseline).matches(text)
+
+
+_PREPARED_BASELINE_LITERAL_GROUPS = tuple(
+    (
+        tuple(
+            _prepare_literal_matcher(literal, baseline=True) for literal in literals
+        ),
+        category,
+        severity,
+    )
+    for literals, category, severity in _BASELINE_LITERAL_GROUPS
+)
 
 
 class LocalTextModerator:
-    def __init__(self, snapshot_provider: Callable[[], ModerationSnapshot]):
+    def __init__(
+        self,
+        snapshot_provider: Callable[[], ModerationSnapshot],
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
         self._snapshot_provider = snapshot_provider
+        self._monotonic = monotonic
+        self._dynamic_literal_cache: OrderedDict[
+            int, tuple[ModerationSnapshot, tuple[_LiteralMatcher, ...]]
+        ] = OrderedDict()
+        self._dynamic_literal_cache_lock = threading.Lock()
+
+    def _dynamic_literal_matchers(
+        self, snapshot: ModerationSnapshot
+    ) -> tuple[_LiteralMatcher, ...]:
+        cache_key = id(snapshot)
+        with self._dynamic_literal_cache_lock:
+            cached = self._dynamic_literal_cache.get(cache_key)
+            if cached is not None and cached[0] is snapshot:
+                self._dynamic_literal_cache.move_to_end(cache_key)
+                return cached[1]
+
+            matchers = tuple(
+                _prepare_literal_matcher(rule.expression, baseline=False)
+                for rule in snapshot.literal_rules
+            )
+            self._dynamic_literal_cache[cache_key] = (snapshot, matchers)
+            self._dynamic_literal_cache.move_to_end(cache_key)
+            while len(self._dynamic_literal_cache) > _DYNAMIC_LITERAL_CACHE_SIZE:
+                self._dynamic_literal_cache.popitem(last=False)
+            return matchers
+
+    def _check_dynamic_budget(self, started_at: float) -> None:
+        if self._monotonic() - started_at > _DYNAMIC_EVALUATION_BUDGET:
+            raise TimeoutError("dynamic moderation rule evaluation timed out")
 
     def moderate(self, text: str) -> ModerationResult:
         normalized = normalize_text(text)
+        normalized_without_whitespace = normalized.replace(" ", "")
         snapshot = self._snapshot_provider()
         if type(snapshot) is not ModerationSnapshot:
             raise TypeError("snapshot provider must return ModerationSnapshot")
@@ -148,11 +232,16 @@ class LocalTextModerator:
         severity = None
         confidence = 1.0
         matched_rule_ids: list[int] = []
+        started_at = self._monotonic()
+        literal_matchers = self._dynamic_literal_matchers(snapshot)
+        self._check_dynamic_budget(started_at)
 
-        for literals, literal_category, literal_severity in _BASELINE_LITERAL_GROUPS:
+        for matchers, literal_category, literal_severity in (
+            _PREPARED_BASELINE_LITERAL_GROUPS
+        ):
             if any(
-                _literal_matches(normalized, literal, baseline=True)
-                for literal in literals
+                matcher.matches(normalized, normalized_without_whitespace)
+                for matcher in matchers
             ):
                 category = literal_category
                 severity = literal_severity
@@ -167,8 +256,13 @@ class LocalTextModerator:
                 severity = Severity.HIGH
                 confidence = 0.98
             else:
-                for rule in snapshot.literal_rules:
-                    if _literal_matches(normalized, rule.expression, baseline=False):
+                for rule, matcher in zip(snapshot.literal_rules, literal_matchers):
+                    self._check_dynamic_budget(started_at)
+                    matched = matcher.matches(
+                        normalized, normalized_without_whitespace
+                    )
+                    self._check_dynamic_budget(started_at)
+                    if matched:
                         category = rule.category
                         severity = rule.severity
                         confidence = 1.0
@@ -179,10 +273,13 @@ class LocalTextModerator:
                         break
                 else:
                     for compiled_rule in snapshot.regex_rules:
+                        self._check_dynamic_budget(started_at)
                         rule = compiled_rule.rule
-                        if compiled_rule.pattern.search(
+                        matched = compiled_rule.pattern.search(
                             normalized, timeout=_REGEX_TIMEOUT
-                        ):
+                        )
+                        self._check_dynamic_budget(started_at)
+                        if matched:
                             category = rule.category
                             severity = rule.severity
                             confidence = 0.99

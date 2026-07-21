@@ -1,6 +1,12 @@
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import regex
 
+import app.services.local_text_moderator as local_text_moderator
 from app.services.local_text_moderator import LocalTextModerator, normalize_text
 from app.services.moderation_errors import ContentRejected, ModerationUnavailable
 from app.services.moderation_service import ModerationService
@@ -88,8 +94,23 @@ def test_obfuscated_cjk_baseline_literals_are_rejected(text):
     assert result.risk_category is RiskCategory.SEXUAL
 
 
-@pytest.mark.parametrize("text", ["something", "paradox", "escorted", "前meth后"])
-def test_ascii_baseline_literals_do_not_match_inside_words(text):
+@pytest.mark.parametrize(
+    "text",
+    [
+        "something",
+        "paradox",
+        "escorted",
+        "前meth后",
+        "xxx_file",
+        "nude_palette",
+        "fake id_number",
+        "xxx\u20dd",
+        "λxxx",
+        "xxxλ",
+        "xxx١",
+    ],
+)
+def test_ascii_baseline_literals_do_not_match_inside_unicode_words(text):
     result = LocalTextModerator(empty_snapshot).moderate(text)
 
     assert result.decision is ModerationDecision.APPROVE
@@ -217,6 +238,34 @@ def test_regex_runtime_timeout_is_fail_closed_and_uses_locked_timeout():
     assert "redacted" not in caught.value.public_message
 
 
+@pytest.mark.parametrize(
+    "expression", ["", " \t\n ", "\u2063\u034f\u200b"]
+)
+@pytest.mark.parametrize("body", ["harmless private body", "porn"])
+def test_dynamic_literal_normalizing_to_empty_is_unavailable_without_leaking_rule(
+    expression, body
+):
+    private_rule_text = expression + "private-rule-marker"
+    dynamic_rule = rule(rule_id=11, expression=expression, match_type="literal")
+    snapshot = ModerationSnapshot(
+        version=20,
+        literal_rules=(dynamic_rule,),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+
+    with pytest.raises(ModerationUnavailable) as caught:
+        ModerationService(LocalTextModerator(lambda: snapshot)).moderate_text(
+            body, CONTEXT
+        )
+
+    assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
+    assert caught.value.public_message == "内容审核服务暂不可用，请稍后重试"
+    assert body not in caught.value.public_message
+    assert private_rule_text not in caught.value.public_message
+
+
 def test_dynamic_literal_uses_current_snapshot_and_records_actual_integer_id():
     dynamic_rule = rule(
         rule_id=12,
@@ -242,10 +291,21 @@ def test_dynamic_literal_uses_current_snapshot_and_records_actual_integer_id():
     assert result.matched_rule_ids == (12,)
 
 
-def test_dynamic_cjk_literal_matches_unicode_whitespace_between_characters():
+@pytest.mark.parametrize(
+    ("expression", "text"),
+    [
+        ("禁止词", "这是禁\u3000止\t词内容"),
+        ("カジノ", "オンラインカ ジ ノ広告"),
+        ("도박", "불법 도 박 광고"),
+        ("赌カ박", "混合赌 カ 박广告"),
+    ],
+)
+def test_dynamic_east_asian_literal_matches_unicode_whitespace_between_characters(
+    expression, text
+):
     dynamic_rule = rule(
         rule_id=13,
-        expression="禁止词",
+        expression=expression,
         match_type="literal",
         category=RiskCategory.PRIVACY,
         severity=Severity.MEDIUM,
@@ -258,7 +318,7 @@ def test_dynamic_cjk_literal_matches_unicode_whitespace_between_characters():
         verified_at=1.0,
     )
 
-    result = LocalTextModerator(lambda: snapshot).moderate("这是禁\u3000止\t词内容")
+    result = LocalTextModerator(lambda: snapshot).moderate(text)
 
     assert result.decision is ModerationDecision.REJECT
     assert result.risk_category is RiskCategory.PRIVACY
@@ -285,6 +345,227 @@ def test_dynamic_english_literal_keeps_substring_semantics():
 
     assert result.decision is ModerationDecision.REJECT
     assert result.matched_rule_ids == (14,)
+
+
+def test_dynamic_literal_matchers_are_prepared_once_for_large_snapshot(
+    monkeypatch,
+):
+    prepare_calls = Counter()
+    original_prepare = local_text_moderator._prepare_literal_matcher
+
+    def counting_prepare(expression, *, baseline):
+        prepare_calls[expression] += 1
+        return original_prepare(expression, baseline=baseline)
+
+    monkeypatch.setattr(
+        local_text_moderator, "_prepare_literal_matcher", counting_prepare
+    )
+    dynamic_rules = tuple(
+        rule(
+            rule_id=index,
+            expression=f"动态禁词{index}",
+            match_type="literal",
+            category=RiskCategory.PRIVACY,
+        )
+        for index in range(600)
+    )
+    snapshot = ModerationSnapshot(
+        version=30,
+        literal_rules=dynamic_rules,
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    moderator = LocalTextModerator(lambda: snapshot)
+
+    started = time.perf_counter()
+    first = moderator.moderate("ordinary harmless text")
+    first_elapsed = time.perf_counter() - started
+    started = time.perf_counter()
+    second = moderator.moderate("ordinary harmless text")
+    second_elapsed = time.perf_counter() - started
+
+    assert first.decision is ModerationDecision.APPROVE
+    assert second.decision is ModerationDecision.APPROVE
+    assert sum(prepare_calls.values()) == 600
+    assert max(prepare_calls.values()) == 1
+    assert first_elapsed < 1.5
+    assert second_elapsed < 0.5
+
+
+def test_dynamic_literal_cache_keys_by_snapshot_identity_not_version():
+    first_rule = rule(rule_id=31, expression="first-private-rule", match_type="literal")
+    second_rule = rule(rule_id=32, expression="second-private-rule", match_type="literal")
+    first_snapshot = ModerationSnapshot(
+        version=44,
+        literal_rules=(first_rule,),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    second_snapshot = ModerationSnapshot(
+        version=44,
+        literal_rules=(second_rule,),
+        regex_rules=(),
+        loaded_at=2.0,
+        verified_at=2.0,
+    )
+    snapshots = iter((first_snapshot, second_snapshot))
+    moderator = LocalTextModerator(lambda: next(snapshots))
+
+    assert moderator.moderate("first-private-rule").matched_rule_ids == (31,)
+    assert moderator.moderate("second-private-rule").matched_rule_ids == (32,)
+
+
+def test_dynamic_literal_cache_is_thread_safe_and_bounded(monkeypatch):
+    prepare_count = 0
+    prepare_count_lock = threading.Lock()
+    original_prepare = local_text_moderator._prepare_literal_matcher
+
+    def counting_prepare(expression, *, baseline):
+        nonlocal prepare_count
+        with prepare_count_lock:
+            prepare_count += 1
+        return original_prepare(expression, baseline=baseline)
+
+    monkeypatch.setattr(
+        local_text_moderator, "_prepare_literal_matcher", counting_prepare
+    )
+    shared_snapshot = ModerationSnapshot(
+        version=50,
+        literal_rules=tuple(
+            rule(rule_id=index, expression=f"shared-{index}", match_type="literal")
+            for index in range(25)
+        ),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    moderator = LocalTextModerator(lambda: shared_snapshot)
+    barrier = threading.Barrier(8)
+
+    def moderate_once():
+        barrier.wait()
+        return moderator.moderate("ordinary harmless text").decision
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        decisions = tuple(executor.map(lambda _: moderate_once(), range(8)))
+
+    assert decisions == (ModerationDecision.APPROVE,) * 8
+    assert prepare_count == 25
+
+    for index in range(local_text_moderator._DYNAMIC_LITERAL_CACHE_SIZE + 5):
+        current = ModerationSnapshot(
+            version=index,
+            literal_rules=(
+                rule(
+                    rule_id=index,
+                    expression=f"bounded-{index}",
+                    match_type="literal",
+                ),
+            ),
+            regex_rules=(),
+            loaded_at=float(index),
+            verified_at=float(index),
+        )
+        moderator._snapshot_provider = lambda current=current: current
+        moderator.moderate("ordinary harmless text")
+
+    assert len(moderator._dynamic_literal_cache) <= (
+        local_text_moderator._DYNAMIC_LITERAL_CACHE_SIZE
+    )
+
+
+def test_whole_dynamic_evaluation_budget_fails_closed_without_sleep():
+    class AdvancingClock:
+        def __init__(self):
+            self.now = -0.03
+
+        def __call__(self):
+            self.now += 0.03
+            return self.now
+
+    class FastNonMatchingPattern:
+        def __init__(self):
+            self.searches = 0
+            self.timeouts = []
+
+        def search(self, text, timeout):
+            self.searches += 1
+            self.timeouts.append(timeout)
+            return None
+
+    patterns = tuple(FastNonMatchingPattern() for _ in range(20))
+    regex_rules = tuple(
+        CompiledRegexRule(
+            rule=rule(rule_id=index, expression=f"private-regex-{index}", match_type="regex"),
+            pattern=pattern,
+        )
+        for index, pattern in enumerate(patterns)
+    )
+    snapshot = ModerationSnapshot(
+        version=60,
+        literal_rules=(),
+        regex_rules=regex_rules,
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+
+    with pytest.raises(ModerationUnavailable) as caught:
+        ModerationService(
+            LocalTextModerator(lambda: snapshot, monotonic=AdvancingClock())
+        ).moderate_text("harmless private body", CONTEXT)
+
+    searched = [pattern for pattern in patterns if pattern.searches]
+    assert 0 < len(searched) < len(patterns)
+    assert {timeout for pattern in searched for timeout in pattern.timeouts} == {0.02}
+    assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
+    assert caught.value.public_message == "内容审核服务暂不可用，请稍后重试"
+    assert "private-regex" not in caught.value.public_message
+    assert "harmless private body" not in caught.value.public_message
+
+
+def test_dynamic_budget_is_checked_after_last_rule_evaluation():
+    class ControlledClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class BudgetConsumingPattern:
+        def __init__(self, clock):
+            self.clock = clock
+
+        def search(self, text, timeout):
+            self.clock.now = local_text_moderator._DYNAMIC_EVALUATION_BUDGET + 0.01
+            return None
+
+    clock = ControlledClock()
+    private_expression = "last-private-regex"
+    dynamic_rule = rule(
+        rule_id=61, expression=private_expression, match_type="regex"
+    )
+    snapshot = ModerationSnapshot(
+        version=61,
+        literal_rules=(),
+        regex_rules=(
+            CompiledRegexRule(
+                rule=dynamic_rule,
+                pattern=BudgetConsumingPattern(clock),
+            ),
+        ),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+
+    with pytest.raises(ModerationUnavailable) as caught:
+        ModerationService(
+            LocalTextModerator(lambda: snapshot, monotonic=clock)
+        ).moderate_text("harmless private body", CONTEXT)
+
+    assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
+    assert private_expression not in caught.value.public_message
+    assert "harmless private body" not in caught.value.public_message
 
 
 def test_dynamic_regex_uses_third_party_regex_and_records_no_id_for_none():
