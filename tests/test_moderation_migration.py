@@ -722,16 +722,55 @@ class _PreflightDialect:
         self.is_mariadb = is_mariadb
 
 
+class _PreflightScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class _PreflightMappingResult:
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def mappings(self):
+        return self
+
+    def one_or_none(self):
+        return self.mapping
+
+
 class _PreflightConnection:
     def __init__(
-        self, dialect_name="sqlite", server_version_info=None, *, is_mariadb=False
+        self,
+        dialect_name="sqlite",
+        server_version_info=None,
+        *,
+        is_mariadb=False,
+        innodb_page_size=16384,
+        effective_table_options=None,
     ):
         self.dialect = _PreflightDialect(
             dialect_name, server_version_info, is_mariadb=is_mariadb
         )
+        self.innodb_page_size = innodb_page_size
+        self.effective_table_options = effective_table_options or {}
+        self.read_queries = []
 
-    def execute(self, _statement):
-        raise AssertionError("upgrade preflight must not execute SQL")
+    def execute(self, statement, parameters=None):
+        sql = str(statement).lower()
+        parameters = parameters or {}
+        self.read_queries.append((sql, parameters))
+        if "@@innodb_page_size" in sql:
+            return _PreflightScalarResult(self.innodb_page_size)
+        if "information_schema.tables" in sql:
+            assert ":table_name" in sql
+            assert set(parameters) == {"table_name"}
+            return _PreflightMappingResult(
+                self.effective_table_options.get(parameters["table_name"])
+            )
+        raise AssertionError("upgrade preflight executed unexpected SQL")
 
 
 class _PreflightOperations:
@@ -751,8 +790,32 @@ class _PreflightOperations:
 
 
 class _UpgradeInspector:
-    def __init__(self, mode="valid"):
+    def __init__(
+        self,
+        mode="valid",
+        *,
+        users_id_type=None,
+        users_id_nullable=False,
+        users_pk=None,
+        users_uniques=None,
+        users_indexes=None,
+        table_options=None,
+    ):
         self.mode = mode
+        self.users_id_type = users_id_type or mysql.INTEGER()
+        self.users_id_nullable = users_id_nullable
+        self.users_pk = users_pk if users_pk is not None else {"constrained_columns": ["id"]}
+        self.users_uniques = users_uniques or []
+        self.users_indexes = users_indexes or []
+        self.table_options = table_options or {
+            "sensitive_words": {
+                "mysql_engine": "InnoDB",
+                "mysql_row_format": "DYNAMIC",
+                "mysql_charset": "utf8mb4",
+                "mysql_collate": "utf8mb4_unicode_ci",
+            },
+            "users": {"mysql_engine": "InnoDB"},
+        }
 
     def get_table_names(self):
         tables = ["users", "sensitive_words"]
@@ -766,8 +829,18 @@ class _UpgradeInspector:
 
     def get_columns(self, table_name):
         if table_name == "users":
-            user_id_type = sa.String(20) if self.mode == "bad_user_id_type" else sa.Integer()
-            return [{"name": "id", "type": user_id_type, "nullable": False}]
+            user_id_type = (
+                sa.String(20)
+                if self.mode == "bad_user_id_type"
+                else self.users_id_type
+            )
+            return [
+                {
+                    "name": "id",
+                    "type": user_id_type,
+                    "nullable": self.users_id_nullable,
+                }
+            ]
         if table_name == "other_table":
             return [{"name": "id", "type": sa.Integer(), "nullable": False}]
         columns = [
@@ -785,6 +858,11 @@ class _UpgradeInspector:
             )
         return columns
 
+    def get_pk_constraint(self, table_name):
+        if table_name == "users":
+            return self.users_pk
+        return {"constrained_columns": ["id"]}
+
     def get_unique_constraints(self, table_name):
         if table_name == "sensitive_words":
             legacy = [{"name": "uq_legacy", "column_names": ["word"]}]
@@ -793,6 +871,8 @@ class _UpgradeInspector:
             if self.mode == "two_legacy_uniques":
                 legacy.append({"name": "uq_legacy_2", "column_names": ["word"]})
             return legacy
+        if table_name == "users":
+            return self.users_uniques
         if table_name == "other_table" and self.mode == "constraint_name":
             return [
                 {
@@ -811,18 +891,19 @@ class _UpgradeInspector:
         return []
 
     def get_indexes(self, table_name):
+        if table_name == "users":
+            return self.users_indexes
         if table_name == "other_table" and self.mode == "index_name":
             return [{"name": "ix_sensitive_word_active_version"}]
         return []
 
     def get_table_options(self, table_name):
-        assert table_name == "sensitive_words"
-        if self.mode == "bad_charset":
-            return {"mysql_charset": "utf8", "mysql_collate": "utf8_general_ci"}
-        return {
-            "mysql_charset": "utf8mb4",
-            "mysql_collate": "utf8mb4_unicode_ci",
-        }
+        options = dict(self.table_options.get(table_name, {}))
+        if table_name == "sensitive_words" and self.mode == "bad_charset":
+            options.update(
+                {"mysql_charset": "utf8", "mysql_collate": "utf8_general_ci"}
+            )
+        return options
 
 
 @pytest.mark.parametrize(
@@ -956,3 +1037,262 @@ def test_mysql_index_budget_and_utf8mb4_table_strategy_are_preflighted(monkeypat
         migration.upgrade()
 
     assert operations.ddl_calls == []
+
+
+def _run_failed_mysql_upgrade(monkeypatch, inspector, connection, match):
+    migration = _load_migration()
+    operations = _PreflightOperations(connection)
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration.sa, "inspect", lambda _connection: inspector)
+
+    with pytest.raises(RuntimeError, match=match):
+        migration.upgrade()
+
+    assert operations.ddl_calls == []
+    return migration
+
+
+def test_mysql_dynamic_row_format_and_16kb_page_size_pass_preflight(monkeypatch):
+    migration = _load_migration()
+    connection = _PreflightConnection("mysql", (8, 0, 16), innodb_page_size=16384)
+    inspector = _UpgradeInspector()
+    monkeypatch.setattr(migration.sa, "inspect", lambda _connection: inspector)
+
+    preflight = migration._preflight_upgrade(connection)
+
+    assert preflight["dialect_name"] == "mysql"
+    assert any("@@innodb_page_size" in sql for sql, _ in connection.read_queries)
+
+
+@pytest.mark.parametrize("row_format", ["COMPACT", "redundant"])
+def test_mysql_legacy_row_formats_fail_before_first_ddl(
+    monkeypatch, row_format
+):
+    table_options = {
+        "sensitive_words": {
+            "mysql_engine": "InnoDB",
+            "mysql_row_format": row_format,
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+        "users": {"mysql_engine": "InnoDB"},
+    }
+    _run_failed_mysql_upgrade(
+        monkeypatch,
+        _UpgradeInspector(table_options=table_options),
+        _PreflightConnection("mysql", (8, 0, 16)),
+        "row format",
+    )
+
+
+@pytest.mark.parametrize("page_size", [4096, 8192])
+def test_mysql_insufficient_page_size_budget_fails_before_first_ddl(
+    monkeypatch, page_size
+):
+    _run_failed_mysql_upgrade(
+        monkeypatch,
+        _UpgradeInspector(),
+        _PreflightConnection(
+            "mysql", (8, 0, 16), innodb_page_size=page_size
+        ),
+        "index key byte budget",
+    )
+
+
+@pytest.mark.parametrize(
+    "table_options,page_size,match",
+    [
+        (
+            {
+                "sensitive_words": {
+                    "mysql_row_format": "DYNAMIC",
+                    "mysql_charset": "utf8mb4",
+                },
+                "users": {"mysql_engine": "InnoDB"},
+            },
+            16384,
+            "storage engine",
+        ),
+        (
+            {
+                "sensitive_words": {
+                    "mysql_engine": "InnoDB",
+                    "mysql_charset": "utf8mb4",
+                },
+                "users": {"mysql_engine": "InnoDB"},
+            },
+            16384,
+            "row format",
+        ),
+        (
+            {
+                "sensitive_words": {
+                    "mysql_engine": "InnoDB",
+                    "mysql_row_format": "DYNAMIC",
+                    "mysql_charset": "utf8mb4",
+                },
+                "users": {},
+            },
+            16384,
+            "storage engine",
+        ),
+        (
+            {
+                "sensitive_words": {
+                    "mysql_engine": "InnoDB",
+                    "mysql_row_format": "DYNAMIC",
+                    "mysql_charset": "utf8mb4",
+                },
+                "users": {"mysql_engine": "InnoDB"},
+            },
+            None,
+            "page size",
+        ),
+        (
+            {
+                "sensitive_words": {
+                    "mysql_engine": "InnoDB",
+                    "mysql_row_format": "DYNAMIC",
+                    "mysql_charset": "utf8mb4",
+                },
+                "users": {"mysql_engine": "InnoDB"},
+            },
+            12288,
+            "page size",
+        ),
+    ],
+)
+def test_mysql_unknown_capabilities_fail_closed_before_first_ddl(
+    monkeypatch, table_options, page_size, match
+):
+    _run_failed_mysql_upgrade(
+        monkeypatch,
+        _UpgradeInspector(table_options=table_options),
+        _PreflightConnection(
+            "mysql", (8, 0, 16), innodb_page_size=page_size
+        ),
+        match,
+    )
+
+
+def test_mysql_default_row_format_uses_parameterized_effective_metadata(monkeypatch):
+    migration = _load_migration()
+    table_options = {
+        "sensitive_words": {
+            "mysql_engine": "InnoDB",
+            "mysql_row_format": "DEFAULT",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+        "users": {"mysql_engine": "InnoDB"},
+    }
+    connection = _PreflightConnection(
+        "mysql",
+        (8, 0, 16),
+        effective_table_options={
+            "sensitive_words": {"ENGINE": "InnoDB", "ROW_FORMAT": "Dynamic"}
+        },
+    )
+    monkeypatch.setattr(
+        migration.sa,
+        "inspect",
+        lambda _connection: _UpgradeInspector(table_options=table_options),
+    )
+
+    migration._preflight_upgrade(connection)
+
+    metadata_queries = [
+        (sql, parameters)
+        for sql, parameters in connection.read_queries
+        if "information_schema.tables" in sql
+    ]
+    assert metadata_queries == [
+        (
+            metadata_queries[0][0],
+            {"table_name": "sensitive_words"},
+        )
+    ]
+    assert "sensitive_words" not in metadata_queries[0][0]
+
+
+@pytest.mark.parametrize(
+    "users_id_type",
+    [mysql.BIGINT(), mysql.SMALLINT(), mysql.INTEGER(unsigned=True)],
+    ids=["bigint", "smallint", "unsigned"],
+)
+def test_mysql_fk_rejects_incompatible_users_id_type_before_first_ddl(
+    monkeypatch, users_id_type
+):
+    _run_failed_mysql_upgrade(
+        monkeypatch,
+        _UpgradeInspector(users_id_type=users_id_type),
+        _PreflightConnection("mysql", (8, 0, 16)),
+        "signed INTEGER",
+    )
+
+
+def test_mysql_fk_accepts_signed_integer_with_id_leading_index(monkeypatch):
+    migration = _load_migration()
+    inspector = _UpgradeInspector(
+        users_id_type=mysql.INTEGER(unsigned=False),
+        users_pk={"constrained_columns": []},
+        users_indexes=[
+            {"name": "ix_users_id_tenant", "column_names": ["id", "tenant_id"]}
+        ],
+    )
+    connection = _PreflightConnection("mysql", (8, 0, 16))
+    monkeypatch.setattr(migration.sa, "inspect", lambda _connection: inspector)
+
+    assert migration._preflight_upgrade(connection)["dialect_name"] == "mysql"
+
+
+@pytest.mark.parametrize(
+    "inspector,match",
+    [
+        (_UpgradeInspector(users_id_nullable=True), "NOT NULL"),
+        (
+            _UpgradeInspector(
+                users_pk={"constrained_columns": []},
+                users_uniques=[{"column_names": ["tenant_id", "id"]}],
+                users_indexes=[{"column_names": ["email", "id"]}],
+            ),
+            "referencable index",
+        ),
+        (
+            _UpgradeInspector(
+                table_options={
+                    "sensitive_words": {
+                        "mysql_engine": "MyISAM",
+                        "mysql_row_format": "DYNAMIC",
+                        "mysql_charset": "utf8mb4",
+                    },
+                    "users": {"mysql_engine": "MyISAM"},
+                }
+            ),
+            "InnoDB",
+        ),
+        (
+            _UpgradeInspector(
+                table_options={
+                    "sensitive_words": {
+                        "mysql_engine": "InnoDB",
+                        "mysql_row_format": "DYNAMIC",
+                        "mysql_charset": "utf8mb4",
+                    },
+                    "users": {"mysql_engine": "MyISAM"},
+                }
+            ),
+            "InnoDB",
+        ),
+    ],
+    ids=["nullable", "no-index", "myisam", "engine-mismatch"],
+)
+def test_mysql_fk_schema_incompatibility_fails_before_first_ddl(
+    monkeypatch, inspector, match
+):
+    _run_failed_mysql_upgrade(
+        monkeypatch,
+        inspector,
+        _PreflightConnection("mysql", (8, 0, 16)),
+        match,
+    )

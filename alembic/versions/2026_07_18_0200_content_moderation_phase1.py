@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql
 
 
 revision: str = "2026_07_18_0200"
@@ -158,6 +159,120 @@ def _validate_dialect_and_version(connection) -> str:
     return dialect_name
 
 
+def _mysql_option(options, *names):
+    normalized = {
+        str(key).lower().replace(" ", "_"): value
+        for key, value in (options or {}).items()
+    }
+    for name in names:
+        value = normalized.get(name)
+        if value is not None:
+            return str(value).strip()
+    return None
+
+
+def _read_mysql_effective_table_options(connection, table_name: str):
+    statement = sa.text(
+        "SELECT ENGINE AS engine, ROW_FORMAT AS row_format "
+        "FROM information_schema.tables "
+        "WHERE table_schema = DATABASE() AND table_name = :table_name"
+    )
+    try:
+        row = connection.execute(
+            statement, {"table_name": table_name}
+        ).mappings().one_or_none()
+    except Exception:
+        raise RuntimeError(
+            "unable to verify MySQL table storage capabilities"
+        ) from None
+    if row is None:
+        return {}
+    return {str(key).lower(): value for key, value in row.items()}
+
+
+def _mysql_storage_options(
+    connection, inspector, table_name: str, *, require_row_format: bool
+):
+    try:
+        options = inspector.get_table_options(table_name) or {}
+    except Exception:
+        raise RuntimeError(
+            "unable to verify MySQL table storage capabilities"
+        ) from None
+
+    engine = _mysql_option(options, "mysql_engine", "engine")
+    row_format = _mysql_option(
+        options, "mysql_row_format", "row_format"
+    )
+    if engine is None or (
+        require_row_format
+        and (row_format is None or row_format.upper() == "DEFAULT")
+    ):
+        effective = _read_mysql_effective_table_options(connection, table_name)
+        engine = engine or _mysql_option(effective, "engine")
+        if require_row_format and (
+            row_format is None or row_format.upper() == "DEFAULT"
+        ):
+            row_format = _mysql_option(effective, "row_format")
+    return options, engine, row_format
+
+
+def _mysql_index_byte_budget(connection) -> int:
+    try:
+        page_size = connection.execute(
+            sa.text("SELECT @@innodb_page_size")
+        ).scalar_one()
+    except Exception:
+        raise RuntimeError(
+            "unable to verify MySQL InnoDB page size"
+        ) from None
+    if type(page_size) is not int or page_size not in {
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+    }:
+        raise RuntimeError("MySQL InnoDB page size is unknown or unsupported")
+    if page_size == 4096:
+        return 768
+    if page_size == 8192:
+        return 1536
+    return _MYSQL_INDEX_BYTE_BUDGET
+
+
+def _assert_mysql_users_id_fk_compatible(inspector, users_id_column) -> None:
+    users_id_type = users_id_column.get("type")
+    if type(users_id_type) is not mysql.INTEGER or bool(
+        getattr(users_id_type, "unsigned", False)
+    ):
+        raise RuntimeError(
+            "users.id must be a signed INTEGER for the MySQL moderation foreign key"
+        )
+    if users_id_column.get("nullable") is not False:
+        raise RuntimeError(
+            "users.id must be NOT NULL for the moderation foreign key"
+        )
+
+    try:
+        key_definitions = [inspector.get_pk_constraint("users")]
+        key_definitions.extend(inspector.get_unique_constraints("users"))
+        key_definitions.extend(inspector.get_indexes("users"))
+    except Exception:
+        raise RuntimeError(
+            "unable to verify the MySQL users.id referencable index"
+        ) from None
+    if not any(
+        list(key.get("constrained_columns") or key.get("column_names") or ())[:1]
+        == ["id"]
+        for key in key_definitions
+        if isinstance(key, dict)
+    ):
+        raise RuntimeError(
+            "users.id must lead a MySQL referencable index"
+        )
+
+
 def _assert_mysql_index_strategy_safe(inspector, word_column) -> None:
     if _MYSQL_COMPOSITE_UNIQUE_BYTES > _MYSQL_INDEX_BYTE_BUDGET:
         raise RuntimeError(
@@ -165,23 +280,73 @@ def _assert_mysql_index_strategy_safe(inspector, word_column) -> None:
         )
 
     options = inspector.get_table_options("sensitive_words")
-    table_charset = options.get("mysql_charset") or options.get(
-        "mysql_default charset"
+    table_charset = _mysql_option(
+        options, "mysql_charset", "mysql_default_charset"
     )
-    table_collation = options.get("mysql_collate")
+    table_collation = _mysql_option(options, "mysql_collate")
     column_collation = getattr(word_column["type"], "collation", None)
-    if table_charset != "utf8mb4":
+    if not table_charset or table_charset.lower() != "utf8mb4":
         raise RuntimeError(
             "sensitive_words must use utf8mb4 for the moderation index budget"
         )
-    if table_collation and not table_collation.startswith("utf8mb4_"):
+    if table_collation and not table_collation.lower().startswith("utf8mb4_"):
         raise RuntimeError(
             "sensitive_words collation must use utf8mb4 for the moderation index budget"
         )
-    if column_collation and not column_collation.startswith("utf8mb4_"):
+    if column_collation and not column_collation.lower().startswith("utf8mb4_"):
         raise RuntimeError(
             "sensitive_words.word collation must use utf8mb4 for the moderation index budget"
         )
+
+
+def _assert_mysql_upgrade_capabilities(
+    connection, inspector, word_column, users_id_column
+) -> None:
+    sensitive_options, sensitive_engine, row_format = _mysql_storage_options(
+        connection,
+        inspector,
+        "sensitive_words",
+        require_row_format=True,
+    )
+    _, users_engine, _ = _mysql_storage_options(
+        connection, inspector, "users", require_row_format=False
+    )
+    if not sensitive_engine or not users_engine:
+        raise RuntimeError("MySQL table storage engine is unknown")
+    if sensitive_engine.lower() != "innodb" or users_engine.lower() != "innodb":
+        raise RuntimeError(
+            "sensitive_words and users must both use InnoDB"
+        )
+    if not row_format:
+        raise RuntimeError("sensitive_words MySQL row format is unknown")
+    if row_format.upper() not in {"DYNAMIC", "COMPRESSED"}:
+        raise RuntimeError(
+            "sensitive_words MySQL row format must support large index prefixes"
+        )
+
+    table_charset = _mysql_option(
+        sensitive_options, "mysql_charset", "mysql_default_charset"
+    )
+    table_collation = _mysql_option(sensitive_options, "mysql_collate")
+    column_collation = getattr(word_column["type"], "collation", None)
+    if not table_charset or table_charset.lower() != "utf8mb4":
+        raise RuntimeError(
+            "sensitive_words must use utf8mb4 for the moderation index budget"
+        )
+    if table_collation and not table_collation.lower().startswith("utf8mb4_"):
+        raise RuntimeError(
+            "sensitive_words collation must use utf8mb4 for the moderation index budget"
+        )
+    if column_collation and not column_collation.lower().startswith("utf8mb4_"):
+        raise RuntimeError(
+            "sensitive_words.word collation must use utf8mb4 for the moderation index budget"
+        )
+
+    if _MYSQL_COMPOSITE_UNIQUE_BYTES > _mysql_index_byte_budget(connection):
+        raise RuntimeError(
+            "moderation composite unique index exceeds the MySQL index key byte budget"
+        )
+    _assert_mysql_users_id_fk_compatible(inspector, users_id_column)
 
 
 def _assert_target_names_available(inspector, table_names: list[str]) -> None:
@@ -269,7 +434,12 @@ def _preflight_upgrade(connection):
     )
     _assert_target_names_available(inspector, table_names)
     if dialect_name == "mysql":
-        _assert_mysql_index_strategy_safe(inspector, columns["word"])
+        _assert_mysql_upgrade_capabilities(
+            connection,
+            inspector,
+            columns["word"],
+            users_columns["id"],
+        )
 
     return {
         "dialect_name": dialect_name,
