@@ -241,7 +241,7 @@ def test_regex_runtime_timeout_is_fail_closed_and_uses_locked_timeout():
 def test_dynamic_regex_timeout_is_capped_by_remaining_evaluation_budget():
     class SequenceClock:
         def __init__(self):
-            self.values = iter((0.0, 0.0, 0.099, 0.099))
+            self.values = iter((0.0, 0.0, 0.099, 0.099, 0.099, 0.099))
 
         def __call__(self):
             return next(self.values)
@@ -429,6 +429,118 @@ def test_dynamic_literal_matchers_are_prepared_once_for_large_snapshot(
     assert second_elapsed < 0.5
 
 
+def test_timed_out_literal_matcher_build_is_not_cached(monkeypatch):
+    class ExpiringClock:
+        def __init__(self):
+            self.available = False
+            self.calls = 0
+
+        def __call__(self):
+            if self.available:
+                return 1.0
+            values = (0.0, 0.03, 0.06, 0.11)
+            value = values[min(self.calls, len(values) - 1)]
+            self.calls += 1
+            return value
+
+    expressions = tuple(f"private-literal-{index}" for index in range(3))
+    dynamic_rules = tuple(
+        rule(rule_id=index, expression=expression, match_type="literal")
+        for index, expression in enumerate(expressions)
+    )
+    snapshot = ModerationSnapshot(
+        version=40,
+        literal_rules=dynamic_rules,
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    prepared = []
+    original_prepare = local_text_moderator._prepare_literal_matcher
+
+    def recording_prepare(expression, *, baseline):
+        prepared.append(expression)
+        return original_prepare(expression, baseline=baseline)
+
+    monkeypatch.setattr(
+        local_text_moderator, "_prepare_literal_matcher", recording_prepare
+    )
+    clock = ExpiringClock()
+    moderator = LocalTextModerator(
+        lambda: snapshot, monotonic=clock, _cache_lock=threading.Lock()
+    )
+    service = ModerationService(moderator)
+
+    with pytest.raises(ModerationUnavailable) as caught:
+        service.moderate_text(expressions[-1], CONTEXT)
+
+    assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
+    assert prepared == [expressions[0]]
+
+    clock.available = True
+    result = moderator.moderate(expressions[-1])
+
+    assert result.decision is ModerationDecision.REJECT
+    assert result.matched_rule_ids == (2,)
+    assert prepared == [expressions[0], *expressions]
+
+
+def test_cached_literal_matcher_lock_contention_fails_closed_within_budget(
+    monkeypatch,
+):
+    monkeypatch.setattr(local_text_moderator, "_DYNAMIC_EVALUATION_BUDGET", 0.02)
+    snapshot = ModerationSnapshot(
+        version=41,
+        literal_rules=(
+            rule(rule_id=41, expression="private-cached-literal", match_type="literal"),
+        ),
+        regex_rules=(),
+        loaded_at=1.0,
+        verified_at=1.0,
+    )
+    moderation_started = threading.Event()
+
+    def snapshot_provider():
+        moderation_started.set()
+        return snapshot
+
+    moderator = LocalTextModerator(snapshot_provider)
+    moderator.moderate("ordinary harmless text")
+    moderation_started.clear()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_cache_lock():
+        with moderator._dynamic_literal_cache_lock:
+            lock_held.set()
+            release_lock.wait()
+
+    holder = threading.Thread(target=hold_cache_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(timeout=1.0)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(
+            ModerationService(moderator).moderate_text,
+            "ordinary harmless text",
+            CONTEXT,
+        )
+        assert moderation_started.wait(timeout=1.0)
+        started = time.perf_counter()
+        with pytest.raises(ModerationUnavailable) as caught:
+            future.result(timeout=0.25)
+        elapsed = time.perf_counter() - started
+    finally:
+        release_lock.set()
+        holder.join(timeout=1.0)
+        executor.shutdown(wait=True)
+
+    assert not holder.is_alive()
+    assert elapsed < 0.25
+    assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
+
+
 def test_dynamic_literal_cache_keys_by_snapshot_identity_not_version():
     first_rule = rule(rule_id=31, expression="first-private-rule", match_type="literal")
     second_rule = rule(rule_id=32, expression="second-private-rule", match_type="literal")
@@ -515,10 +627,10 @@ def test_dynamic_literal_cache_is_thread_safe_and_bounded(monkeypatch):
 def test_whole_dynamic_evaluation_budget_fails_closed_without_sleep():
     class AdvancingClock:
         def __init__(self):
-            self.now = -0.03
+            self.now = -0.02
 
         def __call__(self):
-            self.now += 0.03
+            self.now += 0.02
             return self.now
 
     class FastNonMatchingPattern:
@@ -554,7 +666,7 @@ def test_whole_dynamic_evaluation_budget_fails_closed_without_sleep():
 
     searched = [pattern for pattern in patterns if pattern.searches]
     assert 0 < len(searched) < len(patterns)
-    assert {timeout for pattern in searched for timeout in pattern.timeouts} == {0.02}
+    assert searched[0].timeouts == [pytest.approx(0.02)]
     assert caught.value.error_code.value == "MODERATION_UNAVAILABLE"
     assert caught.value.public_message == "内容审核服务暂不可用，请稍后重试"
     assert "private-regex" not in caught.value.public_message

@@ -4,7 +4,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import regex
 
@@ -183,39 +183,65 @@ _PREPARED_BASELINE_LITERAL_GROUPS = tuple(
 )
 
 
+class _CacheLock(Protocol):
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool: ...
+
+    def release(self) -> None: ...
+
+
 class LocalTextModerator:
     def __init__(
         self,
         snapshot_provider: Callable[[], ModerationSnapshot],
         *,
         monotonic: Callable[[], float] = time.monotonic,
+        _cache_lock: _CacheLock | None = None,
     ):
         self._snapshot_provider = snapshot_provider
         self._monotonic = monotonic
         self._dynamic_literal_cache: OrderedDict[
             int, tuple[ModerationSnapshot, tuple[_LiteralMatcher, ...]]
         ] = OrderedDict()
-        self._dynamic_literal_cache_lock = threading.Lock()
+        self._dynamic_literal_cache_lock = (
+            threading.RLock() if _cache_lock is None else _cache_lock
+        )
 
     def _dynamic_literal_matchers(
-        self, snapshot: ModerationSnapshot
+        self, snapshot: ModerationSnapshot, deadline: float
     ) -> tuple[_LiteralMatcher, ...]:
-        cache_key = id(snapshot)
-        with self._dynamic_literal_cache_lock:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("dynamic moderation rule evaluation timed out")
+        if not self._dynamic_literal_cache_lock.acquire(timeout=remaining):
+            raise TimeoutError("dynamic moderation rule evaluation timed out")
+
+        try:
+            self._check_dynamic_deadline(deadline)
+            cache_key = id(snapshot)
             cached = self._dynamic_literal_cache.get(cache_key)
             if cached is not None and cached[0] is snapshot:
                 self._dynamic_literal_cache.move_to_end(cache_key)
                 return cached[1]
 
-            matchers = tuple(
-                _prepare_literal_matcher(rule.expression, baseline=False)
-                for rule in snapshot.literal_rules
-            )
+            candidate = []
+            for rule in snapshot.literal_rules:
+                candidate.append(
+                    _prepare_literal_matcher(rule.expression, baseline=False)
+                )
+                self._check_dynamic_deadline(deadline)
+            matchers = tuple(candidate)
+            self._check_dynamic_deadline(deadline)
             self._dynamic_literal_cache[cache_key] = (snapshot, matchers)
             self._dynamic_literal_cache.move_to_end(cache_key)
             while len(self._dynamic_literal_cache) > _DYNAMIC_LITERAL_CACHE_SIZE:
                 self._dynamic_literal_cache.popitem(last=False)
             return matchers
+        finally:
+            self._dynamic_literal_cache_lock.release()
+
+    def _check_dynamic_deadline(self, deadline: float) -> None:
+        if self._monotonic() >= deadline:
+            raise TimeoutError("dynamic moderation rule evaluation timed out")
 
     def _check_dynamic_budget(self, started_at: float) -> None:
         if self._monotonic() - started_at > _DYNAMIC_EVALUATION_BUDGET:
@@ -234,8 +260,7 @@ class LocalTextModerator:
         matched_rule_ids: list[int] = []
         started_at = self._monotonic()
         deadline = started_at + _DYNAMIC_EVALUATION_BUDGET
-        literal_matchers = self._dynamic_literal_matchers(snapshot)
-        self._check_dynamic_budget(started_at)
+        literal_matchers = self._dynamic_literal_matchers(snapshot, deadline)
 
         for matchers, literal_category, literal_severity in (
             _PREPARED_BASELINE_LITERAL_GROUPS
