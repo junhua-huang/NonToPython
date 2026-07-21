@@ -85,6 +85,8 @@ class ModerationResult:
             raise ValueError("confidence must be between 0 and 1")
         if self.decision is ModerationDecision.APPROVE and self.severity is not None:
             raise ValueError("severity must be None when decision is APPROVE")
+        if self.decision is ModerationDecision.REJECT and self.severity is None:
+            raise ValueError("rejected result must have severity")
         if type(self.policy_version) is not str:
             raise TypeError("policy_version must be str")
         if not self.policy_version:

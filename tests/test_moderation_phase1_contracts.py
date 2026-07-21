@@ -113,6 +113,18 @@ def test_result_requires_confidence_in_closed_unit_interval(confidence):
         make_result(confidence=confidence)
 
 
+def test_result_requires_rejected_result_to_have_severity():
+    with pytest.raises(ValueError, match="^rejected result must have severity$"):
+        ModerationResult(
+            decision=ModerationDecision.REJECT,
+            risk_category=RiskCategory.SPAM,
+            severity=None,
+            confidence=1.0,
+            policy_version="phase1-local-v1",
+            rule_version=1,
+        )
+
+
 def test_result_requires_approve_severity_to_be_none_and_nonempty_policy_version():
     with pytest.raises(
         ValueError, match="^severity must be None when decision is APPROVE$"
