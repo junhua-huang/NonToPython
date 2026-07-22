@@ -36,19 +36,19 @@ _ALLOWED_SEVERITIES = {"low", "medium", "high"}
 
 
 class SensitiveWordCreate(BaseModel):
-    word: str
-    match_type: str = "literal"
-    category: str = "other"
-    severity: str = "medium"
-    is_active: bool = True
+    word: object
+    match_type: object = "literal"
+    category: object = "other"
+    severity: object = "medium"
+    is_active: object = True
 
 
 class SensitiveWordPatch(BaseModel):
-    word: str | None = None
-    match_type: str | None = None
-    category: str | None = None
-    severity: str | None = None
-    is_active: bool | None = None
+    word: object | None = None
+    match_type: object | None = None
+    category: object | None = None
+    severity: object | None = None
+    is_active: object | None = None
 
 
 def _invalid_rule(message: str) -> HTTPException:
@@ -58,15 +58,15 @@ def _invalid_rule(message: str) -> HTTPException:
     )
 
 
-def _validate_metadata(category: str, severity: str) -> None:
-    if category not in {item.value for item in RiskCategory}:
+def _validate_metadata(category: object, severity: object) -> None:
+    if not isinstance(category, str) or category not in {item.value for item in RiskCategory}:
         raise _invalid_rule("风险分类无效")
-    if severity not in _ALLOWED_SEVERITIES:
+    if not isinstance(severity, str) or severity not in _ALLOWED_SEVERITIES:
         raise _invalid_rule("风险等级无效")
 
 
-def _validated_expression(word: str, match_type: str) -> str:
-    if match_type not in _ALLOWED_MATCH_TYPES:
+def _validated_expression(word: object, match_type: object) -> str:
+    if not isinstance(match_type, str) or match_type not in _ALLOWED_MATCH_TYPES:
         raise _invalid_rule("匹配类型无效")
     if not isinstance(word, str):
         raise _invalid_rule("规则内容不能为空")
@@ -80,6 +80,12 @@ def _validated_expression(word: str, match_type: str) -> str:
             return validate_safe_regex(value)
         except RegexValidationError:
             raise _invalid_rule("正则规则不安全或无效") from None
+    return value
+
+
+def _validated_is_active(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise _invalid_rule("启用状态无效")
     return value
 
 
@@ -169,13 +175,14 @@ def add_sensitive_word(
     """添加敏感词"""
     expression_value = _validated_expression(payload.word, payload.match_type)
     _validate_metadata(payload.category, payload.severity)
+    is_active = _validated_is_active(payload.is_active)
     version = _advance_rule_version(db)
     row = SensitiveWord(
         word=expression_value,
         match_type=payload.match_type,
         category=payload.category,
         severity=payload.severity,
-        is_active=payload.is_active,
+        is_active=is_active,
         row_version=version,
         created_by=user.id,
     )
@@ -204,13 +211,16 @@ def patch_sensitive_word(
     next_severity = values.get("severity", row.severity)
     expression_value = _validated_expression(next_word, next_type)
     _validate_metadata(next_category, next_severity)
+    next_is_active = None
+    if "is_active" in values:
+        next_is_active = _validated_is_active(values["is_active"])
     version = _advance_locked_rule_version(version_row, db)
     row.word = expression_value
     row.match_type = next_type
     row.category = next_category
     row.severity = next_severity
     if "is_active" in values:
-        row.is_active = values["is_active"]
+        row.is_active = next_is_active
     row.row_version = version
     row.updated_at = datetime.utcnow()
     _commit_or_conflict(db)

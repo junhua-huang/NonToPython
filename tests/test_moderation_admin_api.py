@@ -253,6 +253,26 @@ def test_regex_length_validation_does_not_echo_expression(admin_client, moderati
     assert current_version(moderation_db) == before
 
 
+def test_non_string_regex_input_does_not_echo_expression(admin_client, moderation_db):
+    expression = "PRIVATE_REGEX_OBJECT_LEAK_8812(a+)+$"
+    before = current_version(moderation_db)
+
+    response = admin_client.post(
+        CANONICAL,
+        json={
+            "word": {"pattern": expression},
+            "match_type": "regex",
+            "category": "spam",
+            "severity": "medium",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == INVALID_CODE
+    assert expression not in str(response.json())
+    assert current_version(moderation_db) == before
+
+
 def test_patch_validates_resulting_rule_before_version_mutation(
     admin_client, moderation_db, created_rule
 ):
@@ -287,6 +307,24 @@ def test_patch_rejects_explicit_null_word_before_version_mutation(
     assert current_version(moderation_db) == before
     moderation_db.refresh(created_rule)
     assert created_rule.word == "existing literal"
+    assert created_rule.row_version == before
+
+
+def test_patch_rejects_explicit_null_is_active_before_version_mutation(
+    admin_client, moderation_db, created_rule
+):
+    before = current_version(moderation_db)
+
+    response = admin_client.patch(
+        f"{CANONICAL}/{created_rule.id}",
+        json={"is_active": None},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == INVALID_CODE
+    assert current_version(moderation_db) == before
+    moderation_db.refresh(created_rule)
+    assert created_rule.is_active is True
     assert created_rule.row_version == before
 
 
