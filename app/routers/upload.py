@@ -75,7 +75,13 @@ def presign_upload(
     subfolder = _infer_subfolder(upload_type, user.id)
     count = payload.get("count", 1)
 
-    logger.info(f"[presign] user_id={user.id} upload_type={upload_type} file_type={file_type} filename={filename} subfolder={subfolder}")
+    logger.info(
+        "[presign] user_id=%s upload_type=%s file_type=%s count=%s",
+        user.id,
+        upload_type,
+        file_type,
+        count,
+    )
 
     if count < 1 or count > 20:
         raise HTTPException(status_code=400, detail="count must be between 1 and 20")
@@ -88,15 +94,15 @@ def presign_upload(
 
     # 检查是否有错误
     if "error" in first:
-        logger.error(f"[presign] COS error: {first['error']}")
-        raise HTTPException(status_code=503, detail=f"预签名生成失败: {first['error']}")
+        logger.error("[presign] COS error user_id=%s", user.id)
+        raise HTTPException(status_code=503, detail="预签名生成失败")
 
     presigned_url = first.get("upload_url", "")
     if not presigned_url:
-        logger.error(f"[presign] pre-signed URL is empty, results={results}")
+        logger.error("[presign] pre-signed URL is empty user_id=%s count=%s", user.id, len(results))
         raise HTTPException(status_code=503, detail="预签名 URL 为空，请检查 COS 配置")
 
-    logger.info(f"[presign] generated {len(results)} URL(s) for user_id={user.id}, cos_key={first.get('cos_key', 'N/A')}")
+    logger.info("[presign] generated count=%s user_id=%s", len(results), user.id)
 
     return {
         "message": f"{len(results)} presigned URL(s) generated",
@@ -119,18 +125,20 @@ def confirm_upload(
     # final_filename 为空时，用 cos_key 的原文件名兜底（cos_key 本身已是合法唯一路径）
     if cos_key and not final_filename:
         final_filename = os.path.basename(cos_key)
-        logger.info(f"[confirm] final_filename empty, falling back to cos_key basename: {final_filename}")
-    logger.info(f"[confirm] user_id={user.id} cos_key={cos_key} final_filename={final_filename}")
+        logger.info("[confirm] derived stored object basename user_id=%s", user.id)
+    has_object_ref = bool(cos_key)
+    has_name = bool(final_filename)
+    logger.info("[confirm] user_id=%s has_object_ref=%s has_name=%s", user.id, has_object_ref, has_name)
     if not cos_key or not final_filename:
         raise HTTPException(status_code=400, detail="cos_key and final_filename are required")
 
     result = FileUploader.confirm_upload(cos_key, final_filename)
     if result["success"]:
-        logger.info(f"[confirm] success, final_url={result.get('final_url')} final_cos_key={result.get('final_cos_key')}")
+        logger.info("[confirm] success user_id=%s", user.id)
         return {"message": "Upload confirmed", "url": result["final_url"], "cos_key": result["final_cos_key"]}
     else:
-        logger.error(f"[confirm] failed: {result.get('error')}")
-        raise HTTPException(status_code=500, detail=result["error"])
+        logger.error("[confirm] failed user_id=%s", user.id)
+        raise HTTPException(status_code=500, detail="Upload confirmation failed")
 
 
 @router.post("/avatar/confirm")
@@ -141,13 +149,14 @@ def confirm_avatar(
 ):
     """确认头像上传并更新用户资料"""
     avatar_url = payload.get("url")
-    logger.info(f"[avatar/confirm] user_id={user.id} url={avatar_url}")
+    has_ref = bool(avatar_url)
+    logger.info("[avatar/confirm] user_id=%s has_ref=%s", user.id, has_ref)
     if not avatar_url:
         raise HTTPException(status_code=400, detail="url is required")
 
     current_user = db.query(User).filter(User.id == user.id).first()
     if current_user:
-        logger.info(f"[avatar/confirm] updating user {user.id} avatar_url: {current_user.avatar_url} -> {avatar_url}")
+        logger.info("[avatar/confirm] updating user_id=%s", user.id)
         current_user.avatar_url = avatar_url
         db.commit()
         logger.info(f"[avatar/confirm] user {user.id} avatar updated successfully")
@@ -165,13 +174,14 @@ def confirm_cover(
 ):
     """确认封面上传并更新用户资料"""
     cover_url = payload.get("url")
-    logger.info(f"[cover/confirm] user_id={user.id} url={cover_url}")
+    has_ref = bool(cover_url)
+    logger.info("[cover/confirm] user_id=%s has_ref=%s", user.id, has_ref)
     if not cover_url:
         raise HTTPException(status_code=400, detail="url is required")
 
     current_user = db.query(User).filter(User.id == user.id).first()
     if current_user:
-        logger.info(f"[cover/confirm] updating user {user.id} cover_photo_url: {current_user.cover_photo_url} -> {cover_url}")
+        logger.info("[cover/confirm] updating user_id=%s", user.id)
         current_user.cover_photo_url = cover_url
         db.commit()
         logger.info(f"[cover/confirm] user {user.id} cover updated successfully")

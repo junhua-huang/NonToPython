@@ -474,7 +474,7 @@ class WSManager:
             return
 
         if self.is_connected(user_id):
-            logger.debug(f"[WS SEND] uid={user_id} {event} seq={seq} {json.dumps(full_payload, ensure_ascii=False)[:200]}")
+            logger.debug("[WS SEND] uid=%s event=%s seq=%s", user_id, event, seq)
 
         msg_envelope = {"type": "message", "seq": seq, "payload": full_payload}
         if self.is_connected(user_id):
@@ -508,7 +508,7 @@ class WSManager:
             return
 
         if self.is_connected(recipient_id):
-            logger.debug(f"[WS SEND] uid={recipient_id} {event} seq={seq} {json.dumps(full_payload, ensure_ascii=False)[:200]}")
+            logger.debug("[WS SEND] uid=%s event=%s seq=%s", recipient_id, event, seq)
             await self._raw_send_to_connections(recipient_id, {
                 "type": "message", "seq": seq, "payload": full_payload
             })
@@ -523,7 +523,7 @@ class WSManager:
     async def send_raw(self, user_id: int, data: dict):
         """直接发送原始 JSON。覆盖所有设备。"""
         msg_type = data.get("type", "unknown")
-        logger.debug(f"[WS SEND] uid={user_id} {msg_type} {json.dumps(data, ensure_ascii=False)[:200]}")
+        logger.debug("[WS SEND] uid=%s type=%s", user_id, msg_type)
         await self._raw_send_to_connections(user_id, data)
 
     def schedule_push(self, coro):

@@ -46,8 +46,8 @@ def verify_token(token: str) -> User:
         if user_id_raw is None:
             raise AuthError("Invalid token: missing subject", 401)
         user_id = int(user_id_raw)
-    except JWTError as e:
-        raise AuthError(f"Token invalid or expired: {str(e)}", 401)
+    except JWTError:
+        raise AuthError("Token invalid or expired", 401)
     except (ValueError, TypeError):
         raise AuthError("Invalid token format", 401)
 

@@ -188,7 +188,11 @@ async def create_post(
         return {"message": "Post created successfully", "post": post.to_dict(current_user_id=None, is_liked=False)}
     except Exception as e:
         db.rollback()
-        logger.error(f"Create post failed: {e}", exc_info=True)
+        logger.error(
+            "Create post failed user_id=%s error_type=%s",
+            current_user_id,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="An error occurred while creating the post")
 
 
@@ -350,7 +354,12 @@ def update_post(
         return {"message": "Post updated successfully", "post": post.to_dict(current_user_id=None, is_liked=is_liked)}
     except Exception as e:
         db.rollback()
-        logger.error(f"Update post failed: {e}", exc_info=True)
+        logger.error(
+            "Update post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="An error occurred while updating the post")
 
 
@@ -405,7 +414,12 @@ def delete_post(post_id: int, user: User = Depends(get_current_user), db: Sessio
         return {"message": "Post deleted successfully"}
     except Exception as e:
         db.rollback()
-        logger.error(f"Delete post failed: {e}", exc_info=True)
+        logger.error(
+            "Delete post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="An error occurred while deleting the post")
 
 
@@ -455,7 +469,12 @@ def get_user_liked_posts(
             "per_page": per_page,
         }
     except Exception as e:
-        logger.error(f"Get user liked posts failed for user_id={user_id}: {e}", exc_info=True)
+        logger.error(
+            "Get user liked posts failed user_id=%s requester_id=%s error_type=%s",
+            user_id,
+            user.id,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="An error occurred while fetching liked posts")
 
 
@@ -484,7 +503,13 @@ def record_post_view(post_id: int, user: User = Depends(get_current_user), db: S
         return {"message": "View recorded", "views": views_count, "view_count": post.view_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Record post view failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while recording the post view")
 
 
 @router.get("/{post_id}/stats")

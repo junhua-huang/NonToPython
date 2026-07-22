@@ -11,7 +11,7 @@ SENTINELS = (
     "PRIVATE_BODY_8392",
     "MATCH_4481",
     "PRIVATE_REGEX_(a+)+$",
-    "mysql://private-user:private-password@private-host/db",
+    "PRIVATE_DB_DSN_SENTINEL_2026",
 )
 
 
@@ -141,8 +141,30 @@ def test_admin_rule_crud_never_logs_rule_expression_or_exception_text():
                 )
 
 
-def test_websocket_logging_is_metadata_only():
+def test_selected_routes_do_not_return_raw_exception_text():
     paths = [
+        ROOT / "app" / "routers" / "posts.py",
+        ROOT / "app" / "routers" / "upload.py",
+    ]
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for handler in ast.walk(tree):
+            if not isinstance(handler, ast.ExceptHandler):
+                continue
+            if not isinstance(handler.type, ast.Name) or handler.type.id != "Exception":
+                continue
+            handler_source = ast.get_source_segment(source, handler) or ""
+            assert "detail=str(" not in handler_source
+            assert "detail=f\"" not in handler_source
+            assert "detail=result[\"error\"]" not in handler_source
+
+
+
+def test_realtime_and_upload_logging_is_metadata_only():
+    paths = [
+        ROOT / "app" / "routers" / "posts.py",
+        ROOT / "app" / "routers" / "upload.py",
         ROOT / "app" / "routers" / "ws.py",
         ROOT / "app" / "ws_manager.py",
     ]
@@ -155,6 +177,14 @@ def test_websocket_logging_is_metadata_only():
         "logger.exception",
         "{e}",
         "str(e)",
+        "json.dumps",
+        "results=",
+        "cos_key",
+        "final_url",
+        "filename",
+        "url=",
+        "avatar_url",
+        "cover_photo_url",
     }
 
     for path in paths:

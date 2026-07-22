@@ -2,7 +2,7 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
-from jose import jwt
+from jose import JWTError, jwt
 from fastapi import HTTPException
 
 from app.core import auth_core
@@ -80,6 +80,19 @@ def test_http_current_user_dependency_maps_disabled_account_to_contract(monkeypa
         "message": "账号已停用",
         "retryable": False,
     }
+
+
+def test_verify_token_does_not_expose_jwt_library_exception_text(monkeypatch):
+    def raise_jwt_error(*args, **kwargs):
+        raise JWTError("signature mismatch for PRIVATE_TOKEN_9137")
+
+    monkeypatch.setattr(auth_core.jwt, "decode", raise_jwt_error)
+
+    with pytest.raises(auth_core.AuthError) as exc_info:
+        auth_core.verify_token("opaque-token")
+
+    assert exc_info.value.message == "Token invalid or expired"
+    assert "PRIVATE_TOKEN_9137" not in str(exc_info.value)
 
 
 def test_role_dependency_maps_disabled_account_before_role_lookup(monkeypatch):
