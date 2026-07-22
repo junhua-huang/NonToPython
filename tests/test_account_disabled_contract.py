@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi import HTTPException
 from app.core import auth_core
 from app.core.config import Config
 from app.dependencies import get_current_user, require_admin
+from app.routers import ws
 from app.services.moderation_errors import AccountDisabled, to_http_exception
 
 
@@ -53,8 +55,9 @@ def test_account_disabled_contract_is_stable_and_safe():
     }
 
 
-def test_verify_token_rejects_inactive_user_without_returning_user(monkeypatch):
-    user = SimpleNamespace(id=3, is_active=False)
+@pytest.mark.parametrize("is_active", [False, None])
+def test_verify_token_rejects_non_active_user_without_returning_user(monkeypatch, is_active):
+    user = SimpleNamespace(id=3, is_active=is_active)
     session = FakeSession(user)
     monkeypatch.setattr(auth_core, "SessionLocal", lambda: session)
 
@@ -88,3 +91,13 @@ def test_role_dependency_maps_disabled_account_before_role_lookup(monkeypatch):
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail["code"] == "ACCOUNT_DISABLED"
+
+
+def test_websocket_disabled_account_auth_uses_stable_error_code():
+    source = inspect.getsource(ws.websocket_endpoint)
+    disabled_branch = source.split("except AppContractError as e:", 1)[1].split("except AuthError", 1)[0]
+
+    assert "code=e.error_code.value" in disabled_branch
+    assert "msg=e.public_message" in disabled_branch
+    assert "reason=e.error_code.value" in disabled_branch
+    assert "code=e.status_code" not in disabled_branch

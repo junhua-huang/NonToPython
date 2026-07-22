@@ -140,7 +140,7 @@ class WSManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[WS QUEUE] worker error: {e}")
+                logger.error("[WS QUEUE] worker error_type=%s", type(e).__name__)
 
     def enqueue_push(self, user_id: int, event: str, payload: dict):
         """将推送任务入队。自动判断：在线且未积压 → 走推送队列；否则只写序号日志（用户重连后 sync 补发）"""
@@ -417,7 +417,7 @@ class WSManager:
             try:
                 await self._prune_message_logs()
             except Exception as e:
-                logger.error(f"[WS PRUNE] error: {e}")
+                logger.error("[WS PRUNE] error_type=%s", type(e).__name__)
 
     async def _prune_message_logs(self):
         """删除超过保留天数的 ws_message_log 记录"""
@@ -435,7 +435,7 @@ class WSManager:
                 if count > 0:
                     logger.info(f"[WS PRUNE] deleted {count} message_log entries older than {self._LOG_PRUNE_DAYS} days")
             except Exception as e:
-                logger.error(f"[WS PRUNE] sync error: {e}")
+                logger.error("[WS PRUNE] sync error_type=%s", type(e).__name__)
                 db.rollback()
             finally:
                 db.close()
@@ -696,7 +696,12 @@ class WSManager:
                     if self.is_connected(recipient_id):
                         await self._send_presence_with_seq(recipient_id, "community_member_presence", payload, user_id, expected_generation)
         except Exception as e:
-            logger.error(f"[WS PRESENCE] community presence failed uid={user_id} online={is_online}: {e}", exc_info=True)
+            logger.error(
+                "[WS PRESENCE] community presence failed uid=%s online=%s error_type=%s",
+                user_id,
+                is_online,
+                type(e).__name__,
+            )
 
     # ================================================================
     # 会话列表缓存
@@ -828,7 +833,11 @@ class WSManager:
             db.commit()
             return new_seq
         except Exception as e:
-            logger.error(f"[WS SEQ] _next_seq failed uid={user_id}: {e}")
+            logger.error(
+                "[WS SEQ] _next_seq failed uid=%s error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
             db.rollback()
             return None
         finally:
@@ -888,7 +897,12 @@ class WSManager:
             ).delete(synchronize_session=False)
             db.commit()
         except Exception as e:
-            logger.error(f"[WS SEQ] failed to delete stale presence log uid={user_id} seq={seq}: {e}")
+            logger.error(
+                "[WS SEQ] failed to delete stale presence log uid=%s seq=%s error_type=%s",
+                user_id,
+                seq,
+                type(e).__name__,
+            )
             db.rollback()
         finally:
             db.close()
@@ -925,7 +939,11 @@ class WSManager:
                     try:
                         blocked_ids = excluded_user_ids(db, user_id)
                     except Exception as exc:
-                        logger.error("[WS SYNC] block visibility lookup failed uid=%s: %s", user_id, exc)
+                        logger.error(
+                            "[WS SYNC] block visibility lookup failed uid=%s error_type=%s",
+                            user_id,
+                            type(exc).__name__,
+                        )
                         return []
 
                     for row in rows:
@@ -951,9 +969,9 @@ class WSManager:
                             visible_ids = visible_notification_ids(db, user_id, notification_ids)
                         except Exception as e:
                             logger.error(
-                                "[WS SYNC] notification visibility lookup failed uid=%s: %s",
+                                "[WS SYNC] notification visibility lookup failed uid=%s error_type=%s",
                                 user_id,
-                                e,
+                                type(e).__name__,
                             )
 
                     for seq, payload, notification_id in parsed_rows:
@@ -972,7 +990,11 @@ class WSManager:
 
                 return result
             except Exception as e:
-                logger.error(f"[WS SYNC] failed uid={user_id}: {e}")
+                logger.error(
+                    "[WS SYNC] failed uid=%s error_type=%s",
+                    user_id,
+                    type(e).__name__,
+                )
                 return []
             finally:
                 db.close()
@@ -1018,7 +1040,7 @@ class WSManager:
                 db.commit()
                 return False
             except Exception as e:
-                logger.warning(f"[WS DEDUP] failed: {e}")
+                logger.warning("[WS DEDUP] failed error_type=%s", type(e).__name__)
                 db.rollback()
                 return False
             finally:

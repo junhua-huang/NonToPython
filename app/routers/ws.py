@@ -807,7 +807,11 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
                 "participant_ids": participant_ids,
             }
         except Exception as e:
-            logger.error(f"[WS RECALL] uid={user_id} error: {e}")
+            logger.error(
+                "[WS RECALL] uid=%s error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
             db.rollback()
             return {"error": "Recall failed"}
         finally:
@@ -931,11 +935,11 @@ async def _handle_notifications_read(websocket: WebSocket, user_id: int, payload
                 "notification_ids": notif_ids,
                 "unread_count": unread_count,
             })
-        except Exception:
+        except Exception as e:
             logger.warning(
-                "Failed to deliver notifications_read event uid=%s",
+                "Failed to deliver notifications_read event uid=%s error_type=%s",
                 user_id,
-                exc_info=True,
+                type(e).__name__,
             )
 
 
@@ -1044,8 +1048,7 @@ async def websocket_endpoint(websocket: WebSocket):
     3. 服务端验证 → 推 session_list → 推 auth_result
     4. 进入正常收发
     """
-    headers = dict(websocket.headers)
-    print(f"[WS-DEBUG] incoming: headers={headers}, client={websocket.client}")
+    logger.debug("[WS] incoming client=%s", websocket.client)
     await websocket.accept()
     user_id = None
     conn_id = None
@@ -1086,7 +1089,7 @@ async def websocket_endpoint(websocket: WebSocket):
             user = verify_token(token)
         except AppContractError as e:
             await websocket.send_json(_make_response("auth_result", request_id,
-                success=False, code=e.status_code, msg=e.public_message))
+                success=False, code=e.error_code.value, msg=e.public_message))
             await websocket.close(code=4001, reason=e.error_code.value)
             return
         except AuthError as e:
@@ -1174,6 +1177,11 @@ async def websocket_endpoint(websocket: WebSocket):
             await ws_manager.disconnect(user_id, conn_id)
             logger.info(f"[WS -] uid={user_id} cid={conn_id[:8] if conn_id else '?'} kicked_by_dup")
     except Exception as e:
-        logger.error(f"[WS ERROR] uid={user_id} cid={conn_id[:8] if conn_id else '?'} {e}", exc_info=True)
+        logger.error(
+            "[WS ERROR] uid=%s cid=%s error_type=%s",
+            user_id,
+            conn_id[:8] if conn_id else "?",
+            type(e).__name__,
+        )
         if user_id is not None and conn_id:
             await ws_manager.disconnect(user_id, conn_id)

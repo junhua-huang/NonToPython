@@ -139,3 +139,27 @@ def test_admin_rule_crud_never_logs_rule_expression_or_exception_text():
                         or child.func.attr == "exception"
                     )
                 )
+
+
+def test_websocket_logging_is_metadata_only():
+    paths = [
+        ROOT / "app" / "routers" / "ws.py",
+        ROOT / "app" / "ws_manager.py",
+    ]
+    forbidden = {
+        "headers=",
+        "authorization",
+        "cookie",
+        "access_token",
+        "exc_info",
+        "logger.exception",
+        "{e}",
+        "str(e)",
+    }
+
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert "print(" not in source
+        for call in logger_calls(path):
+            lowered = call.lower()
+            assert not any(token in lowered for token in forbidden), call
