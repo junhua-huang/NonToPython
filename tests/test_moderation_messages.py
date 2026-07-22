@@ -255,6 +255,100 @@ def test_ws_same_user_duplicate_ack_bypasses_moderation_and_authorization(monkey
 
 
 
+def test_ws_incomplete_duplicate_state_is_retryable_failed_ack_without_moderation(monkeypatch):
+    manager = FakeWSManager()
+    moderation_events = []
+
+    def fail_if_moderated(*args, **kwargs):
+        moderation_events.append(args)
+        raise AssertionError("incomplete duplicate state must not be moderated again")
+
+    def fail_if_session_opened():
+        raise AssertionError("incomplete duplicate state must not open persistence session")
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: {"user_id": 1, "message_id": None})
+    monkeypatch.setattr(ws, "_get_db_session", fail_if_session_opened)
+    monkeypatch.setattr(ws, "moderate_route_fields", fail_if_moderated)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-pending",
+                "payload": {
+                    "client_msg_id": "client-pending",
+                    "conversation_id": 7,
+                    "content": "blocked",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert moderation_events == []
+    assert manager.side_effects == []
+    assert manager.raw == [
+        (
+            1,
+            {
+                "type": "ack",
+                "request_id": "req-pending",
+                "client_msg_id": "client-pending",
+                "clientMsgId": "client-pending",
+                "status": 503,
+                "code": "MODERATION_UNAVAILABLE",
+                "retryable": True,
+                "msg": "内容审核服务暂不可用，请稍后重试",
+                "message": "内容审核服务暂不可用，请稍后重试",
+            },
+        )
+    ]
+
+
+
+def test_ws_dedup_lookup_failure_is_retryable_failed_ack(monkeypatch):
+    manager = FakeWSManager()
+
+    def fail_dedup_lookup(client_msg_id):
+        raise RuntimeError("PRIVATE_DB_DSN_SENTINEL_2026")
+
+    def fail_if_session_opened():
+        raise AssertionError("dedup lookup failure must fail before authorization or persistence")
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_dedup_state", fail_dedup_lookup)
+    monkeypatch.setattr(ws, "_get_db_session", fail_if_session_opened)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-dedup-fail",
+                "payload": {
+                    "client_msg_id": "client-dedup-fail",
+                    "conversation_id": 7,
+                    "content": "hello",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    ack = manager.raw[-1][1]
+    assert ack["type"] == "ack"
+    assert ack["status"] == 503
+    assert ack["code"] == "MODERATION_UNAVAILABLE"
+    assert ack["retryable"] is True
+    assert "PRIVATE_DB_DSN_SENTINEL_2026" not in str(ack)
+    assert "message_id" not in ack
+
+
+
 def test_ws_moderation_unavailable_failed_ack_is_retryable(monkeypatch):
     conv = SimpleNamespace(id=7, type="single", community_id=None)
     manager = FakeWSManager()

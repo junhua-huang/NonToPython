@@ -469,16 +469,44 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
         return
 
-    dedup_state = await asyncio.get_event_loop().run_in_executor(
-        None,
-        _get_dedup_state,
-        client_msg_id,
-    )
+    try:
+        dedup_state = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _get_dedup_state,
+            client_msg_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "[WS DEDUP] lookup failed uid=%s error_type=%s",
+            user_id,
+            type(e).__name__,
+        )
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=503,
+            code="MODERATION_UNAVAILABLE",
+            retryable=True,
+            message="内容审核服务暂不可用，请稍后重试",
+        )
+        return
     if dedup_state:
         if dedup_state["user_id"] != user_id:
             await _send_error(user_id, request_id, 403, "Cannot send message to this user")
             return
         dedup_msg_id = dedup_state["message_id"]
+        if dedup_msg_id is None:
+            await _send_failed_ack(
+                user_id,
+                request_id,
+                client_msg_id,
+                status=503,
+                code="MODERATION_UNAVAILABLE",
+                retryable=True,
+                message="内容审核服务暂不可用，请稍后重试",
+            )
+            return
         await ws_manager.send_raw(user_id, _make_response("ack", request_id,
             client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
             status=200, msg="duplicate"))
