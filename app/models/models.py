@@ -1013,11 +1013,11 @@ class WSUserSeq(Base):
 
 
 class WSAckDedup(Base):
-    """ACK 去重表（clientMsgId 幂等，定期清理 24h 前记录）"""
+    """ACK 去重表（clientMsgId 对单用户幂等，定期清理 24h 前记录）"""
     __tablename__ = 'ws_ack_dedup'
 
+    user_id = Column(Integer, ForeignKey('users.id'), primary_key=True)
     client_msg_id = Column(String(36), primary_key=True)  # UUID
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     message_id = Column(Integer, nullable=True)  # 首次处理时记录的 message_id，重复 ACK 时回传
     processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 

@@ -17,14 +17,48 @@ class FakeQuery:
     def first(self):
         return self.row
 
+    def count(self):
+        return 0
+
+    def all(self):
+        return []
+
 
 class FakeDB:
-    def __init__(self, row):
+    def __init__(self, row, *, dedup_row=None, flush_error=None):
         self.row = row
+        self.dedup_row = dedup_row
+        self.flush_error = flush_error
         self.closed = False
+        self.added = []
+        self.committed = False
+        self.rolled_back = False
 
     def query(self, *args, **kwargs):
+        model = args[0] if args else None
+        if getattr(model, "__name__", "") == "WSAckDedup":
+            return FakeQuery(self.dedup_row)
         return FakeQuery(self.row)
+
+    def add(self, item):
+        self.added.append(item)
+
+    def flush(self):
+        if self.flush_error:
+            raise self.flush_error
+        for item in self.added:
+            if getattr(item.__class__, "__name__", "") == "Message":
+                item.id = 77
+
+    def commit(self):
+        self.committed = True
+
+    def refresh(self, item):
+        if getattr(item, "id", None) is None:
+            item.id = 77
+
+    def rollback(self):
+        self.rolled_back = True
 
     def close(self):
         self.closed = True
@@ -45,6 +79,10 @@ class FakeWSManager:
     async def get_dedup_message_id(self, *args, **kwargs):
         self.side_effects.append(("get_dedup_message_id", args))
         return None
+
+    async def get_current_seq(self, *args, **kwargs):
+        self.side_effects.append(("get_current_seq", args))
+        return 0
 
     async def update_dedup_message_id(self, *args, **kwargs):
         self.side_effects.append(("update_dedup_message_id", args))
@@ -162,7 +200,7 @@ def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch, co
 
     monkeypatch.setattr(ws, "ws_manager", manager)
     monkeypatch.setattr(ws, "_get_db_session", session_factory)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
@@ -219,7 +257,7 @@ def test_ws_same_user_duplicate_ack_bypasses_moderation_and_authorization(monkey
         raise AssertionError("duplicate sends must not open an authorization or persistence session")
 
     monkeypatch.setattr(ws, "ws_manager", manager)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: {"user_id": 1, "message_id": 99})
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: {"user_id": 1, "message_id": 99})
     monkeypatch.setattr(ws, "_get_db_session", fail_if_session_opened)
     monkeypatch.setattr(ws, "moderate_route_fields", fail_if_moderated)
 
@@ -271,7 +309,7 @@ def test_ws_incomplete_duplicate_state_is_retryable_failed_ack_without_moderatio
         raise AssertionError("incomplete duplicate state must not open persistence session")
 
     monkeypatch.setattr(ws, "ws_manager", manager)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: {"user_id": 1, "message_id": None})
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: {"user_id": 1, "message_id": None})
     monkeypatch.setattr(ws, "_get_db_session", fail_if_session_opened)
     monkeypatch.setattr(ws, "moderate_route_fields", fail_if_moderated)
 
@@ -316,7 +354,7 @@ def test_ws_incomplete_duplicate_state_is_retryable_failed_ack_without_moderatio
 def test_ws_dedup_lookup_failure_is_retryable_failed_ack(monkeypatch):
     manager = FakeWSManager()
 
-    def fail_dedup_lookup(client_msg_id):
+    def fail_dedup_lookup(*args):
         raise RuntimeError("dedup lookup failed")
 
     def fail_if_session_opened():
@@ -354,21 +392,14 @@ def test_ws_dedup_lookup_failure_is_retryable_failed_ack(monkeypatch):
 
 
 def test_ws_late_pending_duplicate_is_retryable_failed_ack_without_persistence(monkeypatch):
+    pending_row = SimpleNamespace(user_id=1, client_msg_id="client-late-pending", message_id=None)
     conv = SimpleNamespace(id=7, type="single", community_id=None)
     manager = FakeWSManager()
     opened_sessions = []
     moderation_events = []
 
-    async def pending_duplicate(*args, **kwargs):
-        manager.side_effects.append(("check_and_record_dedup", args))
-        return True
-
-    async def pending_message_id(*args, **kwargs):
-        manager.side_effects.append(("get_dedup_message_id", args))
-        return None
-
     def session_factory():
-        session = FakeDB(conv)
+        session = FakeDB(conv, dedup_row=pending_row)
         opened_sessions.append(session)
         return session
 
@@ -377,13 +408,11 @@ def test_ws_late_pending_duplicate_is_retryable_failed_ack_without_persistence(m
 
     monkeypatch.setattr(ws, "ws_manager", manager)
     monkeypatch.setattr(ws, "_get_db_session", session_factory)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "moderate_route_fields", moderate)
-    monkeypatch.setattr(manager, "check_and_record_dedup", pending_duplicate, raising=False)
-    monkeypatch.setattr(manager, "get_dedup_message_id", pending_message_id, raising=False)
 
     asyncio.run(
         ws._handle_send_message(
@@ -403,12 +432,10 @@ def test_ws_late_pending_duplicate_is_retryable_failed_ack_without_persistence(m
     )
 
     assert len(moderation_events) == 1
-    assert manager.side_effects == [
-        ("check_and_record_dedup", (1, "client-late-pending")),
-        ("get_dedup_message_id", (1, "client-late-pending")),
-    ]
-    assert len(opened_sessions) == 1
-    assert opened_sessions[0].closed is True
+    assert manager.side_effects == []
+    assert len(opened_sessions) == 2
+    assert all(session.closed for session in opened_sessions)
+    assert opened_sessions[-1].added == []
     assert manager.raw == [
         (
             1,
@@ -433,23 +460,18 @@ def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistenc
     manager = FakeWSManager()
     opened_sessions = []
 
-    async def reservation_unavailable(*args, **kwargs):
-        manager.side_effects.append(("check_and_record_dedup", args))
-        return None
-
     def session_factory():
-        session = FakeDB(conv)
+        session = FakeDB(conv, flush_error=ws.IntegrityError("INSERT", {}, Exception("race")))
         opened_sessions.append(session)
         return session
 
     monkeypatch.setattr(ws, "ws_manager", manager)
     monkeypatch.setattr(ws, "_get_db_session", session_factory)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "moderate_route_fields", lambda *args, **kwargs: None)
-    monkeypatch.setattr(manager, "check_and_record_dedup", reservation_unavailable, raising=False)
 
     asyncio.run(
         ws._handle_send_message(
@@ -468,44 +490,36 @@ def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistenc
         )
     )
 
-    assert manager.side_effects == [("check_and_record_dedup", (1, "client-reserve-fail"))]
-    assert len(opened_sessions) == 1
-    assert opened_sessions[0].closed is True
+    assert manager.side_effects == []
+    assert len(opened_sessions) == 2
+    assert all(session.closed for session in opened_sessions)
+    assert opened_sessions[-1].rolled_back is True
     assert manager.raw[-1][1]["status"] == 503
     assert manager.raw[-1][1]["code"] == "MODERATION_UNAVAILABLE"
     assert "message_id" not in manager.raw[-1][1]
 
 
 
-def test_ws_cross_user_late_duplicate_is_retryable_failed_ack_without_id_leak(monkeypatch):
+def test_ws_cross_user_late_duplicate_is_persisted_without_id_leak(monkeypatch):
     conv = SimpleNamespace(id=7, type="single", community_id=None)
     manager = FakeWSManager()
     opened_sessions = []
 
-    async def raced_duplicate(*args, **kwargs):
-        manager.side_effects.append(("check_and_record_dedup", args))
-        return True
-
-    async def owner_scoped_message_id(*args, **kwargs):
-        manager.side_effects.append(("get_dedup_message_id", args))
-        if args == (2, "client-race"):
-            return None
-        return 99
-
     def session_factory():
-        session = FakeDB(conv)
+        session = FakeDB(conv, dedup_row=None)
         opened_sessions.append(session)
         return session
 
     monkeypatch.setattr(ws, "ws_manager", manager)
     monkeypatch.setattr(ws, "_get_db_session", session_factory)
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
-    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "moderate_route_fields", lambda *args, **kwargs: None)
-    monkeypatch.setattr(manager, "check_and_record_dedup", raced_duplicate, raising=False)
-    monkeypatch.setattr(manager, "get_dedup_message_id", owner_scoped_message_id, raising=False)
+    monkeypatch.setattr(ws, "validate_quote", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws, "inject_quote_preview", lambda db, data, **kwargs: data)
+    monkeypatch.setattr(ws, "redact_unavailable_post_card", lambda *args, **kwargs: None)
 
     asyncio.run(
         ws._handle_send_message(
@@ -524,25 +538,17 @@ def test_ws_cross_user_late_duplicate_is_retryable_failed_ack_without_id_leak(mo
         )
     )
 
-    assert len(opened_sessions) == 1
-    assert opened_sessions[0].closed is True
-    assert manager.raw == [
-        (
-            2,
-            {
-                "type": "ack",
-                "request_id": "req-race",
-                "client_msg_id": "client-race",
-                "clientMsgId": "client-race",
-                "status": 503,
-                "code": "MODERATION_UNAVAILABLE",
-                "retryable": True,
-                "msg": "内容审核服务暂不可用，请稍后重试",
-                "message": "内容审核服务暂不可用，请稍后重试",
-            },
-        )
-    ]
-    assert "message_id" not in manager.raw[0][1]
+    assert len(opened_sessions) == 3
+    assert all(session.closed for session in opened_sessions)
+    assert any(session.committed for session in opened_sessions)
+    assert manager.raw[0][1]["payload"] == {
+        "client_msg_id": "client-race",
+        "server_seq": 0,
+        "message_id": 77,
+        "status": 200,
+        "msg": "success",
+    }
+    assert manager.raw[1][1]["message_id"] == 77
     assert "99" not in str(manager.raw)
 
 
@@ -562,7 +568,7 @@ def test_ws_moderation_unavailable_failed_ack_is_retryable(monkeypatch):
 
     monkeypatch.setattr(ws, "ws_manager", manager)
     monkeypatch.setattr(ws, "_get_db_session", lambda: FakeDB(conv))
-    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda *args: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)

@@ -1026,7 +1026,8 @@ class WSManager:
             try:
                 from app.models.models import WSAckDedup
                 existing = db.query(WSAckDedup).filter(
-                    WSAckDedup.client_msg_id == client_msg_id
+                    WSAckDedup.user_id == user_id,
+                    WSAckDedup.client_msg_id == client_msg_id,
                 ).first()
                 if existing:
                     return True

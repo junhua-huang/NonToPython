@@ -10,7 +10,7 @@ from alembic.operations import Operations
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError
 
-from app.models.models import SensitiveWord, SensitiveWordVersion, User
+from app.models.models import SensitiveWord, SensitiveWordVersion, User, WSAckDedup
 
 
 MIGRATION_PATH = (
@@ -19,11 +19,27 @@ MIGRATION_PATH = (
     / "versions"
     / "2026_07_18_0200_content_moderation_phase1.py"
 )
+WS_ACK_DEDUP_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "2026_07_21_0100_scope_ws_ack_dedup_by_user.py"
+)
 
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "content_moderation_phase1_migration", MIGRATION_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_ws_ack_dedup_migration():
+    spec = importlib.util.spec_from_file_location(
+        "scope_ws_ack_dedup_by_user_migration", WS_ACK_DEDUP_MIGRATION_PATH
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -143,6 +159,43 @@ def _assert_upgraded_sqlite_schema(connection):
         check["name"]: _normalize_reflected_check(check["sqltext"])
         for check in inspector.get_check_constraints("sensitive_word_versions")
     } == {"ck_sensitive_word_version_singleton": "id=1"}
+
+
+def test_ws_ack_dedup_model_is_scoped_by_user_and_client_msg_id():
+    primary_key_columns = tuple(column.name for column in WSAckDedup.__table__.primary_key.columns)
+
+    assert primary_key_columns == ("user_id", "client_msg_id")
+
+
+def test_ws_ack_dedup_sqlite_migration_scopes_primary_key_by_user():
+    migration = _load_ws_ack_dedup_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    sa.Table("users", metadata, sa.Column("id", sa.Integer(), primary_key=True))
+    sa.Table(
+        "ws_ack_dedup",
+        metadata,
+        sa.Column("client_msg_id", sa.String(length=36), primary_key=True),
+        sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("message_id", sa.Integer(), nullable=True),
+        sa.Column("processed_at", sa.DateTime(), nullable=False),
+    )
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        context = MigrationContext.configure(connection)
+        operations = Operations(context)
+        original_op = migration.op
+        migration.op = operations
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = original_op
+
+        assert sa.inspect(connection).get_pk_constraint("ws_ack_dedup") == {
+            "constrained_columns": ["user_id", "client_msg_id"],
+            "name": "pk_ws_ack_dedup_user_client_msg",
+        }
 
 
 def test_sensitive_word_model_has_exact_versioned_rule_shape():

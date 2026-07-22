@@ -15,6 +15,7 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -135,14 +136,15 @@ def _can_send_to_user(db: Session, from_user_id: int, to_user_id: int) -> bool:
     return is_friend is not None
 
 
-def _get_dedup_state(client_msg_id: str) -> dict | None:
+def _get_dedup_state(user_id: int, client_msg_id: str) -> dict | None:
     if not client_msg_id:
         return None
     db = _get_db_session()
     try:
         from app.models.models import WSAckDedup
         row = db.query(WSAckDedup).filter(
-            WSAckDedup.client_msg_id == client_msg_id
+            WSAckDedup.user_id == user_id,
+            WSAckDedup.client_msg_id == client_msg_id,
         ).first()
         if not row:
             return None
@@ -473,6 +475,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         dedup_state = await asyncio.get_event_loop().run_in_executor(
             None,
             _get_dedup_state,
+            user_id,
             client_msg_id,
         )
     except Exception as e:
@@ -567,47 +570,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         )
         return
 
-    # 1. 幂等
-    if client_msg_id:
-        dedup_result = await ws_manager.check_and_record_dedup(user_id, client_msg_id)
-        if dedup_result is None:
-            await _send_failed_ack(
-                user_id,
-                request_id,
-                client_msg_id,
-                status=503,
-                code="MODERATION_UNAVAILABLE",
-                retryable=True,
-                message="内容审核服务暂不可用，请稍后重试",
-            )
-            return
-        if dedup_result:
-            # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
-            dedup_msg_id = await ws_manager.get_dedup_message_id(user_id, client_msg_id)
-            if dedup_msg_id is None:
-                await _send_failed_ack(
-                    user_id,
-                    request_id,
-                    client_msg_id,
-                    status=503,
-                    code="MODERATION_UNAVAILABLE",
-                    retryable=True,
-                    message="内容审核服务暂不可用，请稍后重试",
-                )
-                return
-            await ws_manager.send_raw(user_id, _make_response("ack", request_id,
-                client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
-                status=200, msg="duplicate"))
-            await ws_manager.send_raw(user_id, {
-                "type": "ack",
-                "clientMsgId": client_msg_id,
-                "client_msg_id": client_msg_id,
-                "message_id": dedup_msg_id,
-                "server_seq": 0,
-            })
-            return
-
-    # 2. 持久化
+    # 1. 持久化（与 client_msg_id 幂等记录共用事务）
     def _persist():
         db = _get_db_session()
         try:
@@ -626,6 +589,25 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 conv = _get_conversation(db, user_id, receiver_id)
 
             participant_ids = get_active_conversation_participant_ids(db, conv)
+            dedup_entry = None
+            if client_msg_id:
+                from app.models.models import WSAckDedup
+                dedup_entry = db.query(WSAckDedup).filter(
+                    WSAckDedup.user_id == user_id,
+                    WSAckDedup.client_msg_id == client_msg_id,
+                ).first()
+                if dedup_entry:
+                    if dedup_entry.message_id is None:
+                        return {"dedup_unavailable": True}
+                    return {"duplicate_message_id": dedup_entry.message_id}
+                dedup_entry = WSAckDedup(
+                    user_id=user_id,
+                    client_msg_id=client_msg_id,
+                    processed_at=datetime.utcnow(),
+                )
+                db.add(dedup_entry)
+                db.flush()
+
             normalized = normalize_user_message_payload(
                 payload,
                 db,
@@ -658,6 +640,9 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             )
             db.add(msg)
             conv.last_message_at = datetime.utcnow()
+            db.flush()
+            if dedup_entry is not None:
+                dedup_entry.message_id = msg.id
             db.commit()
             db.refresh(msg)
 
@@ -714,6 +699,14 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         except HTTPException as e:
             db.rollback()
             return {"error": e.detail, "code": e.status_code}
+        except IntegrityError as e:
+            logger.warning(
+                "[WS DEDUP] transactional reservation failed uid=%s error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
+            db.rollback()
+            return {"dedup_unavailable": True}
         except Exception as e:
             logger.error(
                 "[WS SEND] uid=%s persist_error_type=%s",
@@ -731,6 +724,30 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     if isinstance(result, dict) and "error" in result:
         await _send_error(user_id, request_id, result.get("code", _send_error_status(result["error"])), result["error"])
         return
+    if isinstance(result, dict) and result.get("dedup_unavailable"):
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=503,
+            code="MODERATION_UNAVAILABLE",
+            retryable=True,
+            message="内容审核服务暂不可用，请稍后重试",
+        )
+        return
+    if isinstance(result, dict) and "duplicate_message_id" in result:
+        dedup_msg_id = result["duplicate_message_id"]
+        await ws_manager.send_raw(user_id, _make_response("ack", request_id,
+            client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
+            status=200, msg="duplicate"))
+        await ws_manager.send_raw(user_id, {
+            "type": "ack",
+            "clientMsgId": client_msg_id,
+            "client_msg_id": client_msg_id,
+            "message_id": dedup_msg_id,
+            "server_seq": 0,
+        })
+        return
 
     # 3. ACK
     ack_seq = await ws_manager.get_current_seq(user_id)
@@ -747,9 +764,6 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             "message_id": msg_id,
             "server_seq": ack_seq,
         })
-        # 记录 message_id 到 dedup 表，后续重复请求可回传
-        await ws_manager.update_dedup_message_id(user_id, client_msg_id, msg_id)
-
     # 4. 推送接收方（异步入队）
     push_items = []
     for pid in result["participant_ids"]:
