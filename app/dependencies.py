@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.core.auth_core import verify_token, AuthError
 from app.models.models import User
+from app.services.moderation_errors import AppContractError, to_http_exception
 
 
 def get_current_user(
@@ -21,6 +22,8 @@ def get_current_user(
     """从 Query 参数 access_token 获取当前登录用户"""
     try:
         return verify_token(access_token)
+    except AppContractError as e:
+        raise to_http_exception(e) from None
     except AuthError as e:
         raise HTTPException(status_code=e.code, detail=e.message)
 
@@ -35,6 +38,8 @@ def get_optional_user(
         return None
     try:
         return verify_token(access_token)
+    except AppContractError as e:
+        raise to_http_exception(e) from None
     except AuthError:
         return None
 
@@ -60,6 +65,8 @@ def require_role(*role_names: str):
     ) -> User:
         try:
             user = verify_token(access_token)
+        except AppContractError as e:
+            raise to_http_exception(e) from None
         except AuthError as e:
             raise HTTPException(status_code=e.code, detail=e.message)
 

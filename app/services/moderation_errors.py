@@ -38,6 +38,11 @@ class ModerationUnavailable(AppContractError):
         super().__init__(ErrorCode.MODERATION_UNAVAILABLE, cause)
 
 
+class AccountDisabled(AppContractError):
+    def __init__(self):
+        super().__init__(ErrorCode.ACCOUNT_DISABLED)
+
+
 def content_rejected() -> ContentRejected:
     return ContentRejected()
 

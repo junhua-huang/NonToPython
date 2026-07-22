@@ -1081,8 +1081,14 @@ async def websocket_endpoint(websocket: WebSocket):
             return
 
         from app.core.auth_core import verify_token, AuthError
+        from app.services.moderation_errors import AppContractError
         try:
             user = verify_token(token)
+        except AppContractError as e:
+            await websocket.send_json(_make_response("auth_result", request_id,
+                success=False, code=e.status_code, msg=e.public_message))
+            await websocket.close(code=4001, reason=e.error_code.value)
+            return
         except AuthError as e:
             await websocket.send_json(_make_response("auth_result", request_id,
                 success=False, code=4001, msg=e.message))
