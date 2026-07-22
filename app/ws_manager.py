@@ -1017,7 +1017,7 @@ class WSManager:
     # ACK 去重
     # ================================================================
 
-    async def check_and_record_dedup(self, user_id: int, client_msg_id: str) -> bool:
+    async def check_and_record_dedup(self, user_id: int, client_msg_id: str) -> bool | None:
         """检查是否为重复 client_msg_id。首次见到时记录并返回 False，重复时返回 True。"""
         if not client_msg_id:
             return False
@@ -1042,7 +1042,7 @@ class WSManager:
             except Exception as e:
                 logger.warning("[WS DEDUP] failed error_type=%s", type(e).__name__)
                 db.rollback()
-                return False
+                return None
             finally:
                 db.close()
         return await asyncio.get_event_loop().run_in_executor(None, _sync)

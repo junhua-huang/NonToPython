@@ -42,6 +42,10 @@ class FakeWSManager:
         self.side_effects.append(("check_and_record_dedup", args))
         return False
 
+    async def get_dedup_message_id(self, *args, **kwargs):
+        self.side_effects.append(("get_dedup_message_id", args))
+        return None
+
     async def update_dedup_message_id(self, *args, **kwargs):
         self.side_effects.append(("update_dedup_message_id", args))
 
@@ -313,7 +317,7 @@ def test_ws_dedup_lookup_failure_is_retryable_failed_ack(monkeypatch):
     manager = FakeWSManager()
 
     def fail_dedup_lookup(client_msg_id):
-        raise RuntimeError("PRIVATE_DB_DSN_SENTINEL_2026")
+        raise RuntimeError("dedup lookup failed")
 
     def fail_if_session_opened():
         raise AssertionError("dedup lookup failure must fail before authorization or persistence")
@@ -344,8 +348,132 @@ def test_ws_dedup_lookup_failure_is_retryable_failed_ack(monkeypatch):
     assert ack["status"] == 503
     assert ack["code"] == "MODERATION_UNAVAILABLE"
     assert ack["retryable"] is True
-    assert "PRIVATE_DB_DSN_SENTINEL_2026" not in str(ack)
+    assert "dedup lookup failed" not in str(ack)
     assert "message_id" not in ack
+
+
+
+def test_ws_late_pending_duplicate_is_retryable_failed_ack_without_persistence(monkeypatch):
+    conv = SimpleNamespace(id=7, type="single", community_id=None)
+    manager = FakeWSManager()
+    opened_sessions = []
+    moderation_events = []
+
+    async def pending_duplicate(*args, **kwargs):
+        manager.side_effects.append(("check_and_record_dedup", args))
+        return True
+
+    async def pending_message_id(*args, **kwargs):
+        manager.side_effects.append(("get_dedup_message_id", args))
+        return None
+
+    def session_factory():
+        session = FakeDB(conv)
+        opened_sessions.append(session)
+        return session
+
+    def moderate(*args, **kwargs):
+        moderation_events.append(args)
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_db_session", session_factory)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "moderate_route_fields", moderate)
+    monkeypatch.setattr(manager, "check_and_record_dedup", pending_duplicate, raising=False)
+    monkeypatch.setattr(manager, "get_dedup_message_id", pending_message_id, raising=False)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-late-pending",
+                "payload": {
+                    "client_msg_id": "client-late-pending",
+                    "conversation_id": 7,
+                    "content": "hello",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert len(moderation_events) == 1
+    assert manager.side_effects == [
+        ("check_and_record_dedup", (1, "client-late-pending")),
+        ("get_dedup_message_id", ("client-late-pending",)),
+    ]
+    assert len(opened_sessions) == 1
+    assert opened_sessions[0].closed is True
+    assert manager.raw == [
+        (
+            1,
+            {
+                "type": "ack",
+                "request_id": "req-late-pending",
+                "client_msg_id": "client-late-pending",
+                "clientMsgId": "client-late-pending",
+                "status": 503,
+                "code": "MODERATION_UNAVAILABLE",
+                "retryable": True,
+                "msg": "内容审核服务暂不可用，请稍后重试",
+                "message": "内容审核服务暂不可用，请稍后重试",
+            },
+        )
+    ]
+
+
+
+def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistence(monkeypatch):
+    conv = SimpleNamespace(id=7, type="single", community_id=None)
+    manager = FakeWSManager()
+    opened_sessions = []
+
+    async def reservation_unavailable(*args, **kwargs):
+        manager.side_effects.append(("check_and_record_dedup", args))
+        return None
+
+    def session_factory():
+        session = FakeDB(conv)
+        opened_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_db_session", session_factory)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(manager, "check_and_record_dedup", reservation_unavailable, raising=False)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-reserve-fail",
+                "payload": {
+                    "client_msg_id": "client-reserve-fail",
+                    "conversation_id": 7,
+                    "content": "hello",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert manager.side_effects == [("check_and_record_dedup", (1, "client-reserve-fail"))]
+    assert len(opened_sessions) == 1
+    assert opened_sessions[0].closed is True
+    assert manager.raw[-1][1]["status"] == 503
+    assert manager.raw[-1][1]["code"] == "MODERATION_UNAVAILABLE"
+    assert "message_id" not in manager.raw[-1][1]
 
 
 

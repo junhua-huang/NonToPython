@@ -568,13 +568,36 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         return
 
     # 1. 幂等
-    if client_msg_id and await ws_manager.check_and_record_dedup(user_id, client_msg_id):
-        # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
-        dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
-        await ws_manager.send_raw(user_id, _make_response("ack", request_id,
-            client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
-            status=200, msg="duplicate"))
-        if client_msg_id:
+    if client_msg_id:
+        dedup_result = await ws_manager.check_and_record_dedup(user_id, client_msg_id)
+        if dedup_result is None:
+            await _send_failed_ack(
+                user_id,
+                request_id,
+                client_msg_id,
+                status=503,
+                code="MODERATION_UNAVAILABLE",
+                retryable=True,
+                message="内容审核服务暂不可用，请稍后重试",
+            )
+            return
+        if dedup_result:
+            # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
+            dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
+            if dedup_msg_id is None:
+                await _send_failed_ack(
+                    user_id,
+                    request_id,
+                    client_msg_id,
+                    status=503,
+                    code="MODERATION_UNAVAILABLE",
+                    retryable=True,
+                    message="内容审核服务暂不可用，请稍后重试",
+                )
+                return
+            await ws_manager.send_raw(user_id, _make_response("ack", request_id,
+                client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
+                status=200, msg="duplicate"))
             await ws_manager.send_raw(user_id, {
                 "type": "ack",
                 "clientMsgId": client_msg_id,
@@ -582,7 +605,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 "message_id": dedup_msg_id,
                 "server_seq": 0,
             })
-        return
+            return
 
     # 2. 持久化
     def _persist():
