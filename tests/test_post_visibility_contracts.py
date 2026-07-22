@@ -25,6 +25,20 @@ from app.models.models import (
 from app.routers import posts as posts_router
 
 
+@pytest.fixture(autouse=True)
+def approve_route_moderation(monkeypatch):
+    from app.routers import chat as chat_router
+    from app.routers import communities as communities_router
+    from app.routers import interactions as interactions_router
+    from app.routers import ws as ws_router
+
+    monkeypatch.setattr(posts_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(communities_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(interactions_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws_router, "moderate_route_fields", lambda *args, **kwargs: None)
+
+
 @pytest.fixture()
 def post_db():
     engine = create_engine(

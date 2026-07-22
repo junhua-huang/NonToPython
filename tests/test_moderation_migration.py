@@ -183,6 +183,11 @@ def test_ws_ack_dedup_sqlite_migration_scopes_primary_key_by_user():
     metadata.create_all(engine)
 
     with engine.begin() as connection:
+        connection.execute(sa.text("INSERT INTO users (id) VALUES (1), (2)"))
+        connection.execute(sa.text(
+            "INSERT INTO ws_ack_dedup (client_msg_id, user_id, message_id, processed_at) "
+            "VALUES ('same-client', 1, 10, '2026-07-21 00:00:00')"
+        ))
         context = MigrationContext.configure(connection)
         operations = Operations(context)
         original_op = migration.op
@@ -196,6 +201,52 @@ def test_ws_ack_dedup_sqlite_migration_scopes_primary_key_by_user():
             "constrained_columns": ["user_id", "client_msg_id"],
             "name": "pk_ws_ack_dedup_user_client_msg",
         }
+        preserved = connection.execute(sa.text(
+            "SELECT user_id, client_msg_id, message_id FROM ws_ack_dedup"
+        )).all()
+        assert preserved == [(1, "same-client", 10)]
+        connection.execute(sa.text(
+            "INSERT INTO ws_ack_dedup (user_id, client_msg_id, message_id, processed_at) "
+            "VALUES (2, 'same-client', 20, '2026-07-21 00:00:01')"
+        ))
+
+
+def test_ws_ack_dedup_sqlite_downgrade_rejects_cross_user_duplicates():
+    migration = _load_ws_ack_dedup_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    sa.Table("users", metadata, sa.Column("id", sa.Integer(), primary_key=True))
+    sa.Table(
+        "ws_ack_dedup",
+        metadata,
+        sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), primary_key=True),
+        sa.Column("client_msg_id", sa.String(length=36), primary_key=True),
+        sa.Column("message_id", sa.Integer(), nullable=True),
+        sa.Column("processed_at", sa.DateTime(), nullable=False),
+    )
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(sa.text("INSERT INTO users (id) VALUES (1), (2)"))
+        connection.execute(sa.text(
+            "INSERT INTO ws_ack_dedup (user_id, client_msg_id, message_id, processed_at) VALUES "
+            "(1, 'same-client', 10, '2026-07-21 00:00:00'), "
+            "(2, 'same-client', 20, '2026-07-21 00:00:01')"
+        ))
+        context = MigrationContext.configure(connection)
+        operations = Operations(context)
+        original_op = migration.op
+        migration.op = operations
+        try:
+            with pytest.raises(RuntimeError, match="cross-user client_msg_id duplicates"):
+                migration.downgrade()
+        finally:
+            migration.op = original_op
+
+        assert sa.inspect(connection).get_pk_constraint("ws_ack_dedup")["constrained_columns"] == [
+            "user_id",
+            "client_msg_id",
+        ]
 
 
 def test_sensitive_word_model_has_exact_versioned_rule_shape():

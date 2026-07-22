@@ -17,6 +17,13 @@ from app.routers import ws as ws_router
 from app.services.chat_read_state_service import get_community_unread_counts
 
 
+@pytest.fixture(autouse=True)
+def approve_route_moderation(monkeypatch):
+    monkeypatch.setattr(chat_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(communities_router, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws_router, "moderate_route_fields", lambda *args, **kwargs: None)
+
+
 @pytest.fixture()
 def community_block_db():
     engine = create_engine(

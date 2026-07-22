@@ -49,8 +49,20 @@ def upgrade() -> None:
     )
 
 
+def _assert_downgrade_has_unique_client_msg_ids() -> None:
+    duplicate = op.get_bind().execute(sa.text(
+        "SELECT client_msg_id FROM ws_ack_dedup "
+        "GROUP BY client_msg_id HAVING COUNT(*) > 1 LIMIT 1"
+    )).first()
+    if duplicate is not None:
+        raise RuntimeError(
+            "Cannot downgrade ws_ack_dedup while cross-user client_msg_id duplicates exist"
+        )
+
+
 def downgrade() -> None:
     bind = op.get_bind()
+    _assert_downgrade_has_unique_client_msg_ids()
     if bind.dialect.name == "sqlite":
         op.create_table(
             "_ws_ack_dedup_client_scoped",
