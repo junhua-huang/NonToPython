@@ -133,6 +133,30 @@ def test_lookbehind_is_rejected(pattern):
         validate_safe_regex(pattern)
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    [r"(.)\1", r"(.)\g<1>", r"(?R)", r"(?1)", r"(?&name)", r"(?(1)x|y)"],
+)
+def test_contextual_high_risk_regex_constructs_are_rejected_before_compilation(
+    pattern, monkeypatch
+):
+    monkeypatch.setattr(
+        snapshot_module.regex,
+        "compile",
+        lambda expression: pytest.fail("unsafe structure reached compilation"),
+    )
+
+    with pytest.raises(RegexValidationError, match="^unsafe regex structure$"):
+        validate_safe_regex(pattern)
+
+
+@pytest.mark.parametrize("pattern", [r"[a(?R]", r"[a(?<=x)]", r"\\1"])
+def test_high_risk_text_is_safe_inside_character_classes_or_after_escaped_slash(
+    pattern,
+):
+    assert validate_safe_regex(pattern) == pattern
+
+
 def test_unknown_group_extension_is_rejected_before_compilation(monkeypatch):
     monkeypatch.setattr(
         snapshot_module.regex,
@@ -412,6 +436,36 @@ def test_refresh_never_rolls_snapshot_back_to_an_older_version(fake_rule_reposit
     assert store.current_snapshot().version == 2
 
 
+@pytest.mark.parametrize("word", ["", "   ", "\u200b", "\u2060"])
+def test_initial_load_rejects_literal_that_normalizes_to_empty(
+    fake_rule_repository, word
+):
+    fake_rule_repository.rows = [fake_rule_repository.literal_row(word)]
+    store = SensitiveWordSnapshotStore(fake_rule_repository, monotonic=ManualClock())
+
+    with pytest.raises(ValueError, match="^moderation rule expression unavailable$"):
+        store.refresh(force=True)
+
+    with pytest.raises(ModerationUnavailable):
+        store.current_snapshot()
+
+
+@pytest.mark.parametrize("word", ["   ", "\u200b"])
+def test_invalid_normalized_literal_refresh_preserves_old_snapshot(
+    fake_rule_repository, word
+):
+    store = SensitiveWordSnapshotStore(fake_rule_repository, monotonic=ManualClock())
+    old = store.refresh(force=True)
+    fake_rule_repository.version = 2
+    fake_rule_repository.rows = [fake_rule_repository.literal_row(word)]
+
+    with pytest.raises(ValueError, match="^moderation rule expression unavailable$"):
+        store.refresh(force=True)
+
+    assert store.current_snapshot() is old
+    assert store.current_snapshot().version == 1
+
+
 def test_version_change_during_candidate_build_is_rejected(
     fake_rule_repository, monkeypatch
 ):
@@ -478,6 +532,164 @@ def test_concurrent_older_candidate_cannot_overwrite_newer_snapshot():
     assert store.current_snapshot() is newer
     assert newer.version == 3
     assert newer.literal_rules[0].expression == "version-three"
+
+
+def test_same_version_force_refresh_started_later_wins_when_it_finishes_first():
+    earlier_rows_started = threading.Event()
+    allow_earlier_rows = threading.Event()
+    timestamps = threading.local()
+
+    class RacingRepository:
+        def get_version(self):
+            return 7
+
+        def get_active_rules(self):
+            if threading.current_thread().name == "earlier-refresh":
+                earlier_rows_started.set()
+                assert allow_earlier_rows.wait(timeout=2)
+                timestamps.value = 110.0
+                return [FakeRuleRepository.literal_row("earlier")]
+            timestamps.value = 120.0
+            return [FakeRuleRepository.literal_row("later")]
+
+    store = SensitiveWordSnapshotStore(
+        RacingRepository(), monotonic=lambda: timestamps.value
+    )
+    earlier_result = []
+    earlier = threading.Thread(
+        target=lambda: earlier_result.append(store.refresh(force=True)),
+        name="earlier-refresh",
+    )
+    earlier.start()
+    assert earlier_rows_started.wait(timeout=2)
+
+    later = store.refresh(force=True)
+    allow_earlier_rows.set()
+    earlier.join(timeout=2)
+
+    assert not earlier.is_alive()
+    latest = store.current_snapshot()
+    assert earlier_result == [later]
+    assert latest is later
+    assert latest.literal_rules[0].expression == "later"
+    assert latest.loaded_at == 120.0
+    assert latest.verified_at == 120.0
+
+
+def test_later_failed_same_version_refresh_still_blocks_earlier_candidate(
+    fake_rule_repository,
+):
+    earlier_rows_started = threading.Event()
+    allow_earlier_rows = threading.Event()
+    store = SensitiveWordSnapshotStore(fake_rule_repository, monotonic=ManualClock())
+    first = store.refresh(force=True)
+
+    def racing_rows():
+        if threading.current_thread().name == "earlier-refresh":
+            earlier_rows_started.set()
+            assert allow_earlier_rows.wait(timeout=2)
+            return [fake_rule_repository.literal_row("earlier")]
+        return [fake_rule_repository.literal_row("   ")]
+
+    fake_rule_repository.get_active_rules = racing_rows
+    earlier_result = []
+    earlier = threading.Thread(
+        target=lambda: earlier_result.append(store.refresh(force=True)),
+        name="earlier-refresh",
+    )
+    earlier.start()
+    assert earlier_rows_started.wait(timeout=2)
+
+    with pytest.raises(ValueError, match="^moderation rule expression unavailable$"):
+        store.refresh(force=True)
+    allow_earlier_rows.set()
+    earlier.join(timeout=2)
+
+    assert not earlier.is_alive()
+    assert earlier_result == [first]
+    assert store.current_snapshot() is first
+
+
+def test_later_same_version_verification_prevents_earlier_force_load_overwrite(
+    fake_rule_repository,
+):
+    force_rows_started = threading.Event()
+    allow_force_rows = threading.Event()
+    clock = ManualClock()
+    store = SensitiveWordSnapshotStore(fake_rule_repository, monotonic=clock)
+    first = store.refresh(force=True)
+    original_get_active_rules = fake_rule_repository.get_active_rules
+
+    def blocking_rows():
+        force_rows_started.set()
+        assert allow_force_rows.wait(timeout=2)
+        return original_get_active_rules()
+
+    fake_rule_repository.get_active_rules = blocking_rows
+    force_result = []
+    force = threading.Thread(
+        target=lambda: force_result.append(store.refresh(force=True)),
+        name="force-refresh",
+    )
+    force.start()
+    assert force_rows_started.wait(timeout=2)
+
+    clock.value = 120.0
+    verified = store.refresh()
+    allow_force_rows.set()
+    force.join(timeout=2)
+
+    assert not force.is_alive()
+    assert force_result == [verified]
+    assert verified is store.current_snapshot()
+    assert verified is not first
+    assert verified.literal_rules is first.literal_rules
+    assert verified.loaded_at == first.loaded_at
+    assert verified.verified_at == 120.0
+
+
+def test_same_version_verification_cannot_overwrite_concurrent_force_result(
+    fake_rule_repository,
+):
+    clock_entered = threading.Event()
+    allow_clock = threading.Event()
+
+    class BlockingClock:
+        def __init__(self):
+            self.block = False
+            self.value = 100.0
+
+        def __call__(self):
+            if self.block and threading.current_thread().name == "verification-refresh":
+                clock_entered.set()
+                assert allow_clock.wait(timeout=2)
+            return self.value
+
+    clock = BlockingClock()
+    store = SensitiveWordSnapshotStore(fake_rule_repository, monotonic=clock)
+    first = store.refresh(force=True)
+    clock.block = True
+    verification_result = []
+    verification = threading.Thread(
+        target=lambda: verification_result.append(store.refresh()),
+        name="verification-refresh",
+    )
+    verification.start()
+    assert clock_entered.wait(timeout=2)
+
+    fake_rule_repository.rows = [fake_rule_repository.literal_row("replacement")]
+    clock.block = False
+    clock.value = 120.0
+    forced = store.refresh(force=True)
+    allow_clock.set()
+    verification.join(timeout=2)
+
+    assert not verification.is_alive()
+    assert verification_result == [forced]
+    assert first.version == forced.version == 1
+    assert store.current_snapshot() is forced
+    assert forced.literal_rules[0].expression == "replacement"
+    assert forced.loaded_at == forced.verified_at == 120.0
 
 
 def test_same_version_verification_cannot_overwrite_concurrently_loaded_version(
@@ -653,64 +865,129 @@ def test_main_lifespan_merges_init_refresh_poll_and_shutdown_without_secrets(
     asyncio.run(exercise())
 
 
-def test_main_shutdown_cancels_poller_that_does_not_honor_stop(monkeypatch):
+def test_main_shutdown_waits_for_blocked_to_thread_refresh(monkeypatch):
+    async def exercise():
+        import app.main as main_module
+
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_release = threading.Event()
+        worker_finished = threading.Event()
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+
+        def blocking_poll_refresh(force=False):
+            if force:
+                return None
+            loop.call_soon_threadsafe(worker_started.set)
+            try:
+                assert worker_release.wait(timeout=2)
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr(
+            main_module.snapshot_store, "refresh", blocking_poll_refresh
+        )
+
+        async def enter_and_exit():
+            async with main_module.lifespan(main_module.app):
+                await worker_started.wait()
+
+        task = asyncio.create_task(enter_and_exit())
+        await worker_started.wait()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+        assert not task.done()
+        assert not worker_finished.is_set()
+
+        worker_release.set()
+        await asyncio.wait_for(task, timeout=2)
+        assert worker_finished.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_main_cancelled_lifespan_waits_for_blocked_refresh_before_propagating(
+    monkeypatch,
+):
+    async def exercise():
+        import app.main as main_module
+
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_release = threading.Event()
+        worker_finished = threading.Event()
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+
+        def blocking_poll_refresh(force=False):
+            if force:
+                return None
+            loop.call_soon_threadsafe(worker_started.set)
+            try:
+                assert worker_release.wait(timeout=2)
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr(
+            main_module.snapshot_store, "refresh", blocking_poll_refresh
+        )
+
+        async def run_lifespan():
+            async with main_module.lifespan(main_module.app):
+                await worker_started.wait()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(run_lifespan())
+        await worker_started.wait()
+        task.cancel()
+
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        assert task not in done
+        assert not worker_finished.is_set()
+
+        worker_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert worker_finished.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_main_cancellation_during_shutdown_waits_then_propagates(monkeypatch):
     async def exercise():
         import app.main as main_module
 
         poll_started = asyncio.Event()
-        poll_cancelled = asyncio.Event()
+        shutdown_started = asyncio.Event()
+        allow_poll_finish = asyncio.Event()
 
         monkeypatch.setattr(main_module, "init_db", lambda: None)
         monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
 
-        async def stuck_poll(store, stop, interval=30.0):
+        async def controlled_poll(store, stop, interval=30.0):
             poll_started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                poll_cancelled.set()
+            await stop.wait()
+            shutdown_started.set()
+            await allow_poll_finish.wait()
 
-        monkeypatch.setattr(main_module, "poll_snapshots", stuck_poll)
+        monkeypatch.setattr(main_module, "poll_snapshots", controlled_poll)
 
         async def enter_and_exit():
             async with main_module.lifespan(main_module.app):
                 await poll_started.wait()
 
-        await asyncio.wait_for(enter_and_exit(), timeout=0.25)
-        assert poll_cancelled.is_set()
-
-    asyncio.run(exercise())
-
-
-def test_main_cancelled_lifespan_finishes_its_poller(monkeypatch):
-    async def exercise():
-        import app.main as main_module
-
-        lifespan_entered = asyncio.Event()
-        poll_finished = asyncio.Event()
-
-        monkeypatch.setattr(main_module, "init_db", lambda: None)
-        monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
-
-        async def cooperative_poll(store, stop, interval=30.0):
-            await stop.wait()
-            poll_finished.set()
-
-        monkeypatch.setattr(main_module, "poll_snapshots", cooperative_poll)
-
-        async def run_lifespan():
-            async with main_module.lifespan(main_module.app):
-                lifespan_entered.set()
-                await asyncio.Event().wait()
-
-        task = asyncio.create_task(run_lifespan())
-        await lifespan_entered.wait()
+        task = asyncio.create_task(enter_and_exit())
+        await shutdown_started.wait()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
 
-        assert task.done()
-        assert poll_finished.is_set()
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        assert task not in done
+
+        allow_poll_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(exercise())
 
@@ -737,6 +1014,87 @@ def test_main_exceptional_lifespan_finishes_its_poller(monkeypatch):
 
         assert caught.value is sentinel
         assert poll_finished.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_main_poller_failure_does_not_replace_body_error(monkeypatch, caplog):
+    async def exercise():
+        import app.main as main_module
+
+        poll_failed = asyncio.Event()
+        body_error = ValueError("private-body-error")
+        poller_error = RuntimeError("private-poller-error")
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+        monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
+
+        async def failing_poll(store, stop, interval=30.0):
+            poll_failed.set()
+            raise poller_error
+
+        monkeypatch.setattr(main_module, "poll_snapshots", failing_poll)
+
+        with caplog.at_level(logging.ERROR, logger=main_module.__name__):
+            with pytest.raises(ValueError) as caught:
+                async with main_module.lifespan(main_module.app):
+                    await poll_failed.wait()
+                    raise body_error
+
+        assert caught.value is body_error
+        assert "moderation_snapshot_poller_failed" in caplog.text
+        assert "private-poller-error" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    asyncio.run(exercise())
+
+
+def test_main_poller_failure_allows_clean_normal_shutdown(monkeypatch, caplog):
+    async def exercise():
+        import app.main as main_module
+
+        poll_failed = asyncio.Event()
+        poller_error = RuntimeError("private-poller-error")
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+        monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
+
+        async def failing_poll(store, stop, interval=30.0):
+            poll_failed.set()
+            raise poller_error
+
+        monkeypatch.setattr(main_module, "poll_snapshots", failing_poll)
+
+        with caplog.at_level(logging.ERROR, logger=main_module.__name__):
+            async with main_module.lifespan(main_module.app):
+                await poll_failed.wait()
+
+        assert "moderation_snapshot_poller_failed" in caplog.text
+        assert "private-poller-error" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    asyncio.run(exercise())
+
+
+def test_main_naturally_successful_poller_does_not_log_failure(monkeypatch, caplog):
+    async def exercise():
+        import app.main as main_module
+
+        poll_finished = asyncio.Event()
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+        monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
+
+        async def successful_poll(store, stop, interval=30.0):
+            poll_finished.set()
+
+        monkeypatch.setattr(main_module, "poll_snapshots", successful_poll)
+
+        with caplog.at_level(logging.ERROR, logger=main_module.__name__):
+            async with main_module.lifespan(main_module.app):
+                await poll_finished.wait()
+
+        assert "moderation_snapshot_poller_failed" not in caplog.text
 
     asyncio.run(exercise())
 

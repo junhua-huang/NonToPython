@@ -7,7 +7,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 import asyncio
 import logging
 import os
@@ -42,8 +42,6 @@ for _ws_logger_name in ['app.routers.ws', 'app.ws_manager']:
 
 logger = logging.getLogger(__name__)
 
-_MODERATION_POLLER_SHUTDOWN_TIMEOUT = 0.1
-
 moderation_service.local_moderator = LocalTextModerator(
     snapshot_store.current_snapshot
 )
@@ -67,21 +65,21 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop.set()
+        cancellation = None
+        while not poller.done():
+            try:
+                await asyncio.shield(poller)
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except Exception:
+                break
         try:
-            await asyncio.wait_for(
-                asyncio.shield(poller),
-                timeout=_MODERATION_POLLER_SHUTDOWN_TIMEOUT,
-            )
-        except TimeoutError:
-            poller.cancel()
-            with suppress(asyncio.CancelledError):
-                await poller
-        except asyncio.CancelledError:
-            poller.cancel()
-            with suppress(asyncio.CancelledError):
-                await poller
-            raise
+            poller.result()
+        except BaseException:
+            logger.error("moderation_snapshot_poller_failed")
         logger.info("Shutting down NanTuPy server...")
+        if cancellation is not None:
+            raise cancellation
 
 
 # 安全：生产环境通过 HIDE_API_DOCS=1 关闭 openapi.json / docs / redoc，

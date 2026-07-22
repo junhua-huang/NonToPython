@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import replace
 import logging
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -11,6 +10,7 @@ import regex
 
 from app.database import SessionLocal
 from app.models.models import SensitiveWord, SensitiveWordVersion
+from app.services.local_text_moderator import normalize_text
 from app.services.moderation_errors import ModerationUnavailable
 from app.services.moderation_types import (
     CompiledRegexRule,
@@ -31,8 +31,6 @@ _REGEX_PROBES = (
     "0" * 2048 + "!",
     "词" * 1024 + "!",
 )
-_BACK_REFERENCE = re.compile(r"\\(?:[1-9]|g<|k<)")
-_HIGH_RISK_EXTENSION = re.compile(r"\(\?(?:<[-=!]|P=|R|0|&|\(|[1-9])")
 
 
 class _RegexGroup:
@@ -73,12 +71,17 @@ def _quantifier_end(expression: str, start: int) -> int | None:
     return end
 
 
-def _has_unsafe_repeat_structure(expression: str) -> bool:
+def _has_unsafe_regex_structure(expression: str) -> bool:
     groups = [_RegexGroup()]
     index = 0
     while index < len(expression):
         character = expression[index]
         if character == "\\":
+            if index + 1 < len(expression) and (
+                expression[index + 1] in "123456789"
+                or expression.startswith(("\\g<", "\\k<"), index)
+            ):
+                return True
             index += 2
             continue
         if character == "[":
@@ -140,13 +143,7 @@ def validate_safe_regex(pattern: str) -> str:
     expression = pattern.strip()
     if not expression or len(expression) > _REGEX_MAX_LENGTH:
         raise RegexValidationError("regex length out of range")
-    if (
-        _has_unsafe_repeat_structure(expression)
-        or _BACK_REFERENCE.search(expression)
-        or "(?<=" in expression
-        or "(?<!" in expression
-        or _HIGH_RISK_EXTENSION.search(expression)
-    ):
+    if _has_unsafe_regex_structure(expression):
         raise RegexValidationError("unsafe regex structure")
     try:
         compiled = regex.compile(expression)
@@ -199,22 +196,35 @@ class SensitiveWordSnapshotStore:
         self._monotonic = monotonic
         self._lock = threading.Lock()
         self._snapshot: ModerationSnapshot | None = None
+        self._generation = 0
+        self._version_generations: dict[int, int] = {}
 
     def _read_snapshot(self) -> ModerationSnapshot | None:
         with self._lock:
             return self._snapshot
 
     def refresh(self, force: bool = False) -> ModerationSnapshot:
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+
         version = self._repository.get_version()
+        with self._lock:
+            self._version_generations[version] = max(
+                generation, self._version_generations.get(version, 0)
+            )
         current = self._read_snapshot()
 
         if not force and current is not None and current.version == version:
             verified = replace(current, verified_at=self._monotonic())
             with self._lock:
-                if self._snapshot is current:
+                latest = self._snapshot
+                if (
+                    latest is current
+                    and generation == self._version_generations[version]
+                ):
                     self._snapshot = verified
                     return verified
-                latest = self._snapshot
             if latest is None:
                 raise RuntimeError("moderation snapshot unavailable")
             return latest
@@ -225,6 +235,8 @@ class SensitiveWordSnapshotStore:
         for row in rows:
             if row.match_type == "literal":
                 expression = row.word
+                if not isinstance(expression, str) or not normalize_text(expression):
+                    raise ValueError("moderation rule expression unavailable")
             elif row.match_type == "regex":
                 expression = validate_safe_regex(row.word)
             else:
@@ -260,6 +272,10 @@ class SensitiveWordSnapshotStore:
             latest = self._snapshot
             if latest is not None and latest.version > candidate.version:
                 raise RuntimeError("moderation rule version regressed")
+            if generation < self._version_generations[version]:
+                if latest is None:
+                    raise RuntimeError("moderation snapshot unavailable")
+                return latest
             self._snapshot = candidate
         return candidate
 
