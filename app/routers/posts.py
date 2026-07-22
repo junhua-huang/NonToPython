@@ -21,6 +21,8 @@ from app.core.config import Config
 from app.utils import FileUploader
 from app.services.topic_service import TopicService
 from app.services.mention_service import MentionService
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,6 +100,13 @@ async def create_post(
         community_id,
         community_only is True,
     )
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/posts",
+        {"content": content},
+        actor_user_id=current_user_id,
+        is_public=(visibility == "public" and not community_only),
+    )
 
     final_image_url = None
     final_video_url = video_url_input
@@ -153,23 +162,6 @@ async def create_post(
 
     if not content and not final_image_url and not final_video_url:
         raise HTTPException(status_code=400, detail="Content or media file is required")
-
-    # 内容审核
-    if content:
-        from app.services.content_moderation import ContentModeration
-        moderation_result = ContentModeration.check_content(content)
-        if not moderation_result["approved"]:
-            ContentModeration.log_moderation(
-                user_id=current_user_id,
-                content_type="post",
-                original_text=content,
-                reasons=moderation_result["reasons"],
-            )
-            raise HTTPException(status_code=400, detail={
-                "error": "Content rejected by moderation",
-                "reasons": moderation_result["reasons"],
-            })
-        content = moderation_result["filtered_text"]
 
     post = Post(
         content=content,
@@ -326,6 +318,13 @@ def update_post(
         raise HTTPException(status_code=422, detail="is_public is no longer a supported visibility selector")
     if "visible_user_ids" in payload and payload["visible_user_ids"] not in (None, "", [], (), set()):
         raise HTTPException(status_code=422, detail="visible_user_ids custom audiences are no longer supported")
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/posts/{post_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=((payload.get("visibility", post.visibility) == "public") and not next_community_only),
+    )
     if "visibility" in payload:
         try:
             post.visibility = validate_post_visibility_write(payload["visibility"], payload.get("visible_user_ids"))

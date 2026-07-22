@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Report
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 router = APIRouter()
 
@@ -56,6 +58,13 @@ def submit_report(
     db: Session = Depends(get_db),
 ):
     """提交举报（统一入口：{type, target_id, reason}）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/reports",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     return _handle_report(
         report_type=payload.get("type", ""),
         target_id=payload.get("target_id"),
@@ -72,6 +81,13 @@ def report_post(
     db: Session = Depends(get_db),
 ):
     """举报帖子（别名：前端 POST /reports/post {post_id, reason}）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/reports/post",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     return _handle_report(
         report_type="post",
         target_id=payload.get("post_id"),
@@ -88,6 +104,13 @@ def report_comment(
     db: Session = Depends(get_db),
 ):
     """举报评论（别名：前端 POST /reports/comment {comment_id, reason}）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/reports/comment",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     return _handle_report(
         report_type="comment",
         target_id=payload.get("comment_id"),
@@ -104,6 +127,13 @@ def report_user(
     db: Session = Depends(get_db),
 ):
     """举报用户（别名：前端 POST /reports/user {user_id, reason}）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/reports/user",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     return _handle_report(
         report_type="user",
         target_id=payload.get("user_id"),

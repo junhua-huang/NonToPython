@@ -15,6 +15,8 @@ from app.models.models import (
     User, ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
     ComicComment, ComicLike, ComicCommentLike,
 )
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 router = APIRouter()
 
@@ -363,6 +365,19 @@ def create_event(
     website = payload.get('website')
     tag_ids = payload.get('tagIds') or payload.get('tag_ids') or []
     image_urls = payload.get('imageUrls') or payload.get('image_urls') or []
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/comic/events",
+        {
+            "name": name,
+            "venue": venue,
+            "ticket_info": ticket_info,
+            "website": website,
+            "intro": intro,
+        },
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     if not name:
         raise HTTPException(status_code=400, detail='漫展名称不能为空')
@@ -442,6 +457,19 @@ def update_event(
     website = payload.get('website')
     tag_ids = payload.get('tagIds') or payload.get('tag_ids') or []
     image_urls = payload.get('imageUrls') or payload.get('image_urls') or []
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/comic/events/{event_id}",
+        {
+            "name": name,
+            "venue": venue,
+            "ticket_info": ticket_info,
+            "website": website,
+            "intro": intro,
+        },
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     now = datetime.utcnow()
     upd = text("""
@@ -819,6 +847,13 @@ def post_comic_comment(
 
     if not content or len(content) > 2000:
         raise HTTPException(status_code=400, detail="评论内容不能为空且不超过2000字")
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/comic/events/{event_id}/comments",
+        {"content": content},
+        actor_user_id=current_user.id,
+        is_public=True,
+    )
 
     if parent_id:
         parent = db.query(ComicComment).filter(ComicComment.id == parent_id).first()

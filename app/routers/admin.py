@@ -20,6 +20,8 @@ from app.models.models import (
     UserRole,
 )
 from app.services.local_text_moderator import normalize_text
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 from app.services.moderation_snapshot import RegexValidationError, validate_safe_regex
 from app.services.moderation_types import RiskCategory
 
@@ -413,6 +415,13 @@ def admin_approve_application(
         raise HTTPException(status_code=404, detail="Application not found")
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
+    moderate_route_fields(
+        moderation_service,
+        "POST /role-applications/{application_id}/approve",
+        payload,
+        actor_user_id=admin.id,
+        is_public=False,
+    )
 
     app.status = "verified"
     app.review_comment = payload.get("review_comment", "")
@@ -446,6 +455,13 @@ def admin_reject_application(
         raise HTTPException(status_code=404, detail="Application not found")
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
+    moderate_route_fields(
+        moderation_service,
+        "POST /role-applications/{application_id}/reject",
+        payload,
+        actor_user_id=admin.id,
+        is_public=False,
+    )
 
     app.status = "rejected"
     app.review_comment = payload.get("review_comment", "")
@@ -470,6 +486,13 @@ def admin_suspend_application(
     app = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
+    moderate_route_fields(
+        moderation_service,
+        "POST /role-applications/{application_id}/suspend",
+        payload,
+        actor_user_id=admin.id,
+        is_public=False,
+    )
 
     app.status = "suspended"
     app.review_comment = payload.get("review_comment", "")

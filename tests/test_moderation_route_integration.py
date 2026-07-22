@@ -133,3 +133,238 @@ def test_moderate_route_fields_fails_closed_for_bad_payload_shape():
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["code"] == "MODERATION_UNAVAILABLE"
     assert service.calls == []
+
+
+def test_all_inventory_write_route_keys_are_wired_in_route_modules():
+    import inspect
+
+    from app.routers import admin, auth, chat, comic, communities, interactions, posts, reports, roles, topics, ws
+
+    modules_by_route_key = {
+        "POST /api/auth/register": auth,
+        "PUT /api/auth/profile": auth,
+        "POST /api/posts": posts,
+        "PUT /api/posts/{post_id}": posts,
+        "POST /api/posts/{post_id}/comments": interactions,
+        "PUT /api/comments/{comment_id}": interactions,
+        "POST /api/chat/conversations/{conversation_id}/messages": chat,
+        "WS send_message": ws,
+        "POST /api/communities": communities,
+        "PATCH /api/communities/{community_id}": communities,
+        "POST /api/communities/{community_id}/join": communities,
+        "POST /api/communities/{community_id}/announcements": communities,
+        "PATCH /api/communities/{community_id}/announcements/{announcement_id}": communities,
+        "POST /api/communities/{community_id}/bans": communities,
+        "POST /api/communities/{community_id}/chat/messages": communities,
+        "POST /api/comic/events": comic,
+        "PUT /api/comic/events/{event_id}": comic,
+        "POST /api/comic/events/{event_id}/comments": comic,
+        "POST /api/roles/apply": roles,
+        "PUT /api/roles/profiles/coser": roles,
+        "PUT /api/roles/profiles/photographer": roles,
+        "PUT /api/roles/profiles/service": roles,
+        "POST /api/roles/applications/{application_id}/approve": roles,
+        "POST /api/roles/applications/{application_id}/reject": roles,
+        "POST /api/roles/applications/{application_id}/suspend": roles,
+        "POST /role-applications/{application_id}/approve": admin,
+        "POST /role-applications/{application_id}/reject": admin,
+        "POST /role-applications/{application_id}/suspend": admin,
+        "POST /api/topics": topics,
+        "PUT /api/topics/{topic_id}": topics,
+        "POST /api/reports": reports,
+        "POST /api/reports/post": reports,
+        "POST /api/reports/comment": reports,
+        "POST /api/reports/user": reports,
+    }
+
+    missing = {
+        route_key: module.__name__
+        for route_key, module in modules_by_route_key.items()
+        if route_key not in inspect.getsource(module)
+    }
+
+    assert missing == {}
+
+
+def test_create_post_moderates_before_file_upload_and_db_mutation(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.routers import posts as posts_router
+
+    events = []
+
+    class FakeUpload:
+        filename = "clip.mp4"
+
+    class FakeDB:
+        def add(self, item):
+            events.append(("db.add", type(item).__name__))
+
+        def flush(self):
+            events.append(("db.flush",))
+
+        def commit(self):
+            events.append(("db.commit",))
+
+        def rollback(self):
+            events.append(("db.rollback",))
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    def fake_save_file(*args, **kwargs):
+        events.append(("file_upload",))
+        return {"success": True, "url": "https://files.example/video.mp4"}
+
+    monkeypatch.setattr(posts_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(posts_router, "moderation_service", object(), raising=False)
+    monkeypatch.setattr(posts_router.FileUploader, "save_file", fake_save_file)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+                posts_router.create_post(
+                    image=None,
+                    video=FakeUpload(),
+                    content="sample text",
+                    image_urls=None,
+                    video_url_input=None,
+                    content_category=None,
+                    display_role_type=None,
+                    visibility="public",
+                    visible_user_ids=None,
+                    community_id=None,
+                    community_only=False,
+                    user=SimpleNamespace(id=42),
+                    db=FakeDB(),
+                )
+
+        )
+
+    assert exc_info.value.status_code == 422
+    assert events == [("moderate", "POST /api/posts", ["content"], 42, True)]
+
+
+def test_create_community_moderates_before_service_side_effect(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.routers import communities as communities_router
+
+    events = []
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    def fake_create_community(*args, **kwargs):
+        events.append(("service.create_community",))
+        raise AssertionError("community service should not run after moderation rejection")
+
+    monkeypatch.setattr(communities_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(communities_router, "moderation_service", object(), raising=False)
+    monkeypatch.setattr(communities_router.CommunityService, "create_community", fake_create_community)
+
+    with pytest.raises(HTTPException) as exc_info:
+        communities_router.create_community(
+            {"name": "sample", "description": "sample", "rules": "sample"},
+            user=SimpleNamespace(id=17),
+            db=object(),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert events == [
+        (
+            "moderate",
+            "POST /api/communities",
+            ["description", "name", "rules"],
+            17,
+            True,
+        )
+    ]
+
+
+def test_private_chat_message_moderates_before_persist_and_fanout(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.routers import chat as chat_router
+
+    events = []
+    conversation = SimpleNamespace(id=5, type="single", community_id=None, last_message_at=None)
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return conversation
+
+        def count(self):
+            return 0
+
+    class FakeDB:
+        def query(self, *args, **kwargs):
+            return FakeQuery()
+
+        def add(self, item):
+            events.append(("db.add", type(item).__name__))
+
+        def commit(self):
+            events.append(("db.commit",))
+
+        def refresh(self, item):
+            events.append(("db.refresh",))
+
+        def rollback(self):
+            events.append(("db.rollback",))
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    monkeypatch.setattr(chat_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(chat_router, "moderation_service", object(), raising=False)
+    monkeypatch.setattr(chat_router, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(chat_router, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(
+        chat_router,
+        "normalize_user_message_payload",
+        lambda payload, *args, **kwargs: {
+            "content": payload.get("content", ""),
+            "message_type": payload.get("message_type", "text"),
+            "media_url": payload.get("media_url"),
+            "related_id": payload.get("related_id"),
+        },
+    )
+    monkeypatch.setattr(chat_router, "validate_quote", lambda *args, **kwargs: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            chat_router.send_message(
+                5,
+                {"content": "sample text", "media_url": "https://files.example/private.png"},
+                user=SimpleNamespace(id=1),
+                db=FakeDB(),
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    assert events == [
+        (
+            "moderate",
+            "POST /api/chat/conversations/{conversation_id}/messages",
+            ["content"],
+            1,
+            False,
+        )
+    ]

@@ -26,6 +26,8 @@ from app.services.quote_service import (
     inject_quote_preview_batch,
     validate_quote,
 )
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -120,6 +122,13 @@ def create_community(
     db: Session = Depends(get_db),
 ):
     """创建社群"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/communities",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         c = CommunityService.create_community(
             db=db, owner_id=user.id,
@@ -176,6 +185,13 @@ def update_community(
     db: Session = Depends(get_db),
 ):
     """编辑社群（owner/admin）"""
+    moderate_route_fields(
+        moderation_service,
+        "PATCH /api/communities/{community_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         c = CommunityService.update_community(db, community_id, user.id, **payload)
         return {"community": c.to_dict()}
@@ -207,6 +223,13 @@ def join_community(
     db: Session = Depends(get_db),
 ):
     """申请加群"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/communities/{community_id}/join",
+        payload,
+        actor_user_id=user.id,
+        is_public=False,
+    )
     def _do():
         return CommunityService.request_join(db, community_id, user.id, payload.get("message"))
     return _handle(_do)
@@ -320,6 +343,13 @@ def create_announcement(
     db: Session = Depends(get_db),
 ):
     """发布公告（管理员+）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/communities/{community_id}/announcements",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         a = CommunityService.create_announcement(
             db, community_id, user.id,
@@ -340,6 +370,13 @@ def update_announcement(
     db: Session = Depends(get_db),
 ):
     """编辑公告（管理员+）"""
+    moderate_route_fields(
+        moderation_service,
+        "PATCH /api/communities/{community_id}/announcements/{announcement_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         a = CommunityService.update_announcement(
             db, community_id, announcement_id, user.id, **payload
@@ -389,6 +426,13 @@ def ban_user(
     db: Session = Depends(get_db),
 ):
     """拉黑用户（管理员+）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/communities/{community_id}/bans",
+        payload,
+        actor_user_id=user.id,
+        is_public=False,
+    )
     def _do():
         b = CommunityService.ban_user(
             db, community_id, user.id,
@@ -616,6 +660,13 @@ async def send_community_message(
 
     content, message_type, media_url, related_id, mention_user_ids = (
         _normalize_community_message_payload(payload, db, user.id, community_id)
+    )
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/communities/{community_id}/chat/messages",
+        {"content": content},
+        actor_user_id=user.id,
+        is_public=False,
     )
 
     # 校验并生成引用预览（实时生成，不入库 quote_preview）

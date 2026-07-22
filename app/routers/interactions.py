@@ -12,6 +12,8 @@ from app.services.notification_service import NotificationService
 from app.services.mention_service import MentionService
 from app.services.post_visibility_service import can_view_post, load_visible_post
 from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 router = APIRouter()
 
@@ -223,14 +225,13 @@ def create_comment(
     content = payload.get("content")
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
-
-    from app.services.content_moderation import ContentModeration
-    moderation_result = ContentModeration.check_content(content)
-    if not moderation_result["approved"]:
-        ContentModeration.log_moderation(
-            user_id=user.id, content_type="comment", original_text=content, reasons=moderation_result["reasons"]
-        )
-        raise HTTPException(status_code=400, detail={"error": "Content rejected by moderation", "reasons": moderation_result["reasons"]})
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/posts/{post_id}/comments",
+        payload,
+        actor_user_id=user.id,
+        is_public=not bool(getattr(post, "community_only", False)),
+    )
 
     parent_id = payload.get("parent_id")
     reply_to_user_id = payload.get("reply_to_user_id")
@@ -449,6 +450,13 @@ def update_comment(
     content = payload.get("content")
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/comments/{comment_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     comment.content = content
     try:

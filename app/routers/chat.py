@@ -33,6 +33,8 @@ from app.services.chat_read_state_service import (
     get_total_unread_count,
     mark_community_conversation_read,
 )
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -641,6 +643,13 @@ async def send_message(
     message_type = normalized["message_type"]
     media_url = normalized["media_url"]
     related_id = normalized["related_id"]
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/chat/conversations/{conversation_id}/messages",
+        {"content": content},
+        actor_user_id=user.id,
+        is_public=False,
+    )
 
     # 校验并生成引用预览（实时生成，不入库 quote_preview）
     quote_message_id = payload.get("quote_message_id")

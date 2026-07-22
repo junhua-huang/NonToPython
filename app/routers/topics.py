@@ -8,6 +8,8 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_content_manager
 from app.models.models import User, Topic, topic_followers
 from app.services.topic_service import TopicService
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 router = APIRouter()
 
@@ -201,6 +203,13 @@ def create_topic(
 
     if not name:
         raise HTTPException(status_code=400, detail="Topic name is required")
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/topics",
+        {"name": name, "description": description},
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     existing = TopicService.get_topic_by_name(db, name)
     if existing:
@@ -260,6 +269,13 @@ def update_topic(
     topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/topics/{topic_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     if "description" in payload:
         topic.description = payload["description"]

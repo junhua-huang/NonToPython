@@ -20,6 +20,8 @@ from app.models.models import (
     User, Role, UserRole, RoleApplication,
     CoserProfile, PhotographerProfile, ServiceProfile,
 )
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/roles", tags=["Roles"])
@@ -143,6 +145,13 @@ def apply_role(
 ):
     """用户自主申请角色（管理员角色不可申请）"""
     role_name = data.role_name.strip().lower()
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/roles/apply",
+        data.model_dump(),
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     if role_name not in BUSINESS_IDENTITY_ROLES:
         raise HTTPException(status_code=403, detail="Only business identities can be applied for")
@@ -268,6 +277,13 @@ def approve_application(
         raise HTTPException(status_code=404, detail="Application not found")
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/roles/applications/{application_id}/approve",
+        data.model_dump(),
+        actor_user_id=user.id,
+        is_public=False,
+    )
 
     app.status = "verified"
     app.review_comment = data.review_comment.strip()
@@ -301,6 +317,13 @@ def reject_application(
         raise HTTPException(status_code=404, detail="Application not found")
     if app.status != "pending":
         raise HTTPException(status_code=409, detail="Application is not pending")
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/roles/applications/{application_id}/reject",
+        data.model_dump(),
+        actor_user_id=user.id,
+        is_public=False,
+    )
 
     app.status = "rejected"
     app.review_comment = data.review_comment.strip()
@@ -324,6 +347,13 @@ def suspend_application(
     app = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/roles/applications/{application_id}/suspend",
+        data.model_dump(),
+        actor_user_id=user.id,
+        is_public=False,
+    )
 
     app.status = "suspended"
     app.review_comment = data.review_comment.strip()
@@ -374,6 +404,13 @@ def update_coser_profile(
     db: Session = Depends(get_db),
 ):
     """更新 Coser 专属资料"""
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/roles/profiles/coser",
+        data.model_dump(exclude_none=True),
+        actor_user_id=user.id,
+        is_public=True,
+    )
     profile = db.query(CoserProfile).filter(CoserProfile.user_id == user.id).first()
     if not profile:
         profile = CoserProfile(user_id=user.id)
@@ -394,6 +431,13 @@ def update_photographer_profile(
     db: Session = Depends(get_db),
 ):
     """更新摄影师专属资料"""
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/roles/profiles/photographer",
+        data.model_dump(exclude_none=True),
+        actor_user_id=user.id,
+        is_public=True,
+    )
     profile = db.query(PhotographerProfile).filter(PhotographerProfile.user_id == user.id).first()
     if not profile:
         profile = PhotographerProfile(user_id=user.id)
@@ -429,6 +473,13 @@ def update_service_profile(
     )
     if not verified_service_role:
         raise HTTPException(status_code=403, detail="Required verified service identity")
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/roles/profiles/service",
+        data.model_dump(exclude_none=True),
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     profile = db.query(ServiceProfile).filter(
         ServiceProfile.user_id == user.id,

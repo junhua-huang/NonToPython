@@ -23,6 +23,8 @@ from app.dependencies import get_current_user, get_optional_user
 from app.services.email_service import EmailService
 from app.services.otp_service import OtpService
 from app.services.block_service import has_block_between
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 from app.serializers.user import serialize_user_profile, serialize_user_self
 
 logger = logging.getLogger(__name__)
@@ -313,6 +315,13 @@ def verify_otp(data: VerifyOtpRequest, db: Session = Depends(get_db)):
 @router.post("/register", response_model=AuthResponse)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
     """用户注册（必须先通过 /auth/send-otp purpose=register 拿到邮箱验证码）"""
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/auth/register",
+        data.model_dump(),
+        actor_user_id=None,
+        is_public=True,
+    )
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
     if db.query(User).filter(User.email == data.email).first():
@@ -446,6 +455,13 @@ def update_profile(
     db: Session = Depends(get_db),
 ):
     """修改当前用户个人资料"""
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/auth/profile",
+        data.model_dump(exclude_none=True),
+        actor_user_id=user.id,
+        is_public=True,
+    )
     current = db.query(User).filter(User.id == user.id).first()
     if data.display_name is not None:
         # display_name 映射为 username（如业务允许）

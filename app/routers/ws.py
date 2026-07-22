@@ -12,7 +12,6 @@ WebSocket 端点 — 即时通讯协议
 
 from datetime import datetime
 import asyncio
-import json
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
@@ -40,6 +39,8 @@ from app.services.chat_read_state_service import (
     get_community_unread_counts,
     mark_community_conversation_read,
 )
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +448,17 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     validation_error = _validate_send_message_payload(payload)
     if validation_error:
         await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
+        return
+    try:
+        moderate_route_fields(
+            moderation_service,
+            "WS send_message",
+            {"content": content},
+            actor_user_id=user_id,
+            is_public=False,
+        )
+    except HTTPException as exc:
+        await _send_error(user_id, request_id, exc.status_code, exc.detail)
         return
 
     # 1. 幂等
@@ -1015,7 +1027,12 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type", "")
-            logger.debug(f"[WS RECV] uid={user_id} {msg_type} {json.dumps(data, ensure_ascii=False)}")
+            logger.debug(
+                "[WS RECV] uid=%s type=%s has_payload=%s",
+                user_id,
+                msg_type,
+                isinstance(data.get("payload"), dict),
+            )
 
             if msg_type == "auth":
                 logger.debug(f"[WS AUTH] duplicate auth ignored uid={user_id}")
