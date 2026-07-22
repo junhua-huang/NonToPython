@@ -528,7 +528,15 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
         message = detail.get("message") or "内容审核失败"
-        await _send_error(user_id, request_id, exc.status_code, message)
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=exc.status_code,
+            code=detail.get("code") or "MODERATION_UNAVAILABLE",
+            retryable=bool(detail.get("retryable")),
+            message=message,
+        )
         return
 
     # 1. 幂等
@@ -1028,6 +1036,30 @@ async def _handle_typing(websocket: WebSocket, user_id: int, data: dict, is_typi
         exclude=user_id,
         actor_user_id=user_id,
     )
+
+
+async def _send_failed_ack(
+    user_id: int,
+    request_id: str,
+    client_msg_id: str,
+    *,
+    status: int,
+    code: str,
+    retryable: bool,
+    message: str,
+):
+    """发送终态失败 ACK（仅在 async 上下文中调用）"""
+    await ws_manager.send_raw(user_id, {
+        "type": "ack",
+        "request_id": request_id,
+        "client_msg_id": client_msg_id,
+        "clientMsgId": client_msg_id,
+        "status": status,
+        "code": code,
+        "retryable": retryable,
+        "msg": message,
+        "message": message,
+    })
 
 
 async def _send_error(user_id: int, request_id: str, code: int, msg: str):
