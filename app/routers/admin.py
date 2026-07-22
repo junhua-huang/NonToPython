@@ -89,6 +89,33 @@ def _validated_is_active(value: object) -> bool:
     return value
 
 
+def _payload_dict(payload: object) -> dict:
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(exclude_unset=True)
+    if not isinstance(payload, dict):
+        raise _invalid_rule("请求格式无效")
+    return dict(payload)
+
+
+def _create_payload_values(payload: object) -> dict:
+    raw = _payload_dict(payload)
+    if "word" not in raw:
+        raise _invalid_rule("规则内容不能为空")
+    return {
+        "word": raw.get("word"),
+        "match_type": raw.get("match_type", "literal"),
+        "category": raw.get("category", "other"),
+        "severity": raw.get("severity", "medium"),
+        "is_active": raw.get("is_active", True),
+    }
+
+
+def _patch_payload_values(payload: object) -> dict:
+    raw = _payload_dict(payload)
+    allowed = {"word", "match_type", "category", "severity", "is_active"}
+    return {key: raw[key] for key in allowed if key in raw}
+
+
 def _lock_rule_version(db: Session) -> SensitiveWordVersion:
     return db.execute(
         select(SensitiveWordVersion)
@@ -168,20 +195,21 @@ def get_sensitive_word(
 @moderation_router.post("/sensitive-words", status_code=201)
 @router.post("/sensitive-words", status_code=201)
 def add_sensitive_word(
-    payload: SensitiveWordCreate,
+    payload: object = Body(...),
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """添加敏感词"""
-    expression_value = _validated_expression(payload.word, payload.match_type)
-    _validate_metadata(payload.category, payload.severity)
-    is_active = _validated_is_active(payload.is_active)
+    values = _create_payload_values(payload)
+    expression_value = _validated_expression(values["word"], values["match_type"])
+    _validate_metadata(values["category"], values["severity"])
+    is_active = _validated_is_active(values["is_active"])
     version = _advance_rule_version(db)
     row = SensitiveWord(
         word=expression_value,
-        match_type=payload.match_type,
-        category=payload.category,
-        severity=payload.severity,
+        match_type=values["match_type"],
+        category=values["category"],
+        severity=values["severity"],
         is_active=is_active,
         row_version=version,
         created_by=user.id,
@@ -195,12 +223,12 @@ def add_sensitive_word(
 @moderation_router.patch("/sensitive-words/{word_id}")
 def patch_sensitive_word(
     word_id: int,
-    payload: SensitiveWordPatch,
+    payload: object = Body(...),
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     del user
-    values = payload.model_dump(exclude_unset=True)
+    values = _patch_payload_values(payload)
     version_row = _lock_rule_version(db)
     row = _locked_sensitive_word(db, word_id)
     if row is None:

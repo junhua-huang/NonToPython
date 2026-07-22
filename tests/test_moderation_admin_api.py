@@ -217,8 +217,9 @@ def test_pydantic_rejects_missing_or_oversized_input_before_version_mutation(
     admin_client, moderation_db
 ):
     before = current_version(moderation_db)
+    private_payload = "PRIVATE_BODY_8392"
 
-    missing = admin_client.post(CANONICAL, json={"category": "spam"})
+    missing = admin_client.post(CANONICAL, json={"category": private_payload})
     oversized = admin_client.post(
         CANONICAL,
         json={
@@ -230,7 +231,22 @@ def test_pydantic_rejects_missing_or_oversized_input_before_version_mutation(
     )
 
     assert missing.status_code == 422
+    assert private_payload not in str(missing.json())
     assert oversized.status_code == 422
+    assert current_version(moderation_db) == before
+
+
+def test_invalid_top_level_payload_does_not_echo_body(admin_client, moderation_db):
+    private_payload = "PRIVATE_BODY_1937"
+    before = current_version(moderation_db)
+
+    created = admin_client.post(CANONICAL, json=[private_payload])
+    patched = admin_client.patch(f"{CANONICAL}/1", json=[private_payload])
+
+    assert created.status_code == 422
+    assert patched.status_code == 422
+    assert private_payload not in str(created.json())
+    assert private_payload not in str(patched.json())
     assert current_version(moderation_db) == before
 
 
