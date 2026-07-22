@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from fastapi import HTTPException
 
 from app.routers import communities, ws
@@ -32,9 +33,26 @@ class FakeDB:
 class FakeWSManager:
     def __init__(self):
         self.raw = []
+        self.side_effects = []
 
     async def send_raw(self, user_id, payload):
         self.raw.append((user_id, payload))
+
+    async def check_and_record_dedup(self, *args, **kwargs):
+        self.side_effects.append(("check_and_record_dedup", args))
+        return False
+
+    async def update_dedup_message_id(self, *args, **kwargs):
+        self.side_effects.append(("update_dedup_message_id", args))
+
+    async def send_with_seq(self, *args, **kwargs):
+        self.side_effects.append(("send_with_seq", args))
+
+    def enqueue_push_batch(self, *args, **kwargs):
+        self.side_effects.append(("enqueue_push_batch", args))
+
+    def invalidate_participant_caches(self, *args, **kwargs):
+        self.side_effects.append(("invalidate_participant_caches", args))
 
 
 def test_http_community_chat_rejection_has_no_persistence_or_fanout(monkeypatch):
@@ -117,10 +135,11 @@ def test_http_community_chat_rejection_has_no_persistence_or_fanout(monkeypatch)
     ]
 
 
-def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch):
-    conv = SimpleNamespace(id=7, type="single", community_id=None)
+@pytest.mark.parametrize("conversation_type", ["single", "community"])
+def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch, conversation_type):
+    conv = SimpleNamespace(id=7, type=conversation_type, community_id=3 if conversation_type == "community" else None)
     manager = FakeWSManager()
-    dedup_events = []
+    opened_sessions = []
 
     def reject(*args, **kwargs):
         raise HTTPException(
@@ -132,18 +151,18 @@ def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch):
             },
         )
 
-    async def should_not_record_dedup(*args, **kwargs):
-        dedup_events.append(args)
-        return False
+    def session_factory():
+        session = FakeDB(conv)
+        opened_sessions.append(session)
+        return session
 
     monkeypatch.setattr(ws, "ws_manager", manager)
-    monkeypatch.setattr(ws, "_get_db_session", lambda: FakeDB(conv))
+    monkeypatch.setattr(ws, "_get_db_session", session_factory)
     monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
     monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
     monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
     monkeypatch.setattr(ws, "moderate_route_fields", reject)
-    monkeypatch.setattr(manager, "check_and_record_dedup", should_not_record_dedup, raising=False)
 
     asyncio.run(
         ws._handle_send_message(
@@ -178,8 +197,62 @@ def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch):
             },
         )
     ]
-    assert dedup_events == []
+    assert manager.side_effects == []
+    assert len(opened_sessions) == 1
+    assert opened_sessions[0].closed is True
     assert "message_id" not in manager.raw[0][1]
+
+
+def test_ws_same_user_duplicate_ack_bypasses_moderation_and_authorization(monkeypatch):
+    manager = FakeWSManager()
+    moderation_events = []
+
+    def fail_if_moderated(*args, **kwargs):
+        moderation_events.append(args)
+        raise AssertionError("duplicate sends must not be moderated again")
+
+    def fail_if_session_opened():
+        raise AssertionError("duplicate sends must not open an authorization or persistence session")
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: {"user_id": 1, "message_id": 99})
+    monkeypatch.setattr(ws, "_get_db_session", fail_if_session_opened)
+    monkeypatch.setattr(ws, "moderate_route_fields", fail_if_moderated)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-dup",
+                "payload": {
+                    "client_msg_id": "client-dup",
+                    "conversation_id": 7,
+                    "content": "blocked",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert moderation_events == []
+    assert manager.side_effects == []
+    assert manager.raw[0][1]["payload"] == {
+        "client_msg_id": "client-dup",
+        "server_seq": 0,
+        "message_id": 99,
+        "status": 200,
+        "msg": "duplicate",
+    }
+    assert manager.raw[1][1] == {
+        "type": "ack",
+        "clientMsgId": "client-dup",
+        "client_msg_id": "client-dup",
+        "message_id": 99,
+        "server_seq": 0,
+    }
+
 
 
 def test_ws_moderation_unavailable_failed_ack_is_retryable(monkeypatch):
