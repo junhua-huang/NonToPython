@@ -132,6 +132,9 @@ def test_message_text_payload_for_moderation_keeps_text_and_media_captions():
         }
     ) == {"content": "https://example.com banned text"}
     assert message_text_payload_for_moderation(
+        {"message_type": "image", "content": "https://cdn.example/a.png banned caption"}
+    ) == {"content": "https://cdn.example/a.png banned caption"}
+    assert message_text_payload_for_moderation(
         {"message_type": "post", "content": "https://example.com banned text"}
     ) == {"content": "https://example.com banned text"}
 

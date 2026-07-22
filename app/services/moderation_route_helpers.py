@@ -70,7 +70,11 @@ def message_text_payload_for_moderation(payload: object) -> dict[str, str]:
     if message_type in _MEDIA_MESSAGE_TYPES:
         if media_url and content == media_url:
             return {}
-        if not media_url and content.startswith(("http://", "https://")):
+        if (
+            not media_url
+            and content.startswith(("http://", "https://"))
+            and not any(character.isspace() for character in content)
+        ):
             return {}
     return {"content": content}
 

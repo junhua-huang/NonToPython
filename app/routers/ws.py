@@ -452,6 +452,45 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     if validation_error:
         await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
         return
+
+    if client_msg_id:
+        dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
+        if dedup_msg_id is not None:
+            await ws_manager.send_raw(user_id, _make_response("ack", request_id,
+                client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
+                status=200, msg="duplicate"))
+            await ws_manager.send_raw(user_id, {
+                "type": "ack",
+                "clientMsgId": client_msg_id,
+                "client_msg_id": client_msg_id,
+                "message_id": dedup_msg_id,
+                "server_seq": 0,
+            })
+            return
+
+    def _authorize_destination():
+        db = _get_db_session()
+        try:
+            if conversation_id:
+                from app.models.models import Conversation
+                conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+                if not conv:
+                    return {"error": "Conversation not found"}
+                if not can_access_conversation(db, conv, user_id):
+                    return {"error": "Not a conversation participant"}
+                participant_ids = get_active_conversation_participant_ids(db, conv)
+                if conv.type != 'community' and not _can_send_to_participants(user_id, participant_ids, db=db):
+                    return {"error": "Cannot send message to this user"}
+            elif receiver_id and not _can_send_to_user(db, user_id, receiver_id):
+                return {"error": "Cannot send message to this user"}
+            return None
+        finally:
+            db.close()
+
+    auth_error = await asyncio.get_event_loop().run_in_executor(None, _authorize_destination)
+    if auth_error:
+        await _send_error(user_id, request_id, _send_error_status(auth_error["error"]), auth_error["error"])
+        return
     try:
         moderation_payload = message_text_payload_for_moderation(payload)
         if moderation_payload:
@@ -463,7 +502,9 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 is_public=False,
             )
     except HTTPException as exc:
-        await _send_error(user_id, request_id, exc.status_code, exc.detail)
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        message = detail.get("message") or "内容审核失败"
+        await _send_error(user_id, request_id, exc.status_code, message)
         return
 
     # 1. 幂等
