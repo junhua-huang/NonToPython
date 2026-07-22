@@ -1047,8 +1047,8 @@ class WSManager:
                 db.close()
         return await asyncio.get_event_loop().run_in_executor(None, _sync)
 
-    async def get_dedup_message_id(self, client_msg_id: str) -> Optional[int]:
-        """查询已去重的 client_msg_id 对应的 message_id。"""
+    async def get_dedup_message_id(self, user_id: int, client_msg_id: str) -> Optional[int]:
+        """查询当前用户已去重的 client_msg_id 对应的 message_id。"""
         if not client_msg_id:
             return None
         def _sync():
@@ -1056,7 +1056,8 @@ class WSManager:
             try:
                 from app.models.models import WSAckDedup
                 row = db.query(WSAckDedup).filter(
-                    WSAckDedup.client_msg_id == client_msg_id
+                    WSAckDedup.client_msg_id == client_msg_id,
+                    WSAckDedup.user_id == user_id,
                 ).first()
                 return row.message_id if row else None
             except Exception:
@@ -1065,8 +1066,8 @@ class WSManager:
                 db.close()
         return await asyncio.get_event_loop().run_in_executor(None, _sync)
 
-    async def update_dedup_message_id(self, client_msg_id: str, message_id: int):
-        """在去重记录中补充 message_id（首次处理完成后调用）。"""
+    async def update_dedup_message_id(self, user_id: int, client_msg_id: str, message_id: int):
+        """在当前用户的去重记录中补充 message_id（首次处理完成后调用）。"""
         if not client_msg_id or not message_id:
             return
         def _sync():
@@ -1074,7 +1075,8 @@ class WSManager:
             try:
                 from app.models.models import WSAckDedup
                 row = db.query(WSAckDedup).filter(
-                    WSAckDedup.client_msg_id == client_msg_id
+                    WSAckDedup.client_msg_id == client_msg_id,
+                    WSAckDedup.user_id == user_id,
                 ).first()
                 if row and row.message_id is None:
                     row.message_id = message_id

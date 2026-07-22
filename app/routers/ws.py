@@ -583,7 +583,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             return
         if dedup_result:
             # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
-            dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
+            dedup_msg_id = await ws_manager.get_dedup_message_id(user_id, client_msg_id)
             if dedup_msg_id is None:
                 await _send_failed_ack(
                     user_id,
@@ -748,7 +748,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             "server_seq": ack_seq,
         })
         # 记录 message_id 到 dedup 表，后续重复请求可回传
-        await ws_manager.update_dedup_message_id(client_msg_id, msg_id)
+        await ws_manager.update_dedup_message_id(user_id, client_msg_id, msg_id)
 
     # 4. 推送接收方（异步入队）
     push_items = []

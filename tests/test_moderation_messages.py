@@ -405,7 +405,7 @@ def test_ws_late_pending_duplicate_is_retryable_failed_ack_without_persistence(m
     assert len(moderation_events) == 1
     assert manager.side_effects == [
         ("check_and_record_dedup", (1, "client-late-pending")),
-        ("get_dedup_message_id", ("client-late-pending",)),
+        ("get_dedup_message_id", (1, "client-late-pending")),
     ]
     assert len(opened_sessions) == 1
     assert opened_sessions[0].closed is True
@@ -475,6 +475,75 @@ def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistenc
     assert manager.raw[-1][1]["code"] == "MODERATION_UNAVAILABLE"
     assert "message_id" not in manager.raw[-1][1]
 
+
+
+def test_ws_cross_user_late_duplicate_is_retryable_failed_ack_without_id_leak(monkeypatch):
+    conv = SimpleNamespace(id=7, type="single", community_id=None)
+    manager = FakeWSManager()
+    opened_sessions = []
+
+    async def raced_duplicate(*args, **kwargs):
+        manager.side_effects.append(("check_and_record_dedup", args))
+        return True
+
+    async def owner_scoped_message_id(*args, **kwargs):
+        manager.side_effects.append(("get_dedup_message_id", args))
+        if args == (2, "client-race"):
+            return None
+        return 99
+
+    def session_factory():
+        session = FakeDB(conv)
+        opened_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_db_session", session_factory)
+    monkeypatch.setattr(ws, "_get_dedup_state", lambda client_msg_id: None)
+    monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "moderate_route_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(manager, "check_and_record_dedup", raced_duplicate, raising=False)
+    monkeypatch.setattr(manager, "get_dedup_message_id", owner_scoped_message_id, raising=False)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            2,
+            {
+                "type": "send_message",
+                "request_id": "req-race",
+                "payload": {
+                    "client_msg_id": "client-race",
+                    "conversation_id": 7,
+                    "content": "hello",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert len(opened_sessions) == 1
+    assert opened_sessions[0].closed is True
+    assert manager.raw == [
+        (
+            2,
+            {
+                "type": "ack",
+                "request_id": "req-race",
+                "client_msg_id": "client-race",
+                "clientMsgId": "client-race",
+                "status": 503,
+                "code": "MODERATION_UNAVAILABLE",
+                "retryable": True,
+                "msg": "内容审核服务暂不可用，请稍后重试",
+                "message": "内容审核服务暂不可用，请稍后重试",
+            },
+        )
+    ]
+    assert "message_id" not in manager.raw[0][1]
+    assert "99" not in str(manager.raw)
 
 
 def test_ws_moderation_unavailable_failed_ack_is_retryable(monkeypatch):
