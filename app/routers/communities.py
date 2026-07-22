@@ -26,11 +26,13 @@ from app.services.quote_service import (
     inject_quote_preview_batch,
     validate_quote,
 )
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
 from app.services.moderation_route_helpers import (
     message_text_payload_for_moderation,
     moderate_route_fields,
 )
 from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -41,6 +43,54 @@ def _handle(fn):
         return fn()
     except CommunityError as e:
         raise HTTPException(status_code=e.code, detail=e.message)
+
+
+_COMMUNITY_MODERATION_CHECKS = {
+    "POST /api/communities": ("community_create", ("name", "description", "rules")),
+    "PATCH /api/communities/{community_id}": ("community_edit", ("name", "description", "rules")),
+    "POST /api/communities/{community_id}/join": ("community_join_request", ("message",)),
+    "POST /api/communities/{community_id}/announcements": ("community_announcement", ("title", "content")),
+    "PATCH /api/communities/{community_id}/announcements/{announcement_id}": ("community_announcement", ("title", "content")),
+    "POST /api/communities/{community_id}/bans": ("community_ban", ("reason",)),
+}
+
+
+def _moderate_community_fields(
+    route_key: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    target_type, field_names = _COMMUNITY_MODERATION_CHECKS[route_key]
+    fields = {}
+    for field in field_names:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=target_type,
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 def _community_message_to_dict(message: Message):
@@ -125,8 +175,7 @@ def create_community(
     db: Session = Depends(get_db),
 ):
     """创建社群"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "POST /api/communities",
         payload,
         actor_user_id=user.id,
@@ -188,8 +237,7 @@ def update_community(
     db: Session = Depends(get_db),
 ):
     """编辑社群（owner/admin）"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "PATCH /api/communities/{community_id}",
         payload,
         actor_user_id=user.id,
@@ -226,8 +274,7 @@ def join_community(
     db: Session = Depends(get_db),
 ):
     """申请加群"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "POST /api/communities/{community_id}/join",
         payload,
         actor_user_id=user.id,
@@ -346,8 +393,7 @@ def create_announcement(
     db: Session = Depends(get_db),
 ):
     """发布公告（管理员+）"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "POST /api/communities/{community_id}/announcements",
         payload,
         actor_user_id=user.id,
@@ -373,8 +419,7 @@ def update_announcement(
     db: Session = Depends(get_db),
 ):
     """编辑公告（管理员+）"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "PATCH /api/communities/{community_id}/announcements/{announcement_id}",
         payload,
         actor_user_id=user.id,
@@ -429,8 +474,7 @@ def ban_user(
     db: Session = Depends(get_db),
 ):
     """拉黑用户（管理员+）"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_community_fields(
         "POST /api/communities/{community_id}/bans",
         payload,
         actor_user_id=user.id,

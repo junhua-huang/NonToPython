@@ -301,19 +301,22 @@ def test_create_community_moderates_before_service_side_effect(monkeypatch):
 
     events = []
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
-        events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
-        )
+    class FakeModerationService:
+        def moderate_fields(self, fields, context):
+            events.append((
+                "moderate",
+                context.target_type,
+                sorted(fields),
+                context.actor_user_id,
+                context.is_public,
+            ))
+            raise ContentRejected()
 
     def fake_create_community(*args, **kwargs):
         events.append(("service.create_community",))
         raise AssertionError("community service should not run after moderation rejection")
 
-    monkeypatch.setattr(communities_router, "moderate_route_fields", fake_moderate, raising=False)
-    monkeypatch.setattr(communities_router, "moderation_service", object(), raising=False)
+    monkeypatch.setattr(communities_router, "moderation_service", FakeModerationService(), raising=False)
     monkeypatch.setattr(communities_router.CommunityService, "create_community", fake_create_community)
 
     with pytest.raises(HTTPException) as exc_info:
@@ -327,7 +330,7 @@ def test_create_community_moderates_before_service_side_effect(monkeypatch):
     assert events == [
         (
             "moderate",
-            "POST /api/communities",
+            "community_create",
             ["description", "name", "rules"],
             17,
             True,
