@@ -86,14 +86,33 @@ def _has_unsafe_regex_structure(expression: str) -> bool:
             continue
         if character == "[":
             index += 1
+            if index < len(expression) and expression[index] == "^":
+                index += 1
+            if index < len(expression) and expression[index] == "]":
+                index += 1
             while index < len(expression):
                 if expression[index] == "\\":
                     index += 2
-                elif expression[index] == "]":
+                    continue
+                if expression.startswith("[:", index):
+                    index += 2
+                    if index < len(expression) and expression[index] == "^":
+                        index += 1
+                    name_start = index
+                    while index < len(expression) and (
+                        expression[index].isalnum() or expression[index] == "_"
+                    ):
+                        index += 1
+                    if (
+                        index > name_start
+                        and expression.startswith(":]", index)
+                    ):
+                        index += 2
+                        continue
+                if index < len(expression) and expression[index] == "]":
                     index += 1
                     break
-                else:
-                    index += 1
+                index += 1
             continue
         if character == "(":
             if expression.startswith("(?:", index):

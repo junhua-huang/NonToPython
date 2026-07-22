@@ -56,30 +56,46 @@ async def lifespan(app: FastAPI):
     logger.info("WS endpoint: ws://0.0.0.0:5000/ws")
     logger.info("WS logging: enabled (CONNECT/DISCONNECT/RECV/SEND_SEQ/SEND_RAW)")
     stop = asyncio.Event()
+    initial_refresh = asyncio.create_task(
+        asyncio.to_thread(snapshot_store.refresh, True)
+    )
+    startup_cancellation = None
+    while not initial_refresh.done():
+        try:
+            await asyncio.wait({initial_refresh})
+        except asyncio.CancelledError as error:
+            if startup_cancellation is None:
+                startup_cancellation = error
     try:
-        await asyncio.to_thread(snapshot_store.refresh, True)
+        initial_refresh.result()
     except Exception:
         logger.error("moderation_snapshot_initial_load_failed")
+    if startup_cancellation is not None:
+        raise startup_cancellation
+
     poller = asyncio.create_task(poll_snapshots(snapshot_store, stop))
+    body_error = None
     try:
         yield
+    except BaseException as error:
+        body_error = error
+        raise
     finally:
         stop.set()
-        cancellation = None
+        shutdown_cancellation = None
         while not poller.done():
             try:
-                await asyncio.shield(poller)
+                await asyncio.wait({poller})
             except asyncio.CancelledError as error:
-                cancellation = error
-            except Exception:
-                break
+                if shutdown_cancellation is None:
+                    shutdown_cancellation = error
         try:
             poller.result()
         except BaseException:
             logger.error("moderation_snapshot_poller_failed")
         logger.info("Shutting down NanTuPy server...")
-        if cancellation is not None:
-            raise cancellation
+        if body_error is None and shutdown_cancellation is not None:
+            raise shutdown_cancellation
 
 
 # 安全：生产环境通过 HIDE_API_DOCS=1 关闭 openapi.json / docs / redoc，

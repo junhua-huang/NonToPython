@@ -150,11 +150,36 @@ def test_contextual_high_risk_regex_constructs_are_rejected_before_compilation(
         validate_safe_regex(pattern)
 
 
-@pytest.mark.parametrize("pattern", [r"[a(?R]", r"[a(?<=x)]", r"\\1"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"[a(?R]",
+        r"[a(?<=x)]",
+        r"\\1",
+        r"[](?R)]",
+        r"[^](?R)]",
+        r"[\](?R)]",
+        r"[[:alpha:](?R)]",
+    ],
+)
 def test_high_risk_text_is_safe_inside_character_classes_or_after_escaped_slash(
     pattern,
 ):
     assert validate_safe_regex(pattern) == pattern
+
+
+@pytest.mark.parametrize("pattern", [r"[]](?R)", r"[[:alpha:]](?R)"])
+def test_recursive_construct_after_character_class_is_still_rejected(
+    pattern, monkeypatch
+):
+    monkeypatch.setattr(
+        snapshot_module.regex,
+        "compile",
+        lambda expression: pytest.fail("unsafe structure reached compilation"),
+    )
+
+    with pytest.raises(RegexValidationError, match="^unsafe regex structure$"):
+        validate_safe_regex(pattern)
 
 
 def test_unknown_group_extension_is_rejected_before_compilation(monkeypatch):
@@ -865,6 +890,65 @@ def test_main_lifespan_merges_init_refresh_poll_and_shutdown_without_secrets(
     asyncio.run(exercise())
 
 
+def test_main_startup_cancellation_waits_for_initial_refresh_result(
+    monkeypatch, caplog
+):
+    async def exercise():
+        import app.main as main_module
+
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_release = threading.Event()
+        worker_finished = threading.Event()
+        loop_errors = []
+        sentinel = "private-initial-refresh-sentinel"
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+
+        def blocked_initial_refresh(force=False):
+            assert force is True
+            loop.call_soon_threadsafe(worker_started.set)
+            try:
+                assert worker_release.wait(timeout=2)
+                raise RuntimeError(sentinel)
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr(
+            main_module.snapshot_store, "refresh", blocked_initial_refresh
+        )
+        loop.set_exception_handler(
+            lambda current_loop, context: loop_errors.append(context)
+        )
+
+        async def start_lifespan():
+            async with main_module.lifespan(main_module.app):
+                raise AssertionError("cancelled startup must not enter the body")
+
+        with caplog.at_level(logging.ERROR, logger=main_module.__name__):
+            task = asyncio.create_task(start_lifespan())
+            await worker_started.wait()
+            task.cancel("original-startup-cancellation")
+
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            assert task not in done
+            assert not worker_finished.is_set()
+
+            worker_release.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(task, timeout=2)
+            await asyncio.sleep(0)
+
+        assert caught.value.args == ("original-startup-cancellation",)
+        assert worker_finished.is_set()
+        assert loop_errors == []
+        assert "moderation_snapshot_initial_load_failed" in caplog.text
+        assert sentinel not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    asyncio.run(exercise())
+
+
 def test_main_shutdown_waits_for_blocked_to_thread_refresh(monkeypatch):
     async def exercise():
         import app.main as main_module
@@ -988,6 +1072,74 @@ def test_main_cancellation_during_shutdown_waits_then_propagates(monkeypatch):
         allow_poll_finish.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(exercise())
+
+
+def test_main_shutdown_cancellation_drains_failing_poller_without_shield_future(
+    monkeypatch, caplog
+):
+    async def exercise():
+        import app.main as main_module
+
+        loop = asyncio.get_running_loop()
+        poll_started = asyncio.Event()
+        shutdown_started = asyncio.Event()
+        allow_poll_failure = asyncio.Event()
+        loop_errors = []
+        shield_calls = []
+        sentinel = "private-shutdown-poller-sentinel"
+        original_shield = asyncio.shield
+
+        monkeypatch.setattr(main_module, "init_db", lambda: None)
+        monkeypatch.setattr(main_module.snapshot_store, "refresh", lambda force=False: None)
+
+        def recording_shield(awaitable):
+            shield_calls.append(awaitable)
+            return original_shield(awaitable)
+
+        monkeypatch.setattr(main_module.asyncio, "shield", recording_shield)
+        loop.set_exception_handler(
+            lambda current_loop, context: loop_errors.append(context)
+        )
+
+        async def failing_poll(store, stop, interval=30.0):
+            poll_started.set()
+            await stop.wait()
+            shutdown_started.set()
+            await allow_poll_failure.wait()
+            raise RuntimeError(sentinel)
+
+        monkeypatch.setattr(main_module, "poll_snapshots", failing_poll)
+
+        async def enter_and_exit():
+            async with main_module.lifespan(main_module.app):
+                await poll_started.wait()
+
+        with caplog.at_level(logging.ERROR, logger=main_module.__name__):
+            task = asyncio.create_task(enter_and_exit())
+            await shutdown_started.wait()
+            task.cancel("original-shutdown-cancellation")
+
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            assert task not in done
+
+            allow_poll_failure.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(task, timeout=2)
+            await asyncio.sleep(0)
+
+        assert caught.value.args == ("original-shutdown-cancellation",)
+        assert shield_calls == []
+        assert loop_errors == []
+        failure_records = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "moderation_snapshot_poller_failed"
+        ]
+        assert len(failure_records) == 1
+        assert failure_records[0].exc_info is None
+        assert sentinel not in caplog.text
 
     asyncio.run(exercise())
 
