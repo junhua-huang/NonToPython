@@ -3,15 +3,103 @@
 """
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_admin
-from app.models.models import BUSINESS_IDENTITY_ROLES, User, SensitiveWord, UserRole, Role, RoleApplication
+from app.dependencies import require_admin
+from app.models.models import (
+    BUSINESS_IDENTITY_ROLES,
+    Role,
+    RoleApplication,
+    SensitiveWord,
+    SensitiveWordVersion,
+    User,
+    UserRole,
+)
+from app.services.local_text_moderator import normalize_text
+from app.services.moderation_snapshot import RegexValidationError, validate_safe_regex
+from app.services.moderation_types import RiskCategory
 
 router = APIRouter()
+moderation_router = APIRouter(prefix="/api/admin/moderation", tags=["Admin Moderation"])
+
+_RULE_CONFLICT_DETAIL = {
+    "code": "MODERATION_RULE_CONFLICT",
+    "message": "规则已存在或发生冲突",
+}
+_INVALID_RULE = "INVALID_MODERATION_RULE"
+_ALLOWED_MATCH_TYPES = {"literal", "regex"}
+_ALLOWED_SEVERITIES = {"low", "medium", "high"}
 
 
+class SensitiveWordCreate(BaseModel):
+    word: str = Field(min_length=1, max_length=500)
+    match_type: str = "literal"
+    category: str = "other"
+    severity: str = "medium"
+    is_active: bool = True
+
+
+class SensitiveWordPatch(BaseModel):
+    word: str | None = Field(default=None, min_length=1, max_length=500)
+    match_type: str | None = None
+    category: str | None = None
+    severity: str | None = None
+    is_active: bool | None = None
+
+
+def _invalid_rule(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"code": _INVALID_RULE, "message": message},
+    )
+
+
+def _validate_metadata(category: str, severity: str) -> None:
+    if category not in {item.value for item in RiskCategory}:
+        raise _invalid_rule("风险分类无效")
+    if severity not in _ALLOWED_SEVERITIES:
+        raise _invalid_rule("风险等级无效")
+
+
+def _validated_expression(word: str, match_type: str) -> str:
+    if match_type not in _ALLOWED_MATCH_TYPES:
+        raise _invalid_rule("匹配类型无效")
+    value = word.strip()
+    if not value or not normalize_text(value):
+        raise _invalid_rule("规则内容不能为空")
+    if match_type == "regex":
+        try:
+            return validate_safe_regex(value)
+        except RegexValidationError:
+            raise _invalid_rule("正则规则不安全或无效") from None
+    return value
+
+
+def _advance_rule_version(db: Session) -> int:
+    version_row = db.execute(
+        select(SensitiveWordVersion)
+        .where(SensitiveWordVersion.id == 1)
+        .with_for_update()
+    ).scalar_one()
+    version_row.version += 1
+    version_row.updated_at = datetime.utcnow()
+    db.flush()
+    return version_row.version
+
+
+def _commit_or_conflict(db: Session) -> None:
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=_RULE_CONFLICT_DETAIL) from None
+
+
+@moderation_router.get("/sensitive-words")
 @router.get("/sensitive-words")
 def get_sensitive_words(
     page: int = Query(1, ge=1),
@@ -20,7 +108,8 @@ def get_sensitive_words(
     db: Session = Depends(get_db),
 ):
     """获取敏感词列表"""
-    words_query = db.query(SensitiveWord).order_by(SensitiveWord.created_at.desc())
+    del user
+    words_query = db.query(SensitiveWord).order_by(SensitiveWord.id.asc())
     total = words_query.count()
     words = words_query.offset((page - 1) * per_page).limit(per_page).all()
     pages = (total + per_page - 1) // per_page if total > 0 else 0
@@ -34,31 +123,78 @@ def get_sensitive_words(
     }
 
 
-@router.post("/sensitive-words")
+@moderation_router.get("/sensitive-words/{word_id}")
+def get_sensitive_word(
+    word_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    del user
+    row = db.get(SensitiveWord, word_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Sensitive word not found")
+    return {"word": row.to_dict()}
+
+
+@moderation_router.post("/sensitive-words", status_code=201)
+@router.post("/sensitive-words", status_code=201)
 def add_sensitive_word(
-    payload: dict = Body(...),
+    payload: SensitiveWordCreate,
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """添加敏感词"""
-    word = payload.get("word", "").strip()
-    if not word:
-        raise HTTPException(status_code=400, detail="Word is required")
+    expression_value = _validated_expression(payload.word, payload.match_type)
+    _validate_metadata(payload.category, payload.severity)
+    version = _advance_rule_version(db)
+    row = SensitiveWord(
+        word=expression_value,
+        match_type=payload.match_type,
+        category=payload.category,
+        severity=payload.severity,
+        is_active=payload.is_active,
+        row_version=version,
+        created_by=user.id,
+    )
+    db.add(row)
+    _commit_or_conflict(db)
+    db.refresh(row)
+    return {"message": "Sensitive word added", "word": row.to_dict()}
 
-    existing = db.query(SensitiveWord).filter(SensitiveWord.word == word).first()
-    if existing:
-        return {"message": "Word already exists", "word": existing.to_dict()}
 
-    sensitive = SensitiveWord(word=word)
-    try:
-        db.add(sensitive)
-        db.commit()
-        return {"message": "Sensitive word added", "word": sensitive.to_dict()}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+@moderation_router.patch("/sensitive-words/{word_id}")
+def patch_sensitive_word(
+    word_id: int,
+    payload: SensitiveWordPatch,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    del user
+    row = db.get(SensitiveWord, word_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Sensitive word not found")
+    values = payload.model_dump(exclude_unset=True)
+    next_type = values.get("match_type", row.match_type)
+    next_word = values.get("word", row.word)
+    next_category = values.get("category", row.category)
+    next_severity = values.get("severity", row.severity)
+    expression_value = _validated_expression(next_word, next_type)
+    _validate_metadata(next_category, next_severity)
+    version = _advance_rule_version(db)
+    row.word = expression_value
+    row.match_type = next_type
+    row.category = next_category
+    row.severity = next_severity
+    if "is_active" in values:
+        row.is_active = values["is_active"]
+    row.row_version = version
+    row.updated_at = datetime.utcnow()
+    _commit_or_conflict(db)
+    db.refresh(row)
+    return {"message": "Sensitive word updated", "word": row.to_dict()}
 
 
+@moderation_router.delete("/sensitive-words/{word_id}")
 @router.delete("/sensitive-words/{word_id}")
 def delete_sensitive_word(
     word_id: int,
@@ -66,17 +202,14 @@ def delete_sensitive_word(
     db: Session = Depends(get_db),
 ):
     """删除敏感词"""
-    word = db.query(SensitiveWord).filter(SensitiveWord.id == word_id).first()
-    if not word:
+    del user
+    row = db.get(SensitiveWord, word_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Sensitive word not found")
-
-    try:
-        db.delete(word)
-        db.commit()
-        return {"message": "Sensitive word deleted"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    _advance_rule_version(db)
+    db.delete(row)
+    _commit_or_conflict(db)
+    return {"message": "Sensitive word deleted"}
 
 
 # ============================================================
