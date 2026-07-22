@@ -31,14 +31,103 @@ _REGEX_PROBES = (
     "0" * 2048 + "!",
     "词" * 1024 + "!",
 )
-_NESTED_REPEAT = re.compile(
-    r"\((?:[^()\\]|\\.)*[+*{](?:[^()\\]|\\.)*\)[+*{]"
-)
-_AMBIGUOUS_BRANCH_REPEAT = re.compile(
-    r"\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)[+*{]"
-)
 _BACK_REFERENCE = re.compile(r"\\(?:[1-9]|g<|k<)")
 _HIGH_RISK_EXTENSION = re.compile(r"\(\?(?:<[-=!]|P=|R|0|&|\(|[1-9])")
+
+
+class _RegexGroup:
+    __slots__ = ("has_alternation", "has_quantified_node")
+
+    def __init__(self):
+        self.has_alternation = False
+        self.has_quantified_node = False
+
+
+def _quantifier_end(expression: str, start: int) -> int | None:
+    if start >= len(expression):
+        return None
+    if expression[start] in "*+?":
+        end = start + 1
+    elif expression[start] == "{":
+        end = start + 1
+        lower_start = end
+        while end < len(expression) and expression[end].isdigit():
+            end += 1
+        has_lower = end > lower_start
+        if end < len(expression) and expression[end] == ",":
+            end += 1
+            upper_start = end
+            while end < len(expression) and expression[end].isdigit():
+                end += 1
+            if not has_lower and end == upper_start:
+                return None
+        elif not has_lower:
+            return None
+        if end >= len(expression) or expression[end] != "}":
+            return None
+        end += 1
+    else:
+        return None
+    if end < len(expression) and expression[end] in "?+":
+        end += 1
+    return end
+
+
+def _has_unsafe_repeat_structure(expression: str) -> bool:
+    groups = [_RegexGroup()]
+    index = 0
+    while index < len(expression):
+        character = expression[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "[":
+            index += 1
+            while index < len(expression):
+                if expression[index] == "\\":
+                    index += 2
+                elif expression[index] == "]":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if character == "(":
+            if expression.startswith("(?:", index):
+                index += 3
+            elif index + 1 < len(expression) and expression[index + 1] in "?*":
+                return True
+            else:
+                index += 1
+            groups.append(_RegexGroup())
+            continue
+        if character == ")":
+            if len(groups) == 1:
+                index += 1
+                continue
+            closed = groups.pop()
+            quantifier_end = _quantifier_end(expression, index + 1)
+            if quantifier_end is not None:
+                if closed.has_quantified_node or closed.has_alternation:
+                    return True
+                groups[-1].has_quantified_node = True
+                index = quantifier_end
+            else:
+                groups[-1].has_quantified_node |= closed.has_quantified_node
+                groups[-1].has_alternation |= closed.has_alternation
+                index += 1
+            continue
+        if character == "|":
+            groups[-1].has_alternation = True
+            index += 1
+            continue
+        quantifier_end = _quantifier_end(expression, index)
+        if quantifier_end is not None:
+            groups[-1].has_quantified_node = True
+            index = quantifier_end
+            continue
+        index += 1
+    return False
 
 
 class RegexValidationError(ValueError):
@@ -52,8 +141,7 @@ def validate_safe_regex(pattern: str) -> str:
     if not expression or len(expression) > _REGEX_MAX_LENGTH:
         raise RegexValidationError("regex length out of range")
     if (
-        _NESTED_REPEAT.search(expression)
-        or _AMBIGUOUS_BRANCH_REPEAT.search(expression)
+        _has_unsafe_repeat_structure(expression)
         or _BACK_REFERENCE.search(expression)
         or "(?<=" in expression
         or "(?<!" in expression

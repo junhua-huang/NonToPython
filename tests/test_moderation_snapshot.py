@@ -101,10 +101,47 @@ def test_unsafe_regex_is_rejected_with_non_sensitive_reason(pattern):
     assert caught.value.__cause__ is None
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"z((x|xx))+$",
+        r"z((x+))+$",
+        r"z(?:(x|xx))+$",
+        r"z((((x+))))+$",
+        r"z(?:(?:(x|xx)))+$",
+        r"((x?)){2}?$",
+        r"((x{1,2}))*+$",
+        r"((x{,2}))+?$",
+        "z" + "(" * 100 + "x+" + ")" * 100 + "+$",
+    ],
+)
+def test_nested_unsafe_regex_is_rejected_by_structure_without_running_probes(
+    pattern, monkeypatch
+):
+    def unexpected_compile(expression):
+        raise AssertionError("unsafe structure must be rejected before compilation")
+
+    monkeypatch.setattr(snapshot_module.regex, "compile", unexpected_compile)
+
+    with pytest.raises(RegexValidationError, match="^unsafe regex structure$"):
+        validate_safe_regex(pattern)
+
+
 @pytest.mark.parametrize("pattern", [r"(?<=private)word", r"(?<!private)word"])
 def test_lookbehind_is_rejected(pattern):
     with pytest.raises(RegexValidationError, match="^unsafe regex structure$"):
         validate_safe_regex(pattern)
+
+
+def test_unknown_group_extension_is_rejected_before_compilation(monkeypatch):
+    monkeypatch.setattr(
+        snapshot_module.regex,
+        "compile",
+        lambda expression: pytest.fail("unknown extension reached compilation"),
+    )
+
+    with pytest.raises(RegexValidationError, match="^unsafe regex structure$"):
+        validate_safe_regex(r"(*FAIL)")
 
 
 @pytest.mark.parametrize(
@@ -117,6 +154,21 @@ def test_lookbehind_is_rejected(pattern):
 )
 def test_valid_ascii_and_unicode_regex_is_accepted_and_stripped(pattern, expected):
     assert validate_safe_regex(pattern) == expected
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"(?:红包|轉帳)[\p{N}]{2,4}",
+        r"z((((xy))))+$",
+        r"z(?:(x(yz)))+$",
+        r"literal\(parentheses\)+",
+        r"[(]+[)]+",
+        r"[()]{2,4}",
+    ],
+)
+def test_group_parser_accepts_legal_nesting_escapes_and_character_classes(pattern):
+    assert validate_safe_regex(pattern) == pattern
 
 
 @pytest.mark.parametrize("pattern", ["", "   ", "x" * 257])
