@@ -1,6 +1,6 @@
 """
 漫展路由 - FastAPI 版本
-从 C:\PythonProject\routes_comic.py 迁移（Flask → FastAPI）
+从 C:\\PythonProject\\routes_comic.py 迁移（Flask → FastAPI）
 """
 from datetime import datetime, date as date_cls
 from typing import Optional, List
@@ -15,10 +15,78 @@ from app.models.models import (
     User, ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
     ComicComment, ComicLike, ComicCommentLike,
 )
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
 router = APIRouter()
+
+
+def _comic_aliases_for_route(route_key: str) -> dict[str, tuple[str, ...]]:
+    return {
+        field: ("ticketInfo", "ticket_info") if field == "ticket_info" else (field,)
+        for field in MODERATED_TEXT_FIELDS[route_key]
+    }
+
+
+_COMIC_MODERATION_CHECKS = {
+    "POST /api/comic/events": ("comic_event", _comic_aliases_for_route("POST /api/comic/events")),
+    "PUT /api/comic/events/{event_id}": ("comic_event", _comic_aliases_for_route("PUT /api/comic/events/{event_id}")),
+    "POST /api/comic/events/{event_id}/comments": (
+        "comic_comment",
+        _comic_aliases_for_route("POST /api/comic/events/{event_id}/comments"),
+    ),
+}
+
+
+def _extract_comic_text_fields(payload: object, aliases: dict[str, tuple[str, ...]]) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    fields = {}
+    for field, source_names in aliases.items():
+        values = []
+        for source_name in source_names:
+            if source_name not in payload:
+                continue
+            value = payload.get(source_name)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+            if value.strip():
+                values.append(value)
+        if len(values) > 1:
+            raise to_http_exception(ModerationUnavailable(TypeError("ambiguous moderation field aliases")))
+        if values:
+            fields[field] = values[0]
+    return fields
+
+
+def _moderate_comic_fields(
+    route_key: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    target_type, aliases = _COMIC_MODERATION_CHECKS[route_key]
+    fields = _extract_comic_text_fields(payload, aliases)
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=target_type,
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 # ============================================================
@@ -353,6 +421,12 @@ def create_event(
     user: User = Depends(get_current_user),
 ):
     """发布漫展"""
+    _moderate_comic_fields(
+        "POST /api/comic/events",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     name = (payload.get('name') or '').strip()
     city_id = payload.get('cityId') or payload.get('city_id')
     venue = (payload.get('venue') or '').strip()
@@ -365,20 +439,6 @@ def create_event(
     website = payload.get('website')
     tag_ids = payload.get('tagIds') or payload.get('tag_ids') or []
     image_urls = payload.get('imageUrls') or payload.get('image_urls') or []
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/comic/events",
-        {
-            "name": name,
-            "venue": venue,
-            "ticket_info": ticket_info,
-            "website": website,
-            "intro": intro,
-        },
-        actor_user_id=user.id,
-        is_public=True,
-    )
-
     if not name:
         raise HTTPException(status_code=400, detail='漫展名称不能为空')
     if not city_id:
@@ -445,6 +505,13 @@ def update_event(
     if ev[0] != user.id:
         raise HTTPException(status_code=403, detail='无权编辑')
 
+    _moderate_comic_fields(
+        "PUT /api/comic/events/{event_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
+
     name = (payload.get('name') or '').strip()
     city_id = payload.get('cityId') or payload.get('city_id')
     venue = (payload.get('venue') or '').strip()
@@ -457,20 +524,6 @@ def update_event(
     website = payload.get('website')
     tag_ids = payload.get('tagIds') or payload.get('tag_ids') or []
     image_urls = payload.get('imageUrls') or payload.get('image_urls') or []
-    moderate_route_fields(
-        moderation_service,
-        "PUT /api/comic/events/{event_id}",
-        {
-            "name": name,
-            "venue": venue,
-            "ticket_info": ticket_info,
-            "website": website,
-            "intro": intro,
-        },
-        actor_user_id=user.id,
-        is_public=True,
-    )
-
     now = datetime.utcnow()
     upd = text("""
         UPDATE comic_events SET
@@ -841,19 +894,18 @@ def post_comic_comment(
     if not ev:
         raise HTTPException(status_code=404, detail="漫展不存在")
 
+    _moderate_comic_fields(
+        "POST /api/comic/events/{event_id}/comments",
+        payload,
+        actor_user_id=current_user.id,
+        is_public=True,
+    )
     content = (payload.get("content") or "").strip()
     parent_id = payload.get("parentId") or payload.get("parent_id")
     reply_to_user_id = payload.get("replyToUserId") or payload.get("reply_to_user_id")
 
     if not content or len(content) > 2000:
         raise HTTPException(status_code=400, detail="评论内容不能为空且不超过2000字")
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/comic/events/{event_id}/comments",
-        {"content": content},
-        actor_user_id=current_user.id,
-        is_public=True,
-    )
 
     if parent_id:
         parent = db.query(ComicComment).filter(ComicComment.id == parent_id).first()
