@@ -2,7 +2,10 @@ import pytest
 from fastapi import HTTPException
 
 from app.services.moderation_errors import ContentRejected, ModerationUnavailable
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_route_helpers import (
+    message_text_payload_for_moderation,
+    moderate_route_fields,
+)
 from app.services.moderation_types import ModerationContext
 
 
@@ -92,6 +95,31 @@ def test_moderate_route_fields_ignores_missing_empty_and_unknown_inventory():
     )
 
     assert service.calls == []
+
+
+def test_message_text_payload_for_moderation_skips_media_url_fallbacks():
+    assert message_text_payload_for_moderation(
+        {"message_type": "image", "content": "https://files.example/private.png"}
+    ) == {}
+    assert message_text_payload_for_moderation(
+        {"message_type": "video", "content": "https://files.example/private.mp4"}
+    ) == {}
+    assert message_text_payload_for_moderation(
+        {"message_type": "post", "content": "https://files.example/private-card"}
+    ) == {}
+
+
+def test_message_text_payload_for_moderation_keeps_text_and_media_captions():
+    assert message_text_payload_for_moderation(
+        {"message_type": "text", "content": " hello "}
+    ) == {"content": "hello"}
+    assert message_text_payload_for_moderation(
+        {
+            "message_type": "image",
+            "content": "caption text",
+            "media_url": "https://files.example/private.png",
+        }
+    ) == {"content": "caption text"}
 
 
 @pytest.mark.parametrize(
@@ -368,3 +396,52 @@ def test_private_chat_message_moderates_before_persist_and_fanout(monkeypatch):
             False,
         )
     ]
+
+
+def test_private_chat_media_url_fallback_is_not_moderated(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.routers import chat as chat_router
+
+    events = []
+    conversation = SimpleNamespace(id=5, type="single", community_id=None, last_message_at=None)
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return conversation
+
+    class FakeDB:
+        def query(self, *args, **kwargs):
+            return FakeQuery()
+
+        def add(self, item):
+            events.append(("db.add", type(item).__name__))
+            raise RuntimeError("stop after add")
+
+        def rollback(self):
+            events.append(("db.rollback",))
+
+    def fail_if_moderated(*args, **kwargs):
+        raise AssertionError("media URL fallback must not be moderated")
+
+    monkeypatch.setattr(chat_router, "moderate_route_fields", fail_if_moderated, raising=False)
+    monkeypatch.setattr(chat_router, "moderation_service", object(), raising=False)
+    monkeypatch.setattr(chat_router, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(chat_router, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            chat_router.send_message(
+                5,
+                {"message_type": "image", "content": "https://files.example/private.png"},
+                user=SimpleNamespace(id=1),
+                db=FakeDB(),
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert events == [("db.add", "Message"), ("db.rollback",)]

@@ -150,7 +150,7 @@ def apply_role(
         "POST /api/roles/apply",
         data.model_dump(),
         actor_user_id=user.id,
-        is_public=True,
+        is_public=False,
     )
 
     if role_name not in BUSINESS_IDENTITY_ROLES:

@@ -8,6 +8,9 @@ from app.services.moderation_errors import (
 from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_types import ModerationContext
 
+_MEDIA_MESSAGE_TYPES = {"image", "video"}
+_CARD_MESSAGE_TYPES = {"post"}
+
 
 def _extract_moderated_fields(
     route_key: str,
@@ -50,6 +53,25 @@ def _extract_moderated_fields(
         if value.strip():
             fields[field_name] = value
     return fields
+
+
+def message_text_payload_for_moderation(payload: object) -> dict[str, str]:
+    if not isinstance(payload, Mapping):
+        return {}
+    raw_type = payload.get("message_type") or "text"
+    message_type = raw_type.strip().lower() if isinstance(raw_type, str) else "text"
+    raw_content = payload.get("content")
+    if not isinstance(raw_content, str):
+        return {}
+    content = raw_content.strip()
+    if not content:
+        return {}
+    is_url = content.startswith(("http://", "https://"))
+    if message_type in _MEDIA_MESSAGE_TYPES and is_url:
+        return {}
+    if message_type in _CARD_MESSAGE_TYPES and is_url:
+        return {}
+    return {"content": content}
 
 
 def moderate_route_fields(

@@ -26,7 +26,10 @@ from app.services.quote_service import (
     inject_quote_preview_batch,
     validate_quote,
 )
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_route_helpers import (
+    message_text_payload_for_moderation,
+    moderate_route_fields,
+)
 from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
@@ -661,13 +664,15 @@ async def send_community_message(
     content, message_type, media_url, related_id, mention_user_ids = (
         _normalize_community_message_payload(payload, db, user.id, community_id)
     )
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/communities/{community_id}/chat/messages",
-        {"content": content},
-        actor_user_id=user.id,
-        is_public=False,
-    )
+    moderation_payload = message_text_payload_for_moderation(payload)
+    if moderation_payload:
+        moderate_route_fields(
+            moderation_service,
+            "POST /api/communities/{community_id}/chat/messages",
+            moderation_payload,
+            actor_user_id=user.id,
+            is_public=False,
+        )
 
     # 校验并生成引用预览（实时生成，不入库 quote_preview）
     quote_message_id = payload.get("quote_message_id")
