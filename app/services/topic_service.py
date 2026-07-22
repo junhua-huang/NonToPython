@@ -1,11 +1,16 @@
 """
 话题服务 - FastAPI 重构版（Session 参数传递模式）
 """
+import logging
+
 from app.models.models import Topic, Post, User, post_topics, topic_followers
 from app.services.post_visibility_service import post_visibility_predicate
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+
+
+logger = logging.getLogger(__name__)
 
 
 class TopicService:
@@ -23,7 +28,7 @@ class TopicService:
             db.flush()
             return topic
         except Exception as e:
-            print(f"Error creating topic: {e}")
+            logger.warning("Error creating topic error_type=%s", type(e).__name__)
             return None
 
     @staticmethod
@@ -54,7 +59,7 @@ class TopicService:
             db.flush()
             return True
         except Exception as e:
-            print(f"Error adding post to topic: {e}")
+            logger.warning("Error adding post to topic error_type=%s", type(e).__name__)
             return False
 
     @staticmethod
@@ -70,7 +75,7 @@ class TopicService:
             db.flush()
             return True
         except Exception as e:
-            print(f"Error removing post from topic: {e}")
+            logger.warning("Error removing post from topic error_type=%s", type(e).__name__)
             return False
 
     @staticmethod
@@ -137,7 +142,7 @@ class TopicService:
             db.flush()
             return True
         except Exception as e:
-            print(f"Error following topic: {e}")
+            logger.warning("Error following topic error_type=%s", type(e).__name__)
             return False
 
     @staticmethod
@@ -153,7 +158,7 @@ class TopicService:
             db.flush()
             return True
         except Exception as e:
-            print(f"Error unfollowing topic: {e}")
+            logger.warning("Error unfollowing topic error_type=%s", type(e).__name__)
             return False
 
     @staticmethod
@@ -282,5 +287,5 @@ class TopicService:
             db.flush()
             return True
         except Exception as e:
-            print(f"Error updating topic stats: {e}")
+            logger.warning("Error updating topic stats error_type=%s", type(e).__name__)
             return False

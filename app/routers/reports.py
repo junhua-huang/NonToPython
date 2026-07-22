@@ -1,6 +1,8 @@
 """
 举报路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 
@@ -10,6 +12,7 @@ from app.models.models import User, Report
 from app.services.moderation_route_helpers import moderate_route_fields
 from app.services.moderation_service import moderation_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -48,7 +51,13 @@ def _handle_report(
         return {"message": "Report submitted successfully", "report": report.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Submit report failed user_id=%s target_type=%s error_type=%s",
+            user.id,
+            report_type,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while submitting the report")
 
 
 @router.post("")

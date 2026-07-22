@@ -143,7 +143,12 @@ def test_admin_rule_crud_never_logs_rule_expression_or_exception_text():
 
 def test_selected_routes_do_not_return_raw_exception_text():
     paths = [
+        ROOT / "app" / "routers" / "auth.py",
+        ROOT / "app" / "routers" / "chat.py",
+        ROOT / "app" / "routers" / "interactions.py",
         ROOT / "app" / "routers" / "posts.py",
+        ROOT / "app" / "routers" / "reports.py",
+        ROOT / "app" / "routers" / "topics.py",
         ROOT / "app" / "routers" / "upload.py",
     ]
     for path in paths:
@@ -163,9 +168,11 @@ def test_selected_routes_do_not_return_raw_exception_text():
 
 def test_realtime_and_upload_logging_is_metadata_only():
     paths = [
+        ROOT / "app" / "routers" / "interactions.py",
         ROOT / "app" / "routers" / "posts.py",
         ROOT / "app" / "routers" / "upload.py",
         ROOT / "app" / "routers" / "ws.py",
+        ROOT / "app" / "services" / "topic_service.py",
         ROOT / "app" / "ws_manager.py",
     ]
     forbidden = {

@@ -1,6 +1,8 @@
 """
 互动路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -15,6 +17,7 @@ from app.services.block_service import excluded_user_ids, has_block_between, vis
 from app.services.moderation_route_helpers import moderate_route_fields
 from app.services.moderation_service import moderation_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -94,7 +97,13 @@ def like_post(
         return {"message": "Post liked successfully", "liked": True, "like_count": post.get_like_count()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Like post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while liking the post")
 
 
 @router.delete("/posts/{post_id}/like")
@@ -123,7 +132,13 @@ def unlike_post(
         return {"message": "Like removed successfully", "liked": False, "like_count": post.get_like_count()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Unlike post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while removing the post like")
 
 
 @router.get("/posts/{post_id}/likes")
@@ -171,7 +186,13 @@ def like_comment(
         return {"message": "Comment liked successfully", "comment_id": comment_id, "liked": True, "like_count": comment.like_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Like comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while liking the comment")
 
 
 @router.delete("/comments/{comment_id}/like")
@@ -197,7 +218,13 @@ def unlike_comment(
         return {"message": "Like removed successfully", "comment_id": comment_id, "liked": False, "like_count": comment.like_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Unlike comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while removing the comment like")
 
 
 # ==================== 评论功能 ====================
@@ -265,7 +292,13 @@ def create_comment(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Create comment failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while creating the comment")
 
     # 通知和@提及（失败不影响评论创建，传入 db 复用 Session）
     try:
@@ -274,7 +307,12 @@ def create_comment(
             NotificationService.notify_comment(reply_to_user_id, user.id, post_id, content, db=db)
         MentionService.process_mentions(content=content, author_id=user.id, post_id=post_id, comment_id=comment.id)
     except Exception as e:
-        print(f"[WARNING] 评论通知/@提及处理失败: {e}")
+        logger.warning(
+            "Comment notification processing failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
 
     return {
         "message": "Comment created successfully",
@@ -464,7 +502,13 @@ def update_comment(
         return {"message": "Comment updated successfully", "comment": _enrich_comment_dict(comment, db, user.id)}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the comment")
 
 
 @router.delete("/comments/{comment_id}")
@@ -490,4 +534,10 @@ def delete_comment(
         return {"message": "Comment deleted successfully", "comment_count": post.get_comment_count() if post else 0}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the comment")

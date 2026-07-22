@@ -726,7 +726,13 @@ async def send_message(
         return {"message": "Message sent", "data": message_dict}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Send chat message failed conversation_id=%s user_id=%s error_type=%s",
+            conversation_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while sending the message")
 @router.post("/conversations/{conversation_id}/mark-read")
 async def mark_conversation_as_read(
     conversation_id: int,
@@ -777,7 +783,13 @@ async def mark_conversation_as_read(
         return {"message": "All messages marked as read", "marked_count": updated_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Mark conversation read failed conversation_id=%s user_id=%s error_type=%s",
+            conversation_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while marking the conversation as read")
 
 
 @router.get("/users/online")

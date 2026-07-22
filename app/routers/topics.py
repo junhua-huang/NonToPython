@@ -1,6 +1,8 @@
 """
 话题路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 
@@ -11,6 +13,7 @@ from app.services.topic_service import TopicService
 from app.services.moderation_route_helpers import moderate_route_fields
 from app.services.moderation_service import moderation_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -289,7 +292,13 @@ def update_topic(
         return {"message": "Topic updated successfully", "topic": topic.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update topic failed topic_id=%s user_id=%s error_type=%s",
+            topic_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the topic")
 
 
 @router.delete("/{topic_id}")
@@ -312,5 +321,11 @@ def delete_topic(
         return {"message": "Topic deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete topic failed topic_id=%s user_id=%s error_type=%s",
+            topic_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the topic")
 

@@ -477,7 +477,12 @@ def update_profile(
         return {"message": "Profile updated", "user": _build_user_response(current)}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update profile failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the profile")
 
 
 # ============================================================
@@ -506,7 +511,12 @@ def change_password(
         return {"message": "Password changed successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Change password failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while changing the password")
 
 
 # ============================================================
@@ -540,11 +550,16 @@ def delete_account(
     try:
         db.delete(current)
         db.commit()
-        logger.info(f"User account deleted: {user.username} (ID: {user.id})")
+        logger.info("User account deleted user_id=%s", user.id)
         return {"message": "Account deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete account failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the account")
 
 
 # ============================================================
@@ -657,7 +672,12 @@ def update_privacy_settings(
         return {"message": "Privacy settings updated"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update privacy settings failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating privacy settings")
 
 
 # ============================================================
