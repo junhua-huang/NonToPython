@@ -9,7 +9,6 @@ from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_types import ModerationContext
 
 _MEDIA_MESSAGE_TYPES = {"image", "video"}
-_CARD_MESSAGE_TYPES = {"post"}
 
 
 def _extract_moderated_fields(
@@ -66,11 +65,13 @@ def message_text_payload_for_moderation(payload: object) -> dict[str, str]:
     content = raw_content.strip()
     if not content:
         return {}
-    is_url = content.startswith(("http://", "https://"))
-    if message_type in _MEDIA_MESSAGE_TYPES and is_url:
-        return {}
-    if message_type in _CARD_MESSAGE_TYPES and is_url:
-        return {}
+    media_value = payload.get("media_url") or payload.get("file_url")
+    media_url = media_value.strip() if isinstance(media_value, str) else ""
+    if message_type in _MEDIA_MESSAGE_TYPES:
+        if media_url and content == media_url:
+            return {}
+        if not media_url and content.startswith(("http://", "https://")):
+            return {}
     return {"content": content}
 
 

@@ -105,7 +105,11 @@ def test_message_text_payload_for_moderation_skips_media_url_fallbacks():
         {"message_type": "video", "content": "https://files.example/private.mp4"}
     ) == {}
     assert message_text_payload_for_moderation(
-        {"message_type": "post", "content": "https://files.example/private-card"}
+        {
+            "message_type": "image",
+            "content": " https://files.example/private.png ",
+            "media_url": "https://files.example/private.png",
+        }
     ) == {}
 
 
@@ -120,6 +124,16 @@ def test_message_text_payload_for_moderation_keeps_text_and_media_captions():
             "media_url": "https://files.example/private.png",
         }
     ) == {"content": "caption text"}
+    assert message_text_payload_for_moderation(
+        {
+            "message_type": "image",
+            "content": "https://example.com banned text",
+            "media_url": "https://files.example/private.png",
+        }
+    ) == {"content": "https://example.com banned text"}
+    assert message_text_payload_for_moderation(
+        {"message_type": "post", "content": "https://example.com banned text"}
+    ) == {"content": "https://example.com banned text"}
 
 
 @pytest.mark.parametrize(
