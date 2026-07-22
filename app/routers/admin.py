@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -36,7 +36,7 @@ _ALLOWED_SEVERITIES = {"low", "medium", "high"}
 
 
 class SensitiveWordCreate(BaseModel):
-    word: str = Field(min_length=1, max_length=500)
+    word: str
     match_type: str = "literal"
     category: str = "other"
     severity: str = "medium"
@@ -44,7 +44,7 @@ class SensitiveWordCreate(BaseModel):
 
 
 class SensitiveWordPatch(BaseModel):
-    word: str | None = Field(default=None, min_length=1, max_length=500)
+    word: str | None = None
     match_type: str | None = None
     category: str | None = None
     severity: str | None = None
@@ -68,9 +68,13 @@ def _validate_metadata(category: str, severity: str) -> None:
 def _validated_expression(word: str, match_type: str) -> str:
     if match_type not in _ALLOWED_MATCH_TYPES:
         raise _invalid_rule("匹配类型无效")
+    if not isinstance(word, str):
+        raise _invalid_rule("规则内容不能为空")
     value = word.strip()
     if not value or not normalize_text(value):
         raise _invalid_rule("规则内容不能为空")
+    if len(value) > 500:
+        raise _invalid_rule("规则内容过长")
     if match_type == "regex":
         try:
             return validate_safe_regex(value)
@@ -79,16 +83,35 @@ def _validated_expression(word: str, match_type: str) -> str:
     return value
 
 
-def _advance_rule_version(db: Session) -> int:
-    version_row = db.execute(
+def _lock_rule_version(db: Session) -> SensitiveWordVersion:
+    return db.execute(
         select(SensitiveWordVersion)
         .where(SensitiveWordVersion.id == 1)
         .with_for_update()
     ).scalar_one()
+
+
+def _advance_locked_rule_version(
+    version_row: SensitiveWordVersion,
+    db: Session,
+) -> int:
     version_row.version += 1
     version_row.updated_at = datetime.utcnow()
     db.flush()
     return version_row.version
+
+
+def _advance_rule_version(db: Session) -> int:
+    return _advance_locked_rule_version(_lock_rule_version(db), db)
+
+
+def _locked_sensitive_word(db: Session, word_id: int) -> SensitiveWord | None:
+    return db.execute(
+        select(SensitiveWord)
+        .where(SensitiveWord.id == word_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
 
 
 def _commit_or_conflict(db: Session) -> None:
@@ -170,17 +193,18 @@ def patch_sensitive_word(
     db: Session = Depends(get_db),
 ):
     del user
-    row = db.get(SensitiveWord, word_id)
+    values = payload.model_dump(exclude_unset=True)
+    version_row = _lock_rule_version(db)
+    row = _locked_sensitive_word(db, word_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Sensitive word not found")
-    values = payload.model_dump(exclude_unset=True)
     next_type = values.get("match_type", row.match_type)
     next_word = values.get("word", row.word)
     next_category = values.get("category", row.category)
     next_severity = values.get("severity", row.severity)
     expression_value = _validated_expression(next_word, next_type)
     _validate_metadata(next_category, next_severity)
-    version = _advance_rule_version(db)
+    version = _advance_locked_rule_version(version_row, db)
     row.word = expression_value
     row.match_type = next_type
     row.category = next_category
@@ -203,10 +227,11 @@ def delete_sensitive_word(
 ):
     """删除敏感词"""
     del user
-    row = db.get(SensitiveWord, word_id)
+    version_row = _lock_rule_version(db)
+    row = _locked_sensitive_word(db, word_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Sensitive word not found")
-    _advance_rule_version(db)
+    _advance_locked_rule_version(version_row, db)
     db.delete(row)
     _commit_or_conflict(db)
     return {"message": "Sensitive word deleted"}

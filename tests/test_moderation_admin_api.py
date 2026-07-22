@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -234,6 +234,25 @@ def test_pydantic_rejects_missing_or_oversized_input_before_version_mutation(
     assert current_version(moderation_db) == before
 
 
+def test_regex_length_validation_does_not_echo_expression(admin_client, moderation_db):
+    expression = "PRIVATE_REGEX_LEAK_7721" + ("x" * 501)
+    before = current_version(moderation_db)
+
+    response = admin_client.post(
+        CANONICAL,
+        json={
+            "word": expression,
+            "match_type": "regex",
+            "category": "spam",
+            "severity": "medium",
+        },
+    )
+
+    assert response.status_code == 422
+    assert expression not in str(response.json())
+    assert current_version(moderation_db) == before
+
+
 def test_patch_validates_resulting_rule_before_version_mutation(
     admin_client, moderation_db, created_rule
 ):
@@ -250,6 +269,24 @@ def test_patch_validates_resulting_rule_before_version_mutation(
     moderation_db.refresh(created_rule)
     assert created_rule.word == "existing literal"
     assert created_rule.match_type == "literal"
+    assert created_rule.row_version == before
+
+
+def test_patch_rejects_explicit_null_word_before_version_mutation(
+    admin_client, moderation_db, created_rule
+):
+    before = current_version(moderation_db)
+
+    response = admin_client.patch(
+        f"{CANONICAL}/{created_rule.id}",
+        json={"word": None},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == INVALID_CODE
+    assert current_version(moderation_db) == before
+    moderation_db.refresh(created_rule)
+    assert created_rule.word == "existing literal"
     assert created_rule.row_version == before
 
 
@@ -317,6 +354,80 @@ def test_patch_conflict_rolls_back_fields_and_version(
     assert unchanged.word == "existing literal"
     assert unchanged.category == "other"
     assert unchanged.row_version == before
+
+
+def test_patch_reloads_current_row_after_version_lock_before_validation(
+    monkeypatch, moderation_db, created_rule
+):
+    bind = moderation_db.get_bind()
+    SessionFactory = sessionmaker(bind=bind, autoflush=False, expire_on_commit=False)
+    stale_session = SessionFactory()
+    concurrent_session = SessionFactory()
+    stale_session.get(SensitiveWord, created_rule.id)
+    before = current_version(moderation_db)
+    original_lock = admin_router._lock_rule_version
+
+    def concurrent_change(db):
+        row = concurrent_session.get(SensitiveWord, created_rule.id)
+        row.match_type = "regex"
+        concurrent_session.commit()
+        return original_lock(db)
+
+    monkeypatch.setattr(admin_router, "_lock_rule_version", concurrent_change)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            admin_router.patch_sensitive_word(
+                created_rule.id,
+                admin_router.SensitiveWordPatch(word=r"(a+)+$"),
+                moderation_db.get(User, 1),
+                stale_session,
+            )
+    finally:
+        stale_session.close()
+        concurrent_session.close()
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == INVALID_CODE
+    moderation_db.expire_all()
+    unchanged = moderation_db.get(SensitiveWord, created_rule.id)
+    assert unchanged.word == "existing literal"
+    assert unchanged.match_type == "regex"
+    assert current_version(moderation_db) == before
+
+
+def test_delete_reloads_current_row_after_version_lock_before_mutation(
+    monkeypatch, moderation_db, created_rule
+):
+    bind = moderation_db.get_bind()
+    SessionFactory = sessionmaker(bind=bind, autoflush=False, expire_on_commit=False)
+    stale_session = SessionFactory()
+    concurrent_session = SessionFactory()
+    rule_id = created_rule.id
+    stale_session.get(SensitiveWord, rule_id)
+    before = current_version(moderation_db)
+    original_lock = admin_router._lock_rule_version
+
+    def concurrent_delete(db):
+        row = concurrent_session.get(SensitiveWord, rule_id)
+        concurrent_session.delete(row)
+        concurrent_session.commit()
+        return original_lock(db)
+
+    monkeypatch.setattr(admin_router, "_lock_rule_version", concurrent_delete)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            admin_router.delete_sensitive_word(
+                rule_id,
+                moderation_db.get(User, 1),
+                stale_session,
+            )
+    finally:
+        stale_session.close()
+        concurrent_session.close()
+
+    assert exc_info.value.status_code == 404
+    assert current_version(moderation_db) == before
+    assert moderation_db.get(SensitiveWord, rule_id) is None
 
 
 @pytest.mark.parametrize("method", ["get", "patch", "delete"])
