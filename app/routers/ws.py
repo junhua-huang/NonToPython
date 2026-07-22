@@ -10,12 +10,12 @@ WebSocket 端点 — 即时通讯协议
 连接后先收到 auth 消息鉴权，通过后自动推送 session_list + auth_result。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -147,6 +147,8 @@ def _get_dedup_state(user_id: int, client_msg_id: str) -> dict | None:
             WSAckDedup.client_msg_id == client_msg_id,
         ).first()
         if not row:
+            return None
+        if row.processed_at and row.processed_at < datetime.utcnow() - timedelta(hours=24):
             return None
         return {"user_id": row.user_id, "message_id": row.message_id}
     finally:
@@ -591,22 +593,35 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             participant_ids = get_active_conversation_participant_ids(db, conv)
             dedup_entry = None
             if client_msg_id:
-                from app.models.models import WSAckDedup
-                dedup_entry = db.query(WSAckDedup).filter(
-                    WSAckDedup.user_id == user_id,
-                    WSAckDedup.client_msg_id == client_msg_id,
-                ).first()
-                if dedup_entry:
-                    if dedup_entry.message_id is None:
-                        return {"dedup_unavailable": True}
-                    return {"duplicate_message_id": dedup_entry.message_id}
-                dedup_entry = WSAckDedup(
-                    user_id=user_id,
-                    client_msg_id=client_msg_id,
-                    processed_at=datetime.utcnow(),
-                )
-                db.add(dedup_entry)
-                db.flush()
+                try:
+                    from app.models.models import WSAckDedup
+                    cutoff = datetime.utcnow() - timedelta(hours=24)
+                    db.query(WSAckDedup).filter(
+                        WSAckDedup.processed_at < cutoff,
+                    ).delete(synchronize_session=False)
+                    dedup_entry = db.query(WSAckDedup).filter(
+                        WSAckDedup.user_id == user_id,
+                        WSAckDedup.client_msg_id == client_msg_id,
+                    ).first()
+                    if dedup_entry:
+                        if dedup_entry.message_id is None:
+                            return {"dedup_unavailable": True}
+                        return {"duplicate_message_id": dedup_entry.message_id}
+                    dedup_entry = WSAckDedup(
+                        user_id=user_id,
+                        client_msg_id=client_msg_id,
+                        processed_at=datetime.utcnow(),
+                    )
+                    db.add(dedup_entry)
+                    db.flush()
+                except SQLAlchemyError as e:
+                    logger.warning(
+                        "[WS DEDUP] transactional reservation failed uid=%s error_type=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+                    db.rollback()
+                    return {"dedup_unavailable": True}
 
             normalized = normalize_user_message_payload(
                 payload,
@@ -699,14 +714,6 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         except HTTPException as e:
             db.rollback()
             return {"error": e.detail, "code": e.status_code}
-        except IntegrityError as e:
-            logger.warning(
-                "[WS DEDUP] transactional reservation failed uid=%s error_type=%s",
-                user_id,
-                type(e).__name__,
-            )
-            db.rollback()
-            return {"dedup_unavailable": True}
         except Exception as e:
             logger.error(
                 "[WS SEND] uid=%s persist_error_type=%s",

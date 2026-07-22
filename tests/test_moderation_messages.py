@@ -23,6 +23,9 @@ class FakeQuery:
     def all(self):
         return []
 
+    def delete(self, *args, **kwargs):
+        return 0
+
 
 class FakeDB:
     def __init__(self, row, *, dedup_row=None, flush_error=None):
@@ -348,6 +351,24 @@ def test_ws_incomplete_duplicate_state_is_retryable_failed_ack_without_moderatio
             },
         )
     ]
+
+
+
+def test_ws_expired_dedup_state_is_ignored(monkeypatch):
+    from datetime import datetime, timedelta
+
+    row = SimpleNamespace(
+        user_id=1,
+        client_msg_id="expired-client",
+        message_id=99,
+        processed_at=datetime.utcnow() - timedelta(hours=25),
+    )
+    session = FakeDB(row)
+
+    monkeypatch.setattr(ws, "_get_db_session", lambda: session)
+
+    assert ws._get_dedup_state(1, "expired-client") is None
+    assert session.closed is True
 
 
 

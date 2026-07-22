@@ -738,7 +738,6 @@ def test_ws_post_share_caller_returns_post_unavailable_without_persisting(post_d
 
     with (
         patch.object(ws_router, "_get_db_session", return_value=post_db),
-        patch.object(ws_router.ws_manager, "check_and_record_dedup", new=AsyncMock(return_value=False)),
         patch.object(ws_router.ws_manager, "get_blocked_user_ids", return_value=set()),
         patch.object(ws_router.ws_manager, "send_raw", new=AsyncMock()) as send_raw,
     ):
@@ -846,7 +845,6 @@ def test_ws_direct_post_card_checks_recipient_before_persisting(post_db):
 
     with (
         patch.object(ws_router, "_get_db_session", return_value=post_db),
-        patch.object(ws_router.ws_manager, "check_and_record_dedup", new=AsyncMock(return_value=False)),
         patch.object(ws_router.ws_manager, "get_blocked_user_ids", return_value=set()),
         patch.object(ws_router.ws_manager, "send_raw", new=AsyncMock()) as send_raw,
     ):
