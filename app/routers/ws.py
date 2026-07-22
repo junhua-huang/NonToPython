@@ -135,6 +135,22 @@ def _can_send_to_user(db: Session, from_user_id: int, to_user_id: int) -> bool:
     return is_friend is not None
 
 
+def _get_dedup_state(client_msg_id: str) -> dict | None:
+    if not client_msg_id:
+        return None
+    db = _get_db_session()
+    try:
+        from app.models.models import WSAckDedup
+        row = db.query(WSAckDedup).filter(
+            WSAckDedup.client_msg_id == client_msg_id
+        ).first()
+        if not row:
+            return None
+        return {"user_id": row.user_id, "message_id": row.message_id}
+    finally:
+        db.close()
+
+
 def _can_send_to_participants(
     from_user_id: int,
     participant_ids: list[int],
@@ -453,12 +469,20 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
         return
 
-    if client_msg_id:
-        dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
-        if dedup_msg_id is not None:
-            await ws_manager.send_raw(user_id, _make_response("ack", request_id,
-                client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
-                status=200, msg="duplicate"))
+    dedup_state = await asyncio.get_event_loop().run_in_executor(
+        None,
+        _get_dedup_state,
+        client_msg_id,
+    )
+    if dedup_state:
+        if dedup_state["user_id"] != user_id:
+            await _send_error(user_id, request_id, 403, "Cannot send message to this user")
+            return
+        dedup_msg_id = dedup_state["message_id"]
+        await ws_manager.send_raw(user_id, _make_response("ack", request_id,
+            client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
+            status=200, msg="duplicate"))
+        if client_msg_id:
             await ws_manager.send_raw(user_id, {
                 "type": "ack",
                 "clientMsgId": client_msg_id,
@@ -466,7 +490,7 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 "message_id": dedup_msg_id,
                 "server_seq": 0,
             })
-            return
+        return
 
     def _authorize_destination():
         db = _get_db_session()
