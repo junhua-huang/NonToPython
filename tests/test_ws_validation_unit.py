@@ -18,6 +18,13 @@ class WebSocketValidationTests(unittest.TestCase):
         self.assertEqual(ws._send_error_status("Cannot send message to this user"), 403)
         self.assertEqual(ws._send_error_status("Message send failed"), 500)
 
+    def test_send_payload_rejects_invalid_client_msg_id(self):
+        payload = {"conversation_id": 10, "message_type": "text", "content": "x", "client_msg_id": "x" * 37}
+
+        error = ws._validate_send_message_payload(payload)
+
+        self.assertEqual(error, {"code": 400, "error": "Invalid client_msg_id"})
+
     def test_send_payload_rejects_unknown_message_type(self):
         payload = {"conversation_id": 10, "message_type": "file", "content": "x"}
 

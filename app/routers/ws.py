@@ -180,7 +180,10 @@ def _validate_send_message_payload(payload: dict) -> dict | None:
     receiver_id = payload.get("receiver_id")
     message_type = (payload.get("message_type") or "text").strip().lower()
     content = (payload.get("content") or "").strip()
+    client_msg_id = payload.get("client_msg_id")
 
+    if client_msg_id is not None and (not isinstance(client_msg_id, str) or len(client_msg_id) > 36):
+        return {"code": 400, "error": "Invalid client_msg_id"}
     if not conversation_id and not receiver_id:
         return {"code": 400, "error": "conversation_id or receiver_id required"}
     if message_type == "text" and not content:
@@ -614,6 +617,17 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                     )
                     db.add(dedup_entry)
                     db.flush()
+                except IntegrityError as e:
+                    logger.warning(
+                        "[WS DEDUP] transactional reservation raced uid=%s error_type=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+                    db.rollback()
+                    dedup_state = _get_dedup_state(user_id, client_msg_id)
+                    if dedup_state and dedup_state["message_id"] is not None:
+                        return {"duplicate_message_id": dedup_state["message_id"]}
+                    return {"dedup_unavailable": True}
                 except SQLAlchemyError as e:
                     logger.warning(
                         "[WS DEDUP] transactional reservation failed uid=%s error_type=%s",

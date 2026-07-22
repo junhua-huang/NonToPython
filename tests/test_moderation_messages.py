@@ -28,9 +28,10 @@ class FakeQuery:
 
 
 class FakeDB:
-    def __init__(self, row, *, dedup_row=None, flush_error=None):
+    def __init__(self, row, *, dedup_row=None, dedup_rows=None, flush_error=None):
         self.row = row
         self.dedup_row = dedup_row
+        self.dedup_rows = list(dedup_rows or [])
         self.flush_error = flush_error
         self.closed = False
         self.added = []
@@ -40,6 +41,8 @@ class FakeDB:
     def query(self, *args, **kwargs):
         model = args[0] if args else None
         if getattr(model, "__name__", "") == "WSAckDedup":
+            if self.dedup_rows:
+                return FakeQuery(self.dedup_rows.pop(0))
             return FakeQuery(self.dedup_row)
         return FakeQuery(self.row)
 
@@ -354,6 +357,43 @@ def test_ws_incomplete_duplicate_state_is_retryable_failed_ack_without_moderatio
 
 
 
+def test_ws_get_dedup_state_is_user_scoped_with_real_sqlite(monkeypatch):
+    from datetime import datetime
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app.database import Base
+    from app.models.models import User, WSAckDedup
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    try:
+        db.add_all([
+            User(id=1, username="alice", email="alice@example.com", password_hash="x"),
+            User(id=2, username="bob", email="bob@example.com", password_hash="x"),
+            WSAckDedup(user_id=1, client_msg_id="same-client", message_id=91, processed_at=datetime.utcnow()),
+            WSAckDedup(user_id=2, client_msg_id="same-client", message_id=92, processed_at=datetime.utcnow()),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(ws, "_get_db_session", Session)
+
+    assert ws._get_dedup_state(1, "same-client") == {"user_id": 1, "message_id": 91}
+    assert ws._get_dedup_state(2, "same-client") == {"user_id": 2, "message_id": 92}
+    engine.dispose()
+
+
+
 def test_ws_expired_dedup_state_is_ignored(monkeypatch):
     from datetime import datetime, timedelta
 
@@ -482,7 +522,7 @@ def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistenc
     opened_sessions = []
 
     def session_factory():
-        session = FakeDB(conv, flush_error=ws.IntegrityError("INSERT", {}, Exception("race")))
+        session = FakeDB(conv, flush_error=ws.SQLAlchemyError("dedup unavailable"))
         opened_sessions.append(session)
         return session
 
@@ -518,6 +558,64 @@ def test_ws_dedup_reservation_failure_is_retryable_failed_ack_without_persistenc
     assert manager.raw[-1][1]["status"] == 503
     assert manager.raw[-1][1]["code"] == "MODERATION_UNAVAILABLE"
     assert "message_id" not in manager.raw[-1][1]
+
+
+
+def test_ws_same_user_integrity_race_returns_duplicate_success_ack(monkeypatch):
+    conv = SimpleNamespace(id=7, type="single", community_id=None)
+    manager = FakeWSManager()
+    winner_row = SimpleNamespace(
+        user_id=1,
+        client_msg_id="client-race-same-user",
+        message_id=88,
+        processed_at=None,
+    )
+    sessions = iter([
+        FakeDB(None),
+        FakeDB(conv),
+        FakeDB(conv, dedup_rows=[None], flush_error=ws.IntegrityError("INSERT", {}, Exception("race"))),
+        FakeDB(None, dedup_row=winner_row),
+    ])
+
+    monkeypatch.setattr(ws, "ws_manager", manager)
+    monkeypatch.setattr(ws, "_get_db_session", lambda: next(sessions))
+    monkeypatch.setattr(ws, "_get_dedup_state", ws._get_dedup_state)
+    monkeypatch.setattr(ws, "can_access_conversation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "get_active_conversation_participant_ids", lambda *args, **kwargs: [1, 2])
+    monkeypatch.setattr(ws, "_can_send_to_participants", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ws, "moderate_route_fields", lambda *args, **kwargs: None)
+
+    asyncio.run(
+        ws._handle_send_message(
+            None,
+            1,
+            {
+                "type": "send_message",
+                "request_id": "req-same-user-race",
+                "payload": {
+                    "client_msg_id": "client-race-same-user",
+                    "conversation_id": 7,
+                    "content": "hello",
+                    "message_type": "text",
+                },
+            },
+        )
+    )
+
+    assert manager.raw[0][1]["payload"] == {
+        "client_msg_id": "client-race-same-user",
+        "server_seq": 0,
+        "message_id": 88,
+        "status": 200,
+        "msg": "duplicate",
+    }
+    assert manager.raw[1][1] == {
+        "type": "ack",
+        "clientMsgId": "client-race-same-user",
+        "client_msg_id": "client-race-same-user",
+        "message_id": 88,
+        "server_seq": 0,
+    }
 
 
 
