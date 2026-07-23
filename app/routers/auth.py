@@ -23,8 +23,10 @@ from app.dependencies import get_current_user, get_optional_user
 from app.services.email_service import EmailService
 from app.services.otp_service import OtpService
 from app.services.block_service import has_block_between
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 from app.serializers.user import serialize_user_profile, serialize_user_self
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,44 @@ def _sanitize_bio(bio: str) -> str:
     if not bio:
         return bio
     return html.escape(bio, quote=True)
+
+
+def _moderate_auth_fields(
+    route_key: str,
+    target_type: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    fields = {}
+    for field in MODERATED_TEXT_FIELDS[route_key]:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=target_type,
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 # ============================================================
@@ -315,9 +355,9 @@ def verify_otp(data: VerifyOtpRequest, db: Session = Depends(get_db)):
 @router.post("/register", response_model=AuthResponse)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
     """用户注册（必须先通过 /auth/send-otp purpose=register 拿到邮箱验证码）"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_auth_fields(
         "POST /api/auth/register",
+        "user_registration",
         data.model_dump(),
         actor_user_id=None,
         is_public=True,
@@ -455,17 +495,26 @@ def update_profile(
     db: Session = Depends(get_db),
 ):
     """修改当前用户个人资料"""
-    moderate_route_fields(
-        moderation_service,
+    _moderate_auth_fields(
         "PUT /api/auth/profile",
+        "user_profile",
         data.model_dump(exclude_none=True),
         actor_user_id=user.id,
         is_public=True,
     )
     current = db.query(User).filter(User.id == user.id).first()
     if data.display_name is not None:
-        # display_name 映射为 username（如业务允许）
-        pass
+        try:
+            display_name = RegisterRequest.validate_username(data.display_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        duplicate = db.query(User).filter(
+            User.username == display_name,
+            User.id != user.id,
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="Username already exists")
+        current.username = display_name
     if data.bio is not None:
         current.bio = _sanitize_bio(data.bio)
     if data.avatar_url is not None:
