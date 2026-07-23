@@ -7,6 +7,22 @@ from app.routers import admin, auth, roles
 from app.services.moderation_errors import ContentRejected
 
 
+MODERATION_REJECTION_ROUTES = {
+    "POST /api/auth/register",
+    "PUT /api/auth/profile",
+    "POST /api/roles/apply",
+    "PUT /api/roles/profiles/coser",
+    "PUT /api/roles/profiles/photographer",
+    "PUT /api/roles/profiles/service",
+    "POST /api/roles/applications/{application_id}/approve",
+    "POST /api/roles/applications/{application_id}/reject",
+    "POST /api/roles/applications/{application_id}/suspend",
+    "POST /role-applications/{application_id}/approve",
+    "POST /role-applications/{application_id}/reject",
+    "POST /role-applications/{application_id}/suspend",
+}
+
+
 class RejectingModerationService:
     def __init__(self):
         self.calls = []
@@ -82,6 +98,7 @@ def _raise_content_rejected(service, route_key, payload, *, actor_user_id, is_pu
 
 
 def test_registration_uses_user_registration_target_before_otp_and_user_creation(monkeypatch):
+    assert "POST /api/auth/register" in MODERATION_REJECTION_ROUTES
     moderation_spy = RejectingModerationService()
     monkeypatch.setattr(auth, "moderation_service", moderation_spy)
     monkeypatch.setattr(auth.OtpService, "verify", lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -109,6 +126,7 @@ def test_registration_uses_user_registration_target_before_otp_and_user_creation
 
 
 def test_profile_update_uses_user_profile_target_before_db_query(monkeypatch):
+    assert "PUT /api/auth/profile" in MODERATION_REJECTION_ROUTES
     moderation_spy = RejectingModerationService()
     monkeypatch.setattr(auth, "moderation_service", moderation_spy)
 

@@ -9,14 +9,47 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Report
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
 from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+_REPORT_MODERATION_ROUTES = (
+    "POST /api/reports",
+    "POST /api/reports/post",
+    "POST /api/reports/comment",
+    "POST /api/reports/user",
+)
+
+
+def _moderate_report_reason(route_key: str, reason: object, *, actor_user_id: int):
+    if route_key not in _REPORT_MODERATION_ROUTES:
+        raise to_http_exception(ModerationUnavailable(ValueError("unknown moderation route")))
+    if reason is None:
+        return
+    if not isinstance(reason, str):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+    if not reason.strip():
+        return
+    try:
+        moderation_service.moderate_fields(
+            {"reason": reason},
+            ModerationContext(
+                target_type="report_reason",
+                actor_user_id=actor_user_id,
+                is_public=False,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
+
 
 def _handle_report(
+    route_key: str,
     report_type: str,
     target_id: int,
     reason: str,
@@ -30,6 +63,7 @@ def _handle_report(
         raise HTTPException(status_code=400, detail="Invalid report type")
     if not target_id:
         raise HTTPException(status_code=400, detail="Target ID is required")
+    _moderate_report_reason(route_key, reason, actor_user_id=user.id)
 
     existing = db.query(Report).filter(
         Report.reporter_id == user.id,
@@ -67,14 +101,8 @@ def submit_report(
     db: Session = Depends(get_db),
 ):
     """提交举报（统一入口：{type, target_id, reason}）"""
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/reports",
-        payload,
-        actor_user_id=user.id,
-        is_public=True,
-    )
     return _handle_report(
+        route_key="POST /api/reports",
         report_type=payload.get("type", ""),
         target_id=payload.get("target_id"),
         reason=payload.get("reason", ""),
@@ -90,14 +118,8 @@ def report_post(
     db: Session = Depends(get_db),
 ):
     """举报帖子（别名：前端 POST /reports/post {post_id, reason}）"""
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/reports/post",
-        payload,
-        actor_user_id=user.id,
-        is_public=True,
-    )
     return _handle_report(
+        route_key="POST /api/reports/post",
         report_type="post",
         target_id=payload.get("post_id"),
         reason=payload.get("reason", ""),
@@ -113,14 +135,8 @@ def report_comment(
     db: Session = Depends(get_db),
 ):
     """举报评论（别名：前端 POST /reports/comment {comment_id, reason}）"""
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/reports/comment",
-        payload,
-        actor_user_id=user.id,
-        is_public=True,
-    )
     return _handle_report(
+        route_key="POST /api/reports/comment",
         report_type="comment",
         target_id=payload.get("comment_id"),
         reason=payload.get("reason", ""),
@@ -136,14 +152,8 @@ def report_user(
     db: Session = Depends(get_db),
 ):
     """举报用户（别名：前端 POST /reports/user {user_id, reason}）"""
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/reports/user",
-        payload,
-        actor_user_id=user.id,
-        is_public=True,
-    )
     return _handle_report(
+        route_key="POST /api/reports/user",
         report_type="user",
         target_id=payload.get("user_id"),
         reason=payload.get("reason", ""),

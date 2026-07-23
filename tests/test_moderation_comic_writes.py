@@ -7,6 +7,13 @@ from app.routers import comic
 from app.services.moderation_errors import ContentRejected
 
 
+MODERATION_REJECTION_ROUTES = {
+    "POST /api/comic/events",
+    "PUT /api/comic/events/{event_id}",
+    "POST /api/comic/events/{event_id}/comments",
+}
+
+
 class RejectingModerationService:
     def __init__(self):
         self.calls = []
@@ -73,7 +80,7 @@ class ExistingEventQuery:
 
 
 @pytest.mark.parametrize(
-    "route_call,db,payload,expected_fields,target_type",
+    "route_call,db,payload,expected_fields,route_key,target_type",
     [
         (
             lambda payload, user, db: comic.create_event(payload=payload, user=user, db=db),
@@ -89,6 +96,7 @@ class ExistingEventQuery:
                 "end_date": "2026-08-02",
             },
             {"name": "blocked", "venue": "venue", "ticket_info": "ticket", "website": "https://fiction.invalid", "intro": "intro"},
+            "POST /api/comic/events",
             "comic_event",
         ),
         (
@@ -96,6 +104,7 @@ class ExistingEventQuery:
             FailingWriteDB(),
             {"name": "ok", "ticket_info": "   ", "ticketInfo": "blocked", "city_id": 1},
             {"name": "ok", "ticket_info": "blocked"},
+            "POST /api/comic/events",
             "comic_event",
         ),
         (
@@ -103,6 +112,7 @@ class ExistingEventQuery:
             EventOwnerDB(owner_id=1),
             {"intro": "blocked"},
             {"intro": "blocked"},
+            "PUT /api/comic/events/{event_id}",
             "comic_event",
         ),
         (
@@ -110,6 +120,7 @@ class ExistingEventQuery:
             ExistingEventDB(),
             {"content": "blocked"},
             {"content": "blocked"},
+            "POST /api/comic/events/{event_id}/comments",
             "comic_comment",
         ),
     ],
@@ -120,6 +131,7 @@ def test_comic_text_writes_use_targeted_moderation_before_mutation(
     db,
     payload,
     expected_fields,
+    route_key,
     target_type,
 ):
     moderation_spy = RejectingModerationService()
@@ -132,6 +144,7 @@ def test_comic_text_writes_use_targeted_moderation_before_mutation(
     assert len(moderation_spy.calls) == 1
     fields, context = moderation_spy.calls[0]
     assert fields == expected_fields
+    assert comic._COMIC_MODERATION_CHECKS[route_key][0] == target_type
     assert context.target_type == target_type
     assert context.actor_user_id == 1
     assert context.is_public is True

@@ -7,6 +7,12 @@ from fastapi import HTTPException
 from app.routers import communities, ws
 
 
+MODERATION_REJECTION_ROUTES = {
+    "WS send_message",
+    "POST /api/communities/{community_id}/chat/messages",
+}
+
+
 class FakeQuery:
     def __init__(self, row):
         self.row = row
@@ -185,6 +191,7 @@ def test_http_community_chat_rejection_has_no_persistence_or_fanout(monkeypatch)
 
 @pytest.mark.parametrize("conversation_type", ["single", "community"])
 def test_ws_rejection_is_failed_ack_and_has_no_dedup_side_effect(monkeypatch, conversation_type):
+    assert "WS send_message" in MODERATION_REJECTION_ROUTES
     conv = SimpleNamespace(id=7, type=conversation_type, community_id=3 if conversation_type == "community" else None)
     manager = FakeWSManager()
     opened_sessions = []

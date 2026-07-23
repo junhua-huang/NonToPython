@@ -9,6 +9,15 @@ from app.services.moderation_route_helpers import (
 from app.services.moderation_types import ModerationContext
 
 
+MODERATION_REJECTION_ROUTES = {
+    "POST /api/posts",
+    "PUT /api/posts/{post_id}",
+    "POST /api/posts/{post_id}/comments",
+    "PUT /api/comments/{comment_id}",
+    "POST /api/chat/conversations/{conversation_id}/messages",
+}
+
+
 class Recorder:
     def __init__(self, error=None):
         self.error = error
@@ -292,6 +301,148 @@ def test_create_post_moderates_before_file_upload_and_db_mutation(monkeypatch):
 
     assert exc_info.value.status_code == 422
     assert events == [("moderate", "POST /api/posts", ["content"], 42, True)]
+
+
+def test_update_post_moderates_before_db_mutation(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.routers import posts as posts_router
+
+    post = SimpleNamespace(
+        id=5,
+        user_id=42,
+        visibility="public",
+        community_only=False,
+        community_id=None,
+        content="old content",
+        video_url="old-video",
+    )
+
+    class FakeDB:
+        def commit(self):
+            raise AssertionError("post commit must not run after moderation rejection")
+
+        def rollback(self):
+            pass
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        assert route_key == "PUT /api/posts/{post_id}"
+        assert payload == {"content": "blocked", "video_url": "new-video"}
+        assert actor_user_id == 42
+        assert is_public is True
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    monkeypatch.setattr(posts_router, "load_visible_post", lambda *args, **kwargs: post)
+    monkeypatch.setattr(posts_router, "_validate_post_community_write", lambda *args, **kwargs: None)
+    monkeypatch.setattr(posts_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(posts_router, "moderation_service", object(), raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        posts_router.update_post(
+            5,
+            payload={"content": "blocked", "video_url": "new-video"},
+            user=SimpleNamespace(id=42),
+            db=FakeDB(),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert post.content == "old content"
+    assert post.video_url == "old-video"
+
+
+def test_create_comment_moderates_before_comment_insert(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.routers import interactions as interactions_router
+
+    events = []
+    post = SimpleNamespace(id=5, user_id=42, community_only=False, get_comment_count=lambda: 0)
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return post
+
+    class FakeDB:
+        def query(self, *args, **kwargs):
+            return FakeQuery()
+
+        def add(self, item):
+            events.append(("db.add", type(item).__name__))
+            raise AssertionError("comment insert must not run after moderation rejection")
+
+        def commit(self):
+            events.append(("db.commit",))
+
+        def rollback(self):
+            events.append(("db.rollback",))
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    monkeypatch.setattr(interactions_router, "can_view_post", lambda *args, **kwargs: True)
+    monkeypatch.setattr(interactions_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(interactions_router, "moderation_service", object(), raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        interactions_router.create_comment(
+            5,
+            payload={"content": "blocked"},
+            user=SimpleNamespace(id=42),
+            db=FakeDB(),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert events == [("moderate", "POST /api/posts/{post_id}/comments", ["content"], 42, True)]
+
+
+def test_update_comment_moderates_before_comment_mutation(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.routers import interactions as interactions_router
+
+    comment = SimpleNamespace(id=8, user_id=42, post_id=5, content="old content")
+
+    class FakeDB:
+        def commit(self):
+            raise AssertionError("comment commit must not run after moderation rejection")
+
+        def rollback(self):
+            pass
+
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+        assert route_key == "PUT /api/comments/{comment_id}"
+        assert payload == {"content": "blocked"}
+        assert actor_user_id == 42
+        assert is_public is True
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONTENT_REJECTED", "message": "内容未通过审核", "retryable": False},
+        )
+
+    monkeypatch.setattr(interactions_router, "_load_visible_comment", lambda *args, **kwargs: comment)
+    monkeypatch.setattr(interactions_router, "moderate_route_fields", fake_moderate, raising=False)
+    monkeypatch.setattr(interactions_router, "moderation_service", object(), raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        interactions_router.update_comment(
+            8,
+            payload={"content": "blocked"},
+            user=SimpleNamespace(id=42),
+            db=FakeDB(),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert comment.content == "old content"
 
 
 def test_create_community_moderates_before_service_side_effect(monkeypatch):

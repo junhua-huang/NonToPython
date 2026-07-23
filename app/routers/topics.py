@@ -10,11 +10,57 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_content_manager
 from app.models.models import User, Topic, topic_followers
 from app.services.topic_service import TopicService
-from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_TOPIC_MODERATION_TARGETS = {
+    "POST /api/topics": "topic",
+    "PUT /api/topics/{topic_id}": "topic_edit",
+}
+
+
+def _moderate_topic_fields(
+    route_key: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if route_key not in _TOPIC_MODERATION_TARGETS or route_key not in MODERATED_TEXT_FIELDS:
+        raise to_http_exception(ModerationUnavailable(ValueError("unknown moderation route")))
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    fields = {}
+    for field in MODERATED_TEXT_FIELDS[route_key]:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=_TOPIC_MODERATION_TARGETS[route_key],
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 @router.get("/")
@@ -206,8 +252,7 @@ def create_topic(
 
     if not name:
         raise HTTPException(status_code=400, detail="Topic name is required")
-    moderate_route_fields(
-        moderation_service,
+    _moderate_topic_fields(
         "POST /api/topics",
         {"name": name, "description": description},
         actor_user_id=user.id,
@@ -272,8 +317,7 @@ def update_topic(
     topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
-    moderate_route_fields(
-        moderation_service,
+    _moderate_topic_fields(
         "PUT /api/topics/{topic_id}",
         payload,
         actor_user_id=user.id,
