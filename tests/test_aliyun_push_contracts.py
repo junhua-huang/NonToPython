@@ -88,6 +88,7 @@ class AliyunPushContracts(unittest.TestCase):
         self.assertIn("class PushDevice", source)
         self.assertIn("__tablename__ = 'push_devices'", source)
         self.assertIn("device_id", source)
+        self.assertIn("UniqueConstraint('device_id', name='uq_push_devices_device_id')", source)
         self.assertIn("provider", source)
         self.assertIn("enabled", source)
         self.assertIn("last_seen_at", source)

@@ -13,6 +13,10 @@ from app.ws_manager import ws_manager
 router = APIRouter()
 
 
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.post("")
 def block_user(
     payload: dict = Body(...),
@@ -59,10 +63,10 @@ def block_user(
             db.commit()
         except Exception as cleanup_error:
             db.rollback()
-            raise HTTPException(status_code=500, detail=str(cleanup_error))
+            raise _internal_error()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
     direct_conversation_ids = [
         row.id
@@ -105,7 +109,7 @@ def unblock_user(
         return {"message": "User unblocked successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/")

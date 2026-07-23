@@ -340,6 +340,7 @@ def test_sensitive_word_version_is_singleton_shaped():
 
     assert SensitiveWordVersion.__tablename__ == "sensitive_word_versions"
     assert set(columns) == {"id", "version", "updated_at"}
+    assert columns["id"].autoincrement is False
     assert columns["version"].nullable is False
     assert columns["updated_at"].nullable is False
     assert _constraint_names(
@@ -539,6 +540,30 @@ def test_migration_source_preserves_rows_and_reverses_dependencies_safely():
         'drop_index("ix_sensitive_word_active_version")'
     ) < downgrade_source.index('drop_column("row_version")')
     assert "create_unique_constraint" in downgrade_source
+
+
+def test_upgrade_resumes_after_sensitive_words_ddl_completed_without_version_table(monkeypatch):
+    migration = _load_migration()
+    engine = sa.create_engine("sqlite://")
+    _create_legacy_schema(engine)
+
+    with engine.begin() as connection:
+        monkeypatch.setattr(
+            migration,
+            "op",
+            Operations(MigrationContext.configure(connection)),
+        )
+        migration.upgrade()
+        connection.exec_driver_sql("DROP TABLE sensitive_word_versions")
+
+        migration.upgrade()
+
+        _assert_upgraded_sqlite_schema(connection)
+        assert connection.execute(
+            sa.text(
+                "SELECT id, version FROM sensitive_word_versions WHERE id = 1"
+            )
+        ).one() == (1, 1)
 
 
 def test_real_sqlite_upgrade_reflects_and_enforces_migration_contract(monkeypatch):
@@ -1010,6 +1035,20 @@ class _UpgradeInspector:
         return options
 
 
+def test_upgrade_preflight_allows_legacy_created_at_without_resuming(monkeypatch):
+    migration = _load_migration()
+    connection = _PreflightConnection()
+    monkeypatch.setattr(
+        migration.sa, "inspect", lambda _connection: _UpgradeInspector()
+    )
+
+    preflight = migration._preflight_upgrade(connection)
+
+    assert preflight["resume_after_sensitive_words"] is False
+    assert preflight["legacy_word_unique_name"] == "uq_legacy"
+    assert preflight["existing_columns"] == {"id", "word", "created_at"}
+
+
 @pytest.mark.parametrize(
     "dialect_name,version,match",
     [
@@ -1057,7 +1096,7 @@ def test_upgrade_preflight_rejects_mariadb_compatibility_dialect_before_ddl(
         ("bad_id_type", "id column"),
         ("bad_word_type", "word column"),
         ("bad_user_id_type", "users.id"),
-        ("target_column", "target column"),
+        ("target_column", "partially migrated"),
         ("version_table", "target table"),
         ("missing_legacy_unique", "exactly one legacy"),
         ("two_legacy_uniques", "exactly one legacy"),

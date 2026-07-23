@@ -127,7 +127,11 @@ _HATE = regex.compile(r"(?:全部|都)\s*(?:滚|去死)", regex.IGNORECASE)
 
 def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    normalized = _DEFAULT_IGNORABLE.sub("", normalized, timeout=_REGEX_TIMEOUT)
+    normalized = "".join(
+        character
+        for character in normalized
+        if _DEFAULT_IGNORABLE.fullmatch(character) is None
+    )
     return " ".join(normalized.casefold().split())
 
 

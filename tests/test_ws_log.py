@@ -1,4 +1,13 @@
 """Quick WS log test - triggers connect/auth/disconnect to verify logging"""
+import os
+import pytest
+
+if os.getenv("NONTO_RUN_LIVE_WS_TESTS") != "1":
+    pytest.skip(
+        "live WebSocket diagnostic test requires NONTO_RUN_LIVE_WS_TESTS=1 and a running local server",
+        allow_module_level=True,
+    )
+
 import asyncio, json, requests, websockets
 
 # Login

@@ -2,10 +2,18 @@
 WebSocket 连接测试脚本
 用于测试和查看 WebSocket 连接的详细信息
 """
+import os
+import pytest
+
+if os.getenv("NONTO_RUN_LIVE_WS_TESTS") != "1":
+    pytest.skip(
+        "live WebSocket diagnostic test requires NONTO_RUN_LIVE_WS_TESTS=1 and a running local server",
+        allow_module_level=True,
+    )
+
 import socketio
 import time
 import sys
-import websocket
 
 # Flask 服务器地址
 BASE_URL = "http://127.0.0.1:5000"

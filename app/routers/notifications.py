@@ -19,6 +19,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/")
 def get_notifications(
     page: int = Query(1, ge=1),
@@ -96,7 +100,7 @@ async def mark_as_read(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
     try:
         await ws_manager.send_with_seq(user.id, "notifications_read", {
@@ -132,7 +136,7 @@ async def mark_all_as_read(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
     try:
         await ws_manager.send_with_seq(user.id, "notifications_read", {
@@ -160,7 +164,7 @@ def clear_all_notifications(
         return {"message": "All notifications cleared"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.delete("/{notification_id}")
@@ -182,7 +186,7 @@ def delete_notification(
         return {"message": "Notification deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/settings")
@@ -233,4 +237,4 @@ def update_notification_settings(
         }
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()

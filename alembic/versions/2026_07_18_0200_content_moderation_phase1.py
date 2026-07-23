@@ -369,6 +369,62 @@ def _assert_target_names_available(inspector, table_names: list[str]) -> None:
         )
 
 
+def _assert_sensitive_words_upgraded_schema(
+    connection, inspector, columns: dict, dialect_name: str
+) -> None:
+    expected_columns = {"id", "word", "created_at"} | set(_RULE_COLUMNS)
+    if set(columns) != expected_columns:
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    word_type = columns["word"]["type"]
+    if not isinstance(word_type, sa.String) or word_type.length != 500:
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    unique_constraints = inspector.get_unique_constraints("sensitive_words")
+    if not any(
+        constraint.get("name") == "uq_sensitive_word_expression_type"
+        and list(constraint.get("column_names") or ()) == ["word", "match_type"]
+        for constraint in unique_constraints
+    ):
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    check_names = {
+        constraint.get("name")
+        for constraint in inspector.get_check_constraints("sensitive_words")
+    }
+    if not {
+        "ck_sensitive_word_match_type",
+        "ck_sensitive_word_category",
+        "ck_sensitive_word_severity",
+    } <= check_names:
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    if not any(
+        foreign_key.get("name") == "fk_sensitive_words_creator"
+        and list(foreign_key.get("constrained_columns") or ()) == ["created_by"]
+        and foreign_key.get("referred_table") == "users"
+        and list(foreign_key.get("referred_columns") or ()) == ["id"]
+        for foreign_key in inspector.get_foreign_keys("sensitive_words")
+    ):
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    if not any(
+        index.get("name") == "ix_sensitive_word_active_version"
+        and list(index.get("column_names") or ()) == ["is_active", "row_version"]
+        for index in inspector.get_indexes("sensitive_words")
+    ):
+        raise RuntimeError(
+            "sensitive_words is partially migrated and cannot be safely resumed"
+        )
+    if dialect_name == "mysql":
+        _assert_mysql_index_strategy_safe(inspector, columns["word"])
+
+
 def _preflight_upgrade(connection):
     # Front-load predictable failures before MySQL's non-transactional DDL.
     # Permissions, connectivity, and other runtime DDL failures remain possible.
@@ -407,6 +463,18 @@ def _preflight_upgrade(connection):
         raise RuntimeError(
             "sensitive_words.id column must be an integer before migration"
         )
+
+    if _TARGET_COLUMNS & columns.keys():
+        _assert_sensitive_words_upgraded_schema(
+            connection, inspector, columns, dialect_name
+        )
+        return {
+            "dialect_name": dialect_name,
+            "existing_columns": set(columns),
+            "legacy_word_unique_name": None,
+            "resume_after_sensitive_words": True,
+        }
+
     word_type = columns["word"]["type"]
     if not isinstance(word_type, sa.String) or word_type.length != 100:
         raise RuntimeError(
@@ -417,11 +485,6 @@ def _preflight_upgrade(connection):
             "sensitive_words.word column must be non-nullable before migration"
         )
 
-    conflicts = _TARGET_COLUMNS & columns.keys()
-    if conflicts:
-        raise RuntimeError(
-            "target column already exists on sensitive_words"
-        )
     if "created_at" in columns and not isinstance(
         columns["created_at"]["type"], sa.DateTime
     ):
@@ -445,6 +508,7 @@ def _preflight_upgrade(connection):
         "dialect_name": dialect_name,
         "existing_columns": set(columns),
         "legacy_word_unique_name": legacy_word_unique_name,
+        "resume_after_sensitive_words": False,
     }
 
 
@@ -741,18 +805,19 @@ def upgrade() -> None:
     existing_columns = preflight["existing_columns"]
     created_at_was_missing = "created_at" not in existing_columns
 
-    _add_nullable_rule_columns(existing_columns)
-    _alter_word_length(connection, 500)
-    connection.execute(_backfill_sensitive_words_statement(dialect_name))
-    _upgrade_constraints_and_nullability(
-        connection,
-        preflight["legacy_word_unique_name"],
-        created_at_was_missing,
-    )
+    if not preflight["resume_after_sensitive_words"]:
+        _add_nullable_rule_columns(existing_columns)
+        _alter_word_length(connection, 500)
+        connection.execute(_backfill_sensitive_words_statement(dialect_name))
+        _upgrade_constraints_and_nullability(
+            connection,
+            preflight["legacy_word_unique_name"],
+            created_at_was_missing,
+        )
 
     op.create_table(
         "sensitive_word_versions",
-        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=False),
         sa.Column("version", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.CheckConstraint(

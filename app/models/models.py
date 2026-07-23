@@ -539,12 +539,15 @@ class Notification(Base):
 class PushDevice(Base):
     """阿里云推送设备绑定。"""
     __tablename__ = 'push_devices'
+    __table_args__ = (
+        UniqueConstraint('device_id', name='uq_push_devices_device_id'),
+    )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     platform = Column(String(20), default='android')
     provider = Column(String(30), default='aliyun')
-    device_id = Column(String(128), unique=True, nullable=False, index=True)
+    device_id = Column(String(128), nullable=False, index=True)
     manufacturer = Column(String(80))
     model = Column(String(120))
     app_version = Column(String(50))
@@ -806,7 +809,7 @@ class SensitiveWordVersion(Base):
         CheckConstraint('id = 1', name='ck_sensitive_word_version_singleton'),
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=False)
     version = Column(Integer, nullable=False, default=1)
     updated_at = Column(
         DateTime,

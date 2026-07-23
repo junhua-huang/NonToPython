@@ -252,13 +252,6 @@ def create_comment(
     content = payload.get("content")
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
-    moderate_route_fields(
-        moderation_service,
-        "POST /api/posts/{post_id}/comments",
-        payload,
-        actor_user_id=user.id,
-        is_public=not bool(getattr(post, "community_only", False)),
-    )
 
     parent_id = payload.get("parent_id")
     reply_to_user_id = payload.get("reply_to_user_id")
@@ -275,6 +268,14 @@ def create_comment(
 
     if reply_to_user_id and has_block_between(db, user.id, reply_to_user_id):
         raise HTTPException(status_code=404, detail="Reply target not found")
+
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/posts/{post_id}/comments",
+        payload,
+        actor_user_id=user.id,
+        is_public=not bool(getattr(post, "community_only", False)),
+    )
 
     comment = Comment(
         content=content,

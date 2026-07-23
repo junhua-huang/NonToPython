@@ -84,6 +84,32 @@ _FK_OVERLAP_INDEXES = {
     ('post_visibility', 'user_id'),
 }
 
+# 历史迁移显式创建的性能索引，当前 ORM 模型未逐一声明。
+# 它们属于数据库管理的保留对象，autogenerate 不应生成删除操作。
+_DB_MANAGED_INDEXES = {
+    ('comic_event_follows', 'idx_comic_event_follows_event_user'),
+    ('comic_event_follows', 'idx_comic_event_follows_user_event'),
+    ('comic_event_images', 'idx_comic_event_images_event_cover_sort'),
+    ('comic_events', 'idx_comic_events_city_end_start'),
+    ('comic_events', 'idx_comic_events_end_start'),
+    ('conversation_participants', 'ix_cp_conversation_last_read_message'),
+    ('conversation_participants', 'ix_cp_conversation_user'),
+    ('conversations', 'idx_conversations_user1_last_message'),
+    ('conversations', 'idx_conversations_user2_last_message'),
+    ('friendships', 'idx_friendships_receiver_status_sender'),
+    ('friendships', 'idx_friendships_sender_status_receiver'),
+    ('likes', 'idx_likes_post_user'),
+    ('likes', 'idx_likes_user_created'),
+    ('messages', 'idx_messages_conversation_read_sender'),
+    ('post_topics', 'idx_post_topics_topic_post'),
+    ('posts', 'idx_posts_public_created'),
+    ('posts', 'idx_posts_user_public_created'),
+    ('posts', 'idx_posts_visibility_created'),
+    ('service_profiles', 'user_id'),
+    ('topic_followers', 'idx_topic_followers_topic_user'),
+    ('topic_followers', 'idx_topic_followers_user_topic'),
+}
+
 
 def include_object(object, name, type_, reflected, compare_to):
     """autogenerate 过滤器，屏蔽无害噪音。"""
@@ -97,6 +123,8 @@ def include_object(object, name, type_, reflected, compare_to):
         if table_name and (table_name, name) in _FK_AUTO_INDEXES:
             return False
         if table_name and (table_name, name) in _FK_OVERLAP_INDEXES:
+            return False
+        if table_name and (table_name, name) in _DB_MANAGED_INDEXES:
             return False
 
     return True

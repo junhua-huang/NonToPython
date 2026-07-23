@@ -188,7 +188,7 @@ def test_all_phase1_value_objects_are_frozen_and_slotted():
             setattr(value, first_field, getattr(value, first_field))
 
 
-def test_policy_returns_local_binary_decision_without_pending_or_manual_review():
+def test_policy_returns_local_binary_decision_without_queue_or_human_review():
     context = ModerationContext(target_type="post", actor_user_id=7, is_public=True)
     policy = ModerationPolicy()
 

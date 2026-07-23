@@ -17,6 +17,10 @@ from app.ws_manager import ws_manager
 router = APIRouter()
 
 
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.post("/request")
 def send_friend_request(
     payload: dict = Body(...),
@@ -119,7 +123,7 @@ def send_friend_request(
         return {"message": "Friend request sent successfully", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.post("/request/{request_id}/accept")
@@ -179,7 +183,7 @@ def accept_friend_request(
         return {"message": "Friend request accepted", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.post("/request/{request_id}/reject")
@@ -203,7 +207,7 @@ def reject_friend_request(
         return {"message": "Friend request rejected", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.delete("/request/{request_id}")
@@ -227,7 +231,7 @@ def cancel_friend_request(
         return {"message": "Friend request cancelled"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/")
@@ -351,7 +355,7 @@ def remove_friend(
         return {"message": "Friend removed successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/status/{user_id}")
