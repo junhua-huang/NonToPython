@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
+import app.dependencies as dependencies
 from app.dependencies import require_admin
 from app.models.models import (
     AdminAuditLog,
@@ -129,6 +130,29 @@ def test_admin_base_routes_return_safe_dashboard_and_audit_logs(admin_panel_clie
     assert "signed_url" not in body
     assert "SecretKey" not in body
     assert "raw_response" not in body
+
+
+def test_admin_me_serializes_roles_from_request_db_when_token_user_is_detached(
+    admin_panel_db,
+    monkeypatch,
+):
+    app = FastAPI()
+    app.include_router(admin_panel.router)
+
+    def override_db():
+        yield admin_panel_db
+
+    app.dependency_overrides[get_db] = override_db
+
+    detached_admin = admin_panel_db.get(User, 1)
+    admin_panel_db.expunge(detached_admin)
+    monkeypatch.setattr(dependencies, "verify_token", lambda token: detached_admin)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/admin/auth/me?access_token=test-token")
+
+    assert response.status_code == 200
+    assert response.json()["roles"] == ["admin"]
 
 
 def test_admin_user_deactivate_and_reactivate_write_audit_logs(admin_panel_client, admin_panel_db):

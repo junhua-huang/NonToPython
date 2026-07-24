@@ -7,11 +7,11 @@ Token 传参方式: ?access_token=<jwt>
 HTTP / WebSocket 完全复用同一套规则。
 """
 from fastapi import Depends, HTTPException, Request, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.core.auth_core import verify_token, AuthError
 from app.models.models import User
-from app.services.moderation_errors import AppContractError, to_http_exception
+from app.services.moderation_errors import AccountDisabled, AppContractError, to_http_exception
 
 
 def get_current_user(
@@ -72,15 +72,23 @@ def require_role(*role_names: str):
 
         # 权限以数据库为准，避免 JWT 内旧 roles 在撤销/暂停后继续生效。
         from app.models.models import UserRole, Role
-        ur_rows = db.query(UserRole).filter(UserRole.user_id == user.id).all()
-        role_ids = [ur.role_id for ur in ur_rows]
-        roles = db.query(Role).filter(Role.id.in_(role_ids)).all() if role_ids else []
-        user_roles = {r.name for r in roles}
+        current_user = (
+            db.query(User)
+            .options(joinedload(User.user_roles).joinedload(UserRole.role))
+            .filter(User.id == user.id)
+            .first()
+        )
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        if current_user.is_active is not True:
+            raise to_http_exception(AccountDisabled())
+
+        user_roles = {ur.role.name for ur in current_user.user_roles if ur.role}
 
         if not any(r in user_roles for r in role_names):
             raise HTTPException(status_code=403, detail=f"Required role(s): {', '.join(role_names)}")
 
-        return user
+        return current_user
 
     return dependency
 
