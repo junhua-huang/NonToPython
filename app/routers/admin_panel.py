@@ -110,6 +110,7 @@ def _serialize_post_admin(post: Post) -> dict:
         "video_url": post.video_url,
         "post_type": post.post_type,
         "visibility": post.visibility,
+        "quoted_post_id": post.quoted_post_id,
         "community_only": bool(post.community_only),
         "hidden_by_admin": bool(post.hidden_by_admin),
         "hidden_by": post.hidden_by,
@@ -118,11 +119,20 @@ def _serialize_post_admin(post: Post) -> dict:
     }
 
 
+def _serialize_quoted_post_admin(post: Post, db: Session) -> dict:
+    payload = _serialize_post_admin(post)
+    author = db.query(User).filter(User.id == post.user_id).first()
+    payload["author"] = _serialize_user_admin(author, db) if author else None
+    return payload
+
+
 def _serialize_post_detail_admin(post: Post, db: Session) -> dict:
     payload = _serialize_post_admin(post)
     author = db.query(User).filter(User.id == post.user_id).first()
+    quoted_post = db.query(Post).filter(Post.id == post.quoted_post_id).first() if post.quoted_post_id else None
     payload.update({
         "author": _serialize_user_admin(author, db) if author else None,
+        "quoted_post": _serialize_quoted_post_admin(quoted_post, db) if quoted_post else None,
         "comments_count": db.query(Comment).filter(Comment.post_id == post.id).count(),
         "reports_count": db.query(Report).filter(Report.target_type == "post", Report.target_id == post.id).count(),
         "moderation_events": [

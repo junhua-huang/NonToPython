@@ -109,17 +109,18 @@ class RecommendationService:
         }
 
     @staticmethod
-    def _serialize_posts(posts: list, batch_data: dict) -> list:
+    def _serialize_posts(posts: list, batch_data: dict, current_user_id: int | None = None, db: Session | None = None) -> list:
         """使用批量数据序列化帖子列表"""
         result = []
         for post in posts:
             data = batch_data.get(post.id, {})
             result.append(post.to_dict(
-                current_user_id=None,  # 不再让 to_dict 内部查询
+                current_user_id=current_user_id,
                 like_count=data.get('like_count'),
                 comment_count=data.get('comment_count'),
                 topics=data.get('topics'),
                 is_liked=data.get('is_liked'),
+                db=db,
             ))
         return result
 
@@ -527,7 +528,7 @@ class RecommendationService:
 
         # 批量加载聚合数据，消除 N+1
         batch_data = RecommendationService._batch_load_post_data(db, diversified_posts, user_id)
-        serialized_posts = RecommendationService._serialize_posts(diversified_posts, batch_data)
+        serialized_posts = RecommendationService._serialize_posts(diversified_posts, batch_data, current_user_id=user_id, db=db)
         RecommendationService._record_feed_seen(db, user_id, diversified_posts, now=now)
 
         return {
@@ -852,4 +853,4 @@ class RecommendationService:
 
         posts = related_query.all()
         batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
-        return {'posts': RecommendationService._serialize_posts(posts, batch_data), 'algorithm': 'related_v2'}
+        return {'posts': RecommendationService._serialize_posts(posts, batch_data, current_user_id=current_user_id, db=db), 'algorithm': 'related_v2'}

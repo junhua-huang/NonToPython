@@ -107,7 +107,7 @@ class TopicService:
         batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
 
         return {
-            'posts': RecommendationService._serialize_posts(posts, batch_data),
+            'posts': RecommendationService._serialize_posts(posts, batch_data, current_user_id=current_user_id, db=db),
             'total': total,
             'pages': (total + per_page - 1) // per_page if total > 0 else 0,
             'current_page': page,

@@ -109,7 +109,7 @@ def test_registration_uses_user_registration_target_before_otp_and_user_creation
         auth.register(
             auth.RegisterRequest(
                 username="blocked_user",
-                email="new@example.invalid",
+                email="new@qq.com",
                 password="Password9",
                 email_code="123456",
             ),

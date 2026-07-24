@@ -5,6 +5,7 @@
 import re
 import logging
 import html
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -32,6 +33,29 @@ from app.serializers.user import serialize_user_profile, serialize_user_self
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Auth"])
 security = HTTPBearer()
+
+_ALLOWED_REGISTRATION_EMAIL_DOMAINS = {"qq.com", "foxmail.com", "vip.qq.com"}
+_FORBIDDEN_USERNAME_CHARS = set('/\\?#@:\r\n\t')
+
+
+def is_allowed_registration_email(email: str) -> bool:
+    if not isinstance(email, str) or "@" not in email:
+        return False
+    domain = email.strip().lower().rsplit("@", 1)[-1]
+    return domain in _ALLOWED_REGISTRATION_EMAIL_DOMAINS
+
+
+def normalize_username(value: str) -> str:
+    username = value.strip() if isinstance(value, str) else ""
+    if not (2 <= len(username) <= 30):
+        raise ValueError("Username must be 2-30 characters long")
+    if any(char in _FORBIDDEN_USERNAME_CHARS for char in username):
+        raise ValueError("Username contains unsupported characters")
+    if any(unicodedata.category(char)[0] == "C" or char.isspace() for char in username):
+        raise ValueError("Username contains unsupported characters")
+    if not any(unicodedata.category(char)[0] in {"L", "N"} for char in username):
+        raise ValueError("Username must contain a letter or number")
+    return username
 
 
 def _validate_avatar_url(url: str) -> str:
@@ -129,13 +153,7 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def validate_username(cls, v: str) -> str:
-        v = v.strip()
-        if not (3 <= len(v) <= 30):
-            raise ValueError("Username must be 3-30 characters long")
-        # 允许中文、英文、数字、下划线、点号
-        if not re.match(r'^[\u4e00-\u9fff a-zA-Z0-9_.]+$', v):
-            raise ValueError("Username can only contain Chinese, English letters, numbers, underscores, and dots")
-        return v
+        return normalize_username(v)
 
     @field_validator("email")
     @classmethod
@@ -143,6 +161,8 @@ class RegisterRequest(BaseModel):
         v = v.strip().lower()
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', v):
             raise ValueError("Invalid email format")
+        if not is_allowed_registration_email(v):
+            raise ValueError("目前仅支持 QQ 邮箱注册")
         return v
 
     @field_validator("password")
@@ -299,6 +319,10 @@ async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends
     email = data.email
     purpose = data.purpose
     ip = request.client.host if request.client else None
+
+    # 注册场景：只允许 QQ 邮箱体系注册。
+    if purpose == "register" and not is_allowed_registration_email(email):
+        raise HTTPException(status_code=400, detail="目前仅支持 QQ 邮箱注册")
 
     # 注册场景：邮箱已被占用 → 直接拒绝（其它 purpose 不暴露邮箱是否存在）
     if purpose == "register":

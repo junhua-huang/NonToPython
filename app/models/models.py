@@ -183,6 +183,7 @@ class Post(Base):
     content_category = Column(String(32), nullable=True)
     display_role_type = Column(String(32), nullable=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    quoted_post_id = Column(Integer, ForeignKey('posts.id'), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     visibility = Column(String(20), default='public')
@@ -198,6 +199,7 @@ class Post(Base):
     
     # 关系
     author = relationship('User', back_populates='posts', foreign_keys=[user_id])
+    quoted_post = relationship('Post', remote_side=[id], foreign_keys=[quoted_post_id], uselist=False)
     comments = relationship('Comment', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     likes = relationship('Like', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     
@@ -259,6 +261,7 @@ class Post(Base):
             'display_role_type': effective_display_role_type,
             'display_role_label': get_business_identity_label(effective_display_role_type),
             'user_id': self.user_id,
+            'quoted_post_id': self.quoted_post_id,
             'author': self.author.to_dict() if self.author else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
@@ -271,6 +274,28 @@ class Post(Base):
             'topics': topics if topics is not None else self.get_topics(db=db),
             'is_liked': is_liked if is_liked is not None else False,
         }
+        quoted_post = self.quoted_post
+        if quoted_post is None and self.quoted_post_id and db is not None:
+            quoted_post = db.query(Post).filter(Post.id == self.quoted_post_id).first()
+        if quoted_post is not None:
+            try:
+                from app.services.post_visibility_service import can_view_post
+                visible = can_view_post(db, quoted_post, current_user_id) if db is not None else not quoted_post.hidden_by_admin
+            except Exception:
+                visible = False
+            if visible and quoted_post.hidden_by_admin is not True:
+                result['quoted_post'] = quoted_post.to_dict(
+                    current_user_id=current_user_id,
+                    like_count=0,
+                    comment_count=0,
+                    topics=[],
+                    is_liked=False,
+                    db=None,
+                )
+            else:
+                result['quoted_post'] = {'id': self.quoted_post_id, 'unavailable': True}
+        else:
+            result['quoted_post'] = None
         return result
 
 
@@ -1293,9 +1318,12 @@ class ModerationEvent(Base):
 class AdminSetting(Base):
     """管理员可修改的安全业务配置，不存密钥。"""
     __tablename__ = 'admin_settings'
+    __table_args__ = (
+        UniqueConstraint('key', name='uq_admin_settings_key'),
+    )
 
     id = Column(Integer, primary_key=True)
-    key = Column(String(120), unique=True, nullable=False, index=True)
+    key = Column(String(120), nullable=False, index=True)
     value = Column(String(500), nullable=False)
     updated_by = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)

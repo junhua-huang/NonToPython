@@ -79,6 +79,8 @@ def admin_panel_db():
     db.add(SensitiveWordVersion(id=1, version=1))
     db.add(SensitiveWord(id=70, word="spam", match_type="literal", category="spam", severity="medium", is_active=True, row_version=1))
     db.add(Post(id=10, user_id=2, content="public post", images=json.dumps(["https://example.com/image.jpg"]), visibility="public", created_at=datetime.utcnow()))
+    db.add(Post(id=11, user_id=3, content="quoted original", images=json.dumps(["https://example.com/quoted.jpg"]), visibility="public", created_at=datetime.utcnow()))
+    db.add(Post(id=12, user_id=2, content="quote wrapper", quoted_post_id=11, visibility="public", created_at=datetime.utcnow()))
     db.add(Comment(id=20, post_id=10, user_id=3, content="public comment", created_at=datetime.utcnow()))
     db.add(Report(id=30, reporter_id=3, target_type="post", target_id=10, reason="spam", status="pending", created_at=datetime.utcnow()))
     db.add(RoleApplication(id=40, user_id=2, role_id=2, status="pending", reason="verify me", proof_images=json.dumps(["https://example.com/proof.jpg"]), created_at=datetime.utcnow()))
@@ -225,6 +227,19 @@ def test_admin_content_hide_restore_and_report_resolution(admin_panel_client, ad
     assert resolved_report.json()["report"]["status"] == "resolved"
     assert admin_panel_db.get(Post, 10).hidden_by_admin is True
     assert admin_panel_db.query(AdminAuditLog).filter(AdminAuditLog.action == "resolve_report").count() == 1
+
+
+def test_admin_post_detail_includes_quoted_post_snapshot(admin_panel_client):
+    detail = admin_panel_client.get("/api/admin/posts/12")
+
+    assert detail.status_code == 200
+    assert detail.json()["quoted_post_id"] == 11
+    assert detail.json()["quoted_post"]["id"] == 11
+    assert detail.json()["quoted_post"]["content"] == "quoted original"
+    assert detail.json()["quoted_post"]["author"]["id"] == 3
+    body = json.dumps(detail.json(), ensure_ascii=False)
+    assert "signed_url" not in body
+    assert "SecretKey" not in body
 
 
 def test_admin_comment_detail_and_content_governance_notice(admin_panel_client, admin_panel_db):

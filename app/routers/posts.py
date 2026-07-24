@@ -98,6 +98,21 @@ def _delete_owned_post_media_url(url: str | None, user_id: int) -> None:
     FileUploader.delete_file(FileUploader._get_cos_url(cos_key))
 
 
+def _load_quotable_post(db: Session, quoted_post_id: int | None, viewer_user_id: int) -> Post | None:
+    if quoted_post_id is None:
+        return None
+    quoted = db.query(Post).filter(Post.id == quoted_post_id).first()
+    if not quoted or quoted.hidden_by_admin is True or not can_view_post(db, quoted, viewer_user_id):
+        raise HTTPException(status_code=404, detail="Quoted post not found")
+    if has_block_between(db, viewer_user_id, quoted.user_id):
+        raise HTTPException(status_code=404, detail="Quoted post not found")
+    return quoted
+
+
+def _serialize_created_post(post: Post, current_user_id: int, db: Session) -> dict:
+    return post.to_dict(current_user_id=current_user_id, is_liked=False, db=db)
+
+
 def _validate_post_community_write(
     db: Session,
     user_id: int,
@@ -139,12 +154,15 @@ async def create_post(
     visible_user_ids: Optional[str] = Form(None),
     community_id: Optional[int] = Form(None),
     community_only: Optional[bool] = Form(False),
+    quoted_post_id: Optional[int] = Form(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """创建新帖子（支持文件上传 + 多图 URL）"""
     import json as _json
     current_user_id = user.id
+    if type(quoted_post_id) is not int:
+        quoted_post_id = None
     try:
         visibility = validate_post_visibility_write(visibility, visible_user_ids)
     except ValueError as exc:
@@ -155,6 +173,7 @@ async def create_post(
         community_id,
         community_only is True,
     )
+    _load_quotable_post(db, quoted_post_id, current_user_id)
     moderate_route_fields(
         moderation_service,
         "POST /api/posts",
@@ -256,15 +275,16 @@ async def create_post(
         else:
             raise HTTPException(status_code=400, detail=f"Video upload failed: {result['error']}")
 
-    if not content and not final_image_url and not final_video_url:
-        raise HTTPException(status_code=400, detail="Content or media file is required")
+    if not content and not final_image_url and not final_video_url and quoted_post_id is None:
+        raise HTTPException(status_code=400, detail="Content, media file, or quoted post is required")
 
     post = Post(
-        content=content,
+        content=content or "",
         images=images_json,
         video_url=final_video_url,
         post_type=post_type,
         user_id=current_user_id,
+        quoted_post_id=quoted_post_id,
         display_role_type=resolve_display_role_type(user, display_role_type, db),
         visibility=visibility,
         is_public=(visibility == "public"),
@@ -281,7 +301,7 @@ async def create_post(
             TopicService.auto_link_topics(db, post.id, post.content)
             MentionService.process_mentions(content=post.content, author_id=current_user_id, post_id=post.id)
 
-        return {"message": "Post created successfully", "post": post.to_dict(current_user_id=None, is_liked=False)}
+        return {"message": "Post created successfully", "post": _serialize_created_post(post, current_user_id, db)}
     except Exception as e:
         db.rollback()
         logger.error(
@@ -340,7 +360,7 @@ def get_posts(
     batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
 
     return {
-        "posts": RecommendationService._serialize_posts(posts, batch_data),
+        "posts": RecommendationService._serialize_posts(posts, batch_data, current_user_id=current_user_id, db=db),
         "has_more": has_more,
         "current_page": page,
         "per_page": per_page,
@@ -374,7 +394,7 @@ def get_user_posts(
     batch_data = RecommendationService._batch_load_post_data(db, posts, user.id)
 
     return {
-        "posts": RecommendationService._serialize_posts(posts, batch_data),
+        "posts": RecommendationService._serialize_posts(posts, batch_data, current_user_id=user.id, db=db),
         "has_more": has_more,
         "current_page": page,
         "per_page": per_page,
@@ -388,7 +408,7 @@ def get_post(post_id: int, user: User = Depends(get_current_user), db: Session =
     if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
     is_liked = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first() is not None
-    return {"post": post.to_dict(current_user_id=None, is_liked=is_liked)}
+    return {"post": post.to_dict(current_user_id=user.id, is_liked=is_liked, db=db)}
 
 
 @router.put("/{post_id}")
@@ -453,7 +473,7 @@ def update_post(
             TopicService.auto_link_topics(db, post.id, payload["content"])
             MentionService.process_mentions(payload["content"], post.user_id, post_id=post.id)
         is_liked = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first() is not None
-        return {"message": "Post updated successfully", "post": post.to_dict(current_user_id=None, is_liked=is_liked)}
+        return {"message": "Post updated successfully", "post": post.to_dict(current_user_id=user.id, is_liked=is_liked, db=db)}
     except Exception as e:
         db.rollback()
         logger.error(
@@ -560,7 +580,7 @@ def get_user_liked_posts(
         from app.services.recommendation_service import RecommendationService
         batch_data = RecommendationService._batch_load_post_data(db, post_objects, current_user_id)
 
-        posts_data = RecommendationService._serialize_posts(post_objects, batch_data)
+        posts_data = RecommendationService._serialize_posts(post_objects, batch_data, current_user_id=current_user_id, db=db)
 
         return {
             "posts": posts_data,

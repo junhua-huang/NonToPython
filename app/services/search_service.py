@@ -63,7 +63,7 @@ class SearchService:
             return []
         from app.services.recommendation_service import RecommendationService
         batch_data = RecommendationService._batch_load_post_data(db, posts, user_id)
-        return RecommendationService._serialize_posts(posts, batch_data)
+        return RecommendationService._serialize_posts(posts, batch_data, current_user_id=user_id, db=db)
 
     @staticmethod
     def search_posts(

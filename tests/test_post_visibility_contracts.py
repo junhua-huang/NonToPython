@@ -180,6 +180,131 @@ def test_anonymous_viewers_see_only_public_posts(post_db):
     assert not service.can_view_post(post_db, private, None)
 
 
+def test_create_quote_post_returns_safe_quoted_post_snapshot(post_db):
+    user = post_db.get(User, 1)
+    original = _add_post(post_db, 4, "public", content="original post")
+
+    with (
+        patch.object(posts_router.TopicService, "auto_link_topics"),
+        patch.object(posts_router.MentionService, "process_mentions"),
+    ):
+        response = asyncio.run(posts_router.create_post(
+            image=None,
+            video=None,
+            content="quote text",
+            image_urls=None,
+            video_url_input=None,
+            content_category=None,
+            display_role_type=None,
+            visibility="public",
+            visible_user_ids=None,
+            community_id=None,
+            community_only=False,
+            quoted_post_id=original.id,
+            user=user,
+            db=post_db,
+        ))
+
+    created = post_db.query(Post).filter(Post.content == "quote text").one()
+    assert created.quoted_post_id == original.id
+    assert response["post"]["quoted_post_id"] == original.id
+    assert response["post"]["quoted_post"]["id"] == original.id
+    assert response["post"]["quoted_post"]["content"] == "original post"
+
+
+def test_create_quote_only_post_succeeds_without_text_or_media(post_db):
+    user = post_db.get(User, 1)
+    original = _add_post(post_db, 4, "public", content="original only")
+
+    with (
+        patch.object(posts_router.TopicService, "auto_link_topics"),
+        patch.object(posts_router.MentionService, "process_mentions"),
+    ):
+        response = asyncio.run(posts_router.create_post(
+            image=None,
+            video=None,
+            content=None,
+            image_urls=None,
+            video_url_input=None,
+            content_category=None,
+            display_role_type=None,
+            visibility="public",
+            visible_user_ids=None,
+            community_id=None,
+            community_only=False,
+            quoted_post_id=original.id,
+            user=user,
+            db=post_db,
+        ))
+
+    created = post_db.query(Post).filter(Post.quoted_post_id == original.id, Post.user_id == user.id).one()
+    assert created.content == ""
+    assert response["post"]["content"] == ""
+    assert response["post"]["quoted_post"]["id"] == original.id
+
+
+def test_create_quote_post_rejects_hidden_or_invisible_original(post_db):
+    user = post_db.get(User, 1)
+    hidden = _add_post(post_db, 4, "public", content="hidden original")
+    hidden.hidden_by_admin = True
+    post_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(posts_router.create_post(
+            image=None,
+            video=None,
+            content="quote text",
+            image_urls=None,
+            video_url_input=None,
+            content_category=None,
+            display_role_type=None,
+            visibility="public",
+            visible_user_ids=None,
+            community_id=None,
+            community_only=False,
+            quoted_post_id=hidden.id,
+            user=user,
+            db=post_db,
+        ))
+
+    assert exc_info.value.status_code == 404
+
+
+def test_post_detail_marks_quoted_post_unavailable_when_original_becomes_invisible(post_db):
+    viewer = post_db.get(User, 1)
+    original = _add_post(post_db, 4, "public", content="later hidden from viewer")
+    quote = _add_post(post_db, 1, "public", content="quote remains visible")
+    quote.quoted_post_id = original.id
+    post_db.commit()
+
+    original.visibility = "private"
+    original.is_public = False
+    post_db.commit()
+
+    response = posts_router.get_post(quote.id, user=viewer, db=post_db)
+
+    assert response["post"]["quoted_post_id"] == original.id
+    assert response["post"]["quoted_post"] == {"id": original.id, "unavailable": True}
+
+
+def test_post_list_marks_quoted_post_unavailable_when_original_becomes_invisible(post_db):
+    viewer = post_db.get(User, 1)
+    original = _add_post(post_db, 4, "public", content="private original must not leak")
+    quote = _add_post(post_db, 1, "public", content="visible quote")
+    quote.quoted_post_id = original.id
+    post_db.commit()
+
+    original.visibility = "private"
+    original.is_public = False
+    post_db.commit()
+
+    response = posts_router.get_posts(page=1, per_page=20, community_id=None, user=viewer, db=post_db)
+    quote_payload = next(item for item in response["posts"] if item["id"] == quote.id)
+
+    assert quote_payload["quoted_post_id"] == original.id
+    assert quote_payload["quoted_post"] == {"id": original.id, "unavailable": True}
+
+
 def test_create_ignores_content_category_and_normalizes_friends_only(post_db):
     user = post_db.get(User, 1)
 
