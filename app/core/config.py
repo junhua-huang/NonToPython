@@ -4,6 +4,20 @@ NanTuPy - FastAPI 应用配置
 import os
 from datetime import timedelta
 
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw_value = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
 class Config:
     # 安全密钥 - 从环境变量读取
     SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
@@ -67,6 +81,10 @@ class Config:
     COS_BUCKET = os.environ.get('COS_BUCKET', '')
     COS_BUCKET_NAME = os.environ.get('COS_BUCKET_NAME', os.environ.get('COS_BUCKET', ''))
     COS_DOMAIN = os.environ.get('COS_DOMAIN', '')
+    COS_CI_IMAGE_AUDIT_ENABLED = os.environ.get('COS_CI_IMAGE_AUDIT_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+    COS_CI_IMAGE_AUDIT_BIZ_TYPE = os.environ.get('COS_CI_IMAGE_AUDIT_BIZ_TYPE', '')
+    COS_CI_IMAGE_AUDIT_TIMEOUT_SECONDS = _env_float('COS_CI_IMAGE_AUDIT_TIMEOUT_SECONDS', 8.0, minimum=1.0, maximum=30.0)
+    COS_CI_IMAGE_AUDIT_LARGE_IMAGE_DETECT = os.environ.get('COS_CI_IMAGE_AUDIT_LARGE_IMAGE_DETECT', '0')
 
     # 阿里云移动推送配置 - 仅从环境变量读取，禁止在代码中写入真实密钥
     ALIYUN_ACCESS_KEY_ID = os.environ.get('ALIYUN_ACCESS_KEY_ID', '')

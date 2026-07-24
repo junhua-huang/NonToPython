@@ -23,6 +23,10 @@ from app.services.topic_service import TopicService
 from app.services.mention_service import MentionService
 from app.services.moderation_route_helpers import moderate_route_fields
 from app.services.moderation_service import moderation_service
+from app.services.media_moderation_route_helpers import (
+    is_moderated_image_key,
+    moderate_cos_image_or_raise,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -41,6 +45,57 @@ def resolve_display_role_type(user: User, requested_role: Optional[str], db: Ses
         .first()
     )
     return role_name if row else None
+
+
+def _validate_owned_post_media_key(
+    cos_key: str | None,
+    user_id: int,
+    *,
+    error_detail: str = "Invalid media URL",
+) -> str:
+    if not cos_key or type(cos_key) is not str:
+        raise HTTPException(status_code=400, detail=error_detail)
+    normalized = cos_key.strip().lstrip("/")
+    parts = normalized.split("/")
+    if (
+        normalized != cos_key.strip()
+        or ".." in normalized
+        or "\\" in normalized
+        or any(not part for part in parts)
+        or len(parts) < 3
+        or parts[0] != "posts"
+        or parts[1] != str(user_id)
+    ):
+        raise HTTPException(status_code=403, detail=error_detail)
+    return normalized
+
+
+def _validate_owned_post_image_key(cos_key: str | None, user_id: int) -> str:
+    return _validate_owned_post_media_key(cos_key, user_id, error_detail="Invalid image URL")
+
+
+def _validate_client_post_media_url(url: str | None, user_id: int, *, error_detail: str) -> str | None:
+    if url in (None, ""):
+        return url
+    if type(url) is not str:
+        raise HTTPException(status_code=400, detail=error_detail)
+    cos_key = FileUploader.cos_key_from_url(url)
+    if cos_key:
+        _validate_owned_post_media_key(cos_key, user_id, error_detail=error_detail)
+    return url
+
+
+def _delete_owned_post_media_url(url: str | None, user_id: int) -> None:
+    if not url or type(url) is not str:
+        return
+    cos_key = FileUploader.cos_key_from_url(url)
+    if not cos_key:
+        return
+    try:
+        _validate_owned_post_media_key(cos_key, user_id)
+    except HTTPException:
+        return
+    FileUploader.delete_file(FileUploader._get_cos_url(cos_key))
 
 
 def _validate_post_community_write(
@@ -109,7 +164,11 @@ async def create_post(
     )
 
     final_image_url = None
-    final_video_url = video_url_input
+    final_video_url = _validate_client_post_media_url(
+        video_url_input,
+        current_user_id,
+        error_detail="Invalid video URL",
+    )
     images_json = None
     post_type = "text"
 
@@ -118,11 +177,30 @@ async def create_post(
         try:
             images_list = _json.loads(image_urls)
             if isinstance(images_list, list) and len(images_list) > 0:
-                images_json = _json.dumps(images_list)
-                final_image_url = images_list[0]
+                audited_images = []
+                for index, image_url in enumerate(images_list):
+                    if type(image_url) is not str or not image_url.strip():
+                        raise HTTPException(status_code=400, detail="Invalid image URL")
+                    image_cos_key = _validate_owned_post_image_key(
+                        FileUploader.cos_key_from_url(image_url),
+                        current_user_id,
+                    )
+                    if not is_moderated_image_key(image_cos_key):
+                        raise HTTPException(status_code=400, detail="Invalid image URL")
+                    moderate_cos_image_or_raise(
+                        image_cos_key,
+                        target_type="post_image_url",
+                        actor_user_id=current_user_id,
+                        upload_type="post",
+                        is_public=(visibility == "public" and not community_only),
+                        data_id=f"post-image-url-{current_user_id}-{index}",
+                    )
+                    audited_images.append(image_url)
+                images_json = _json.dumps(audited_images)
+                final_image_url = audited_images[0]
                 post_type = "image"
-        except (_json.JSONDecodeError, TypeError):
-            pass
+        except _json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid image URLs")
 
     # 处理图片上传
     if image and image.filename:
@@ -143,6 +221,19 @@ async def create_post(
             )
             result = FileUploader.save_file(optimized_file, file_type="image", subfolder=f"posts/{current_user_id}")
             if result["success"]:
+                try:
+                    moderate_cos_image_or_raise(
+                        result["cos_key"],
+                        target_type="post_image",
+                        actor_user_id=current_user_id,
+                        upload_type="post",
+                        is_public=(visibility == "public" and not community_only),
+                        content_type="image/jpeg",
+                        data_id=f"post-image-{current_user_id}",
+                    )
+                except HTTPException as moderation_error:
+                    FileUploader.delete_file(result["url"])
+                    raise moderation_error
                 final_image_url = result["url"]
                 images_json = _json.dumps([final_image_url])
                 post_type = "image"
@@ -339,7 +430,11 @@ def update_post(
     if "content" in payload:
         post.content = payload["content"]
     if "video_url" in payload:
-        post.video_url = payload["video_url"]
+        post.video_url = _validate_client_post_media_url(
+            payload["video_url"],
+            user.id,
+            error_detail="Invalid video URL",
+        )
     if "community_id" in payload:
         post.community_id = next_community_id
     if "community_only" in payload:
@@ -403,12 +498,10 @@ def delete_post(post_id: int, user: User = Depends(get_current_user), db: Sessio
             try:
                 imgs = _json.loads(post.images)
                 for img_url in imgs:
-                    if img_url:
-                        FileUploader.delete_file(img_url)
+                    _delete_owned_post_media_url(img_url, user.id)
             except (_json.JSONDecodeError, TypeError):
                 pass
-        if post.video_url:
-            FileUploader.delete_file(post.video_url)
+        _delete_owned_post_media_url(post.video_url, user.id)
         db.delete(post)
         db.commit()
         return {"message": "Post deleted successfully"}

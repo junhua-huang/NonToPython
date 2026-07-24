@@ -50,7 +50,7 @@ class FileUploader:
         if not client:
             return [{"error": "COS not configured"} for _ in range(count)]
 
-        _image_exts = {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tiff", "tif", "ico", "heic", "heif", "avif", "apng", "jfif", "pjpeg", "pjp"}
+        _image_exts = {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "ico", "heic", "heif", "avif", "apng", "jfif", "pjpeg", "pjp"}
         ext = ".jpg" if file_type.lower() in _image_exts else ".mp4"
         results = []
         for _ in range(count):
@@ -120,6 +120,21 @@ class FileUploader:
             return {"success": False, "error": str(e)}
 
     @classmethod
+    def cos_key_from_url(cls, url: str) -> str | None:
+        if not url or type(url) is not str:
+            return None
+        if Config.COS_DOMAIN:
+            prefix = f"https://{Config.COS_DOMAIN}/"
+            if url.startswith(prefix):
+                key = url[len(prefix):]
+                return key if key and ".." not in key else None
+        bucket_prefix = f"https://{Config.COS_BUCKET_NAME}.cos.{Config.COS_REGION}.myqcloud.com/"
+        if url.startswith(bucket_prefix):
+            key = url[len(bucket_prefix):]
+            return key if key and ".." not in key else None
+        return None
+
+    @classmethod
     def delete_file(cls, url: str):
         """
         删除 COS 文件
@@ -136,11 +151,9 @@ class FileUploader:
 
         # 从 URL 提取 cos_key
         try:
-            if Config.COS_DOMAIN and Config.COS_DOMAIN in url:
-                cos_key = url.split(f"https://{Config.COS_DOMAIN}/")[-1]
-            else:
-                prefix = f"https://{Config.COS_BUCKET_NAME}.cos.{Config.COS_REGION}.myqcloud.com/"
-                cos_key = url.split(prefix)[-1]
+            cos_key = cls.cos_key_from_url(url)
+            if not cos_key:
+                return {"success": False, "error": "Invalid COS URL"}
 
             client.delete_object(Bucket=Config.COS_BUCKET_NAME, Key=cos_key)
             return {"success": True}
@@ -164,7 +177,7 @@ class FileUploader:
         if not client:
             return {"success": False, "error": "COS not configured"}
 
-        _image_exts = {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tiff", "tif", "ico", "heic", "heif", "avif", "apng", "jfif", "pjpeg", "pjp"}
+        _image_exts = {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "ico", "heic", "heif", "avif", "apng", "jfif", "pjpeg", "pjp"}
         ext = ".jpg" if file_type.lower() in _image_exts else ".mp4"
         unique_id = uuid.uuid4().hex[:8]
         filename = f"{unique_id}{ext}"
@@ -202,11 +215,9 @@ class FileUploader:
             return None
 
         try:
-            if Config.COS_DOMAIN and Config.COS_DOMAIN in url:
-                cos_key = url.split(f"https://{Config.COS_DOMAIN}/")[-1]
-            else:
-                prefix = f"https://{Config.COS_BUCKET_NAME}.cos.{Config.COS_REGION}.myqcloud.com/"
-                cos_key = url.split(prefix)[-1]
+            cos_key = cls.cos_key_from_url(url)
+            if not cos_key:
+                return None
 
             response = client.head_object(Bucket=Config.COS_BUCKET_NAME, Key=cos_key)
             return {
