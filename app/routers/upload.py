@@ -272,6 +272,8 @@ def confirm_avatar(
         upload_type="avatar",
         is_public=True,
         data_id=f"avatar-{user.id}",
+        db=db,
+        route_key="POST /api/upload/avatar/confirm",
     )
 
     current_user = db.query(User).filter(User.id == user.id).first()
@@ -314,6 +316,8 @@ def confirm_cover(
         upload_type="cover",
         is_public=True,
         data_id=f"cover-{user.id}",
+        db=db,
+        route_key="POST /api/upload/cover/confirm",
     )
 
     current_user = db.query(User).filter(User.id == user.id).first()

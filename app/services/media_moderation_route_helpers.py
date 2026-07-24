@@ -4,7 +4,8 @@ from fastapi import HTTPException
 
 from app.services.media_moderation_service import MediaModerationService
 from app.services.media_moderation_types import MediaModerationTarget
-from app.services.moderation_errors import AppContractError, to_http_exception
+from app.services.moderation_errors import AppContractError, ContentRejected, to_http_exception
+from app.services.moderation_event_service import record_moderation_event
 
 _IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "heic", "heif", "avif", "apng", "jfif"}
 _MEDIA_MODERATION_SKIP_PREFIXES = ("chat/",)
@@ -36,6 +37,8 @@ def moderate_cos_image_or_raise(
     content_type: str | None = None,
     data_id: str | None = None,
     service: MediaModerationService | None = None,
+    db=None,
+    route_key: str | None = None,
 ):
     if not is_moderated_image_key(cos_key, content_type=content_type):
         return None
@@ -52,7 +55,31 @@ def moderate_cos_image_or_raise(
                 data_id=data_id,
             )
         )
+    except ContentRejected as exc:
+        record_moderation_event(
+            db,
+            provider="tencent_cos_ci",
+            content_type="image",
+            route_key=route_key,
+            target_type=target_type,
+            target_id=data_id,
+            actor_user_id=actor_user_id,
+            decision="reject",
+            error_code=exc.error_code.value,
+        )
+        raise to_http_exception(exc) from None
     except AppContractError as exc:
+        record_moderation_event(
+            db,
+            provider="tencent_cos_ci",
+            content_type="image",
+            route_key=route_key,
+            target_type=target_type,
+            target_id=data_id,
+            actor_user_id=actor_user_id,
+            decision="unavailable",
+            error_code=exc.error_code.value,
+        )
         raise to_http_exception(exc) from None
 
 

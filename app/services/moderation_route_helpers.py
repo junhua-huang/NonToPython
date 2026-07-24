@@ -2,9 +2,11 @@ from collections.abc import Mapping
 
 from app.services.moderation_errors import (
     AppContractError,
+    ContentRejected,
     ModerationUnavailable,
     to_http_exception,
 )
+from app.services.moderation_event_service import record_moderation_event
 from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_types import ModerationContext
 
@@ -86,6 +88,8 @@ def moderate_route_fields(
     *,
     actor_user_id: int | None,
     is_public: bool,
+    db=None,
+    target_id: str | int | None = None,
 ) -> None:
     try:
         fields = _extract_moderated_fields(route_key, payload)
@@ -99,7 +103,43 @@ def moderate_route_fields(
                 is_public=is_public,
             ),
         )
+    except ContentRejected as error:
+        record_moderation_event(
+            db,
+            provider="local",
+            content_type="text",
+            route_key=route_key,
+            target_type=route_key,
+            target_id=target_id,
+            actor_user_id=actor_user_id,
+            decision="reject",
+            error_code=error.error_code.value,
+        )
+        raise to_http_exception(error) from None
     except AppContractError as error:
+        record_moderation_event(
+            db,
+            provider="local",
+            content_type="text",
+            route_key=route_key,
+            target_type=route_key,
+            target_id=target_id,
+            actor_user_id=actor_user_id,
+            decision="unavailable",
+            error_code=error.error_code.value,
+        )
         raise to_http_exception(error) from None
     except Exception as exc:
-        raise to_http_exception(ModerationUnavailable(exc)) from None
+        error = ModerationUnavailable(exc)
+        record_moderation_event(
+            db,
+            provider="local",
+            content_type="text",
+            route_key=route_key,
+            target_type=route_key,
+            target_id=target_id,
+            actor_user_id=actor_user_id,
+            decision="unavailable",
+            error_code=error.error_code.value,
+        )
+        raise to_http_exception(error) from None

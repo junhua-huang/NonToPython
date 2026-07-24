@@ -1,0 +1,561 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session
+
+from app.core.config import Config
+from app.database import get_db
+from app.dependencies import require_admin
+from app.models.models import (
+    AdminAuditLog,
+    Comment,
+    ModerationEvent,
+    Post,
+    Report,
+    Role,
+    RoleApplication,
+    SensitiveWord,
+    User,
+    UserRole,
+)
+from app.routers.auth import LoginRequest, login as auth_login
+from app.serializers.user import serialize_user_admin
+from app.services.admin_audit_service import record_required_admin_audit
+
+router = APIRouter(prefix="/api/admin", tags=["Admin Panel"])
+
+
+def _require_reason(payload: dict, *, field: str = "reason") -> str:
+    reason = payload.get(field)
+    if type(reason) is not str or not reason.strip():
+        raise HTTPException(status_code=422, detail=f"{field} is required")
+    return reason.strip()[:500]
+
+
+def _page_result(query, *, page: int, page_size: int, serializer):
+    total = query.count()
+    rows = query.offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [serializer(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+def _user_roles(user: User) -> list[str]:
+    return [ur.role.name for ur in getattr(user, "user_roles", []) if getattr(ur, "role", None)]
+
+
+def _serialize_user_admin(user: User, db: Session | None = None) -> dict:
+    posts_count = None
+    reports_received_count = None
+    if db is not None:
+        posts_count = db.query(Post).filter(Post.user_id == user.id).count()
+        reports_received_count = db.query(Report).filter(
+            Report.target_type == "user",
+            Report.target_id == user.id,
+        ).count()
+    payload = serialize_user_admin(user)
+    payload.update({
+        "posts_count": posts_count,
+        "reports_received_count": reports_received_count,
+    })
+    return payload
+
+
+def _serialize_post_admin(post: Post) -> dict:
+    return {
+        "id": post.id,
+        "user_id": post.user_id,
+        "content": post.content,
+        "images": json.loads(post.images) if post.images else [],
+        "video_url": post.video_url,
+        "post_type": post.post_type,
+        "visibility": post.visibility,
+        "community_only": bool(post.community_only),
+        "hidden_by_admin": bool(post.hidden_by_admin),
+        "hidden_by": post.hidden_by,
+        "hidden_at": post.hidden_at.isoformat() if post.hidden_at else None,
+        "created_at": post.created_at.isoformat() if post.created_at else None,
+    }
+
+
+def _serialize_comment_admin(comment: Comment) -> dict:
+    return {
+        "id": comment.id,
+        "post_id": comment.post_id,
+        "user_id": comment.user_id,
+        "parent_id": comment.parent_id,
+        "content": comment.content,
+        "hidden_by_admin": bool(getattr(comment, "hidden_by_admin", False)),
+        "hidden_by": getattr(comment, "hidden_by", None),
+        "hidden_reason": getattr(comment, "hidden_reason", None),
+        "hidden_at": comment.hidden_at.isoformat() if getattr(comment, "hidden_at", None) else None,
+        "created_at": comment.created_at.isoformat() if comment.created_at else None,
+    }
+
+
+def _serialize_report_admin(report: Report) -> dict:
+    return report.to_dict()
+
+
+def _serialize_identity_application(application: RoleApplication) -> dict:
+    return application.to_dict(include_private_user=True)
+
+
+def _serialize_audit_log(log: AdminAuditLog) -> dict:
+    metadata = None
+    if log.metadata_json:
+        try:
+            metadata = json.loads(log.metadata_json)
+        except json.JSONDecodeError:
+            metadata = None
+    return {
+        "id": log.id,
+        "admin_user_id": log.admin_user_id,
+        "action": log.action,
+        "target_type": log.target_type,
+        "target_id": log.target_id,
+        "result": log.result,
+        "reason": log.reason,
+        "metadata": metadata,
+        "ip_address": log.ip_address,
+        "user_agent": log.user_agent,
+        "created_at": log.created_at.isoformat() if log.created_at else None,
+    }
+
+
+def _user_has_admin_role(db: Session, user_id: int) -> bool:
+    return db.query(UserRole).join(Role, UserRole.role_id == Role.id).filter(
+        UserRole.user_id == user_id,
+        Role.name == "admin",
+    ).first() is not None
+
+
+
+def _serialize_moderation_event(event: ModerationEvent) -> dict:
+    return {
+        "id": event.id,
+        "provider": event.provider,
+        "content_type": event.content_type,
+        "route_key": event.route_key,
+        "target_type": event.target_type,
+        "target_id": event.target_id,
+        "actor_user_id": event.actor_user_id,
+        "decision": event.decision,
+        "error_code": event.error_code,
+        "label": event.label,
+        "category": event.category,
+        "score": event.score,
+        "created_at": event.created_at.isoformat() if event.created_at else None,
+    }
+
+
+@router.post("/auth/login")
+def admin_login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    response = auth_login(data, request, db)
+    if response.user_id is None or not _user_has_admin_role(db, response.user_id):
+        raise HTTPException(status_code=403, detail="Required role(s): admin")
+    return response
+
+
+@router.get("/auth/me")
+def admin_me(admin: User = Depends(require_admin)):
+    payload = serialize_user_admin(admin)
+    payload["permissions"] = ["admin:*"]
+    return payload
+
+
+@router.get("/dashboard/summary")
+def dashboard_summary(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    today = datetime.utcnow().date()
+    start = datetime.combine(today, datetime.min.time())
+    return {
+        "users_total": db.query(User).count(),
+        "users_today": db.query(User).filter(User.created_at >= start).count(),
+        "posts_today": db.query(Post).filter(Post.created_at >= start).count(),
+        "comments_today": db.query(Comment).filter(Comment.created_at >= start).count(),
+        "reports_pending": db.query(Report).filter(Report.status == "pending").count(),
+        "identity_applications_pending": db.query(RoleApplication).filter(RoleApplication.status == "pending").count(),
+        "sensitive_words_active": db.query(SensitiveWord).filter(SensitiveWord.is_active.is_(True)).count(),
+        "cos_image_audit_enabled": bool(Config.COS_CI_IMAGE_AUDIT_ENABLED),
+    }
+
+
+@router.get("/audit-logs")
+def list_audit_logs(
+    admin_user_id: int | None = Query(None),
+    action: str | None = Query(None),
+    target_type: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = db.query(AdminAuditLog)
+    if admin_user_id is not None:
+        query = query.filter(AdminAuditLog.admin_user_id == admin_user_id)
+    if action:
+        query = query.filter(AdminAuditLog.action == action)
+    if target_type:
+        query = query.filter(AdminAuditLog.target_type == target_type)
+    return _page_result(
+        query.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc()),
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_audit_log,
+    )
+
+
+@router.get("/users")
+def list_users(
+    q: str | None = Query(None),
+    status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = db.query(User)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(User.username.like(like), User.email.like(like)))
+    if status == "active":
+        query = query.filter(User.is_active.is_(True))
+    elif status == "inactive":
+        query = query.filter(User.is_active.is_(False))
+    return _page_result(
+        query.order_by(User.created_at.desc(), User.id.desc()),
+        page=page,
+        page_size=page_size,
+        serializer=lambda user: _serialize_user_admin(user, db),
+    )
+
+
+@router.get("/users/{user_id}")
+def get_user_detail(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _serialize_user_admin(user, db)
+
+
+@router.post("/users/{user_id}/deactivate")
+def deactivate_user(
+    user_id: int,
+    payload: dict = Body(...),
+    request: Request = None,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    reason = _require_reason(payload)
+    if user_id == admin.id:
+        raise HTTPException(status_code=422, detail="Cannot deactivate yourself")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    status_before = "active" if user.is_active else "inactive"
+    user.is_active = False
+    record_required_admin_audit(
+        db,
+        admin_user_id=admin.id,
+        action="deactivate_user",
+        target_type="user",
+        target_id=user.id,
+        reason=reason,
+        metadata={"status_before": status_before, "status_after": "inactive"},
+        request=request,
+    )
+    db.commit()
+    return {"message": "User deactivated", "user": _serialize_user_admin(user, db)}
+
+
+@router.post("/users/{user_id}/reactivate")
+def reactivate_user(
+    user_id: int,
+    payload: dict = Body(...),
+    request: Request = None,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    reason = _require_reason(payload)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    status_before = "active" if user.is_active else "inactive"
+    user.is_active = True
+    record_required_admin_audit(
+        db,
+        admin_user_id=admin.id,
+        action="reactivate_user",
+        target_type="user",
+        target_id=user.id,
+        reason=reason,
+        metadata={"status_before": status_before, "status_after": "active"},
+        request=request,
+    )
+    db.commit()
+    return {"message": "User reactivated", "user": _serialize_user_admin(user, db)}
+
+
+@router.get("/posts")
+def list_posts(
+    q: str | None = Query(None),
+    hidden: bool | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Post)
+    if q:
+        query = query.filter(Post.content.like(f"%{q}%"))
+    if hidden is not None:
+        query = query.filter(Post.hidden_by_admin.is_(hidden))
+    return _page_result(query.order_by(Post.created_at.desc(), Post.id.desc()), page=page, page_size=page_size, serializer=_serialize_post_admin)
+
+
+@router.get("/posts/{post_id}")
+def get_post_detail(post_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return _serialize_post_admin(post)
+
+
+@router.post("/posts/{post_id}/hide")
+def hide_post(post_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    status_before = "hidden" if post.hidden_by_admin else "visible"
+    post.hidden_by_admin = True
+    post.hidden_by = admin.id
+    post.hidden_at = datetime.utcnow()
+    record_required_admin_audit(db, admin_user_id=admin.id, action="hide_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_before": status_before, "status_after": "hidden"}, request=request)
+    db.commit()
+    return {"message": "Post hidden", "post": _serialize_post_admin(post)}
+
+
+@router.post("/posts/{post_id}/restore")
+def restore_post(post_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    status_before = "hidden" if post.hidden_by_admin else "visible"
+    post.hidden_by_admin = False
+    post.hidden_by = None
+    post.hidden_at = None
+    record_required_admin_audit(db, admin_user_id=admin.id, action="restore_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_before": status_before, "status_after": "visible"}, request=request)
+    db.commit()
+    return {"message": "Post restored", "post": _serialize_post_admin(post)}
+
+
+@router.get("/comments")
+def list_comments(post_id: int | None = Query(None), hidden: bool | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = db.query(Comment)
+    if post_id is not None:
+        query = query.filter(Comment.post_id == post_id)
+    if hidden is not None:
+        query = query.filter(Comment.hidden_by_admin.is_(hidden))
+    return _page_result(query.order_by(Comment.created_at.desc(), Comment.id.desc()), page=page, page_size=page_size, serializer=_serialize_comment_admin)
+
+
+@router.post("/comments/{comment_id}/hide")
+def hide_comment(comment_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    status_before = "hidden" if comment.hidden_by_admin else "visible"
+    comment.hidden_by_admin = True
+    comment.hidden_by = admin.id
+    comment.hidden_reason = reason
+    comment.hidden_at = datetime.utcnow()
+    record_required_admin_audit(db, admin_user_id=admin.id, action="hide_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_before": status_before, "status_after": "hidden"}, request=request)
+    db.commit()
+    return {"message": "Comment hidden", "comment": _serialize_comment_admin(comment)}
+
+
+@router.post("/comments/{comment_id}/restore")
+def restore_comment(comment_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    status_before = "hidden" if comment.hidden_by_admin else "visible"
+    comment.hidden_by_admin = False
+    comment.hidden_by = None
+    comment.hidden_reason = None
+    comment.hidden_at = None
+    record_required_admin_audit(db, admin_user_id=admin.id, action="restore_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_before": status_before, "status_after": "visible"}, request=request)
+    db.commit()
+    return {"message": "Comment restored", "comment": _serialize_comment_admin(comment)}
+
+
+@router.get("/reports")
+def list_reports(status: str | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = db.query(Report)
+    if status:
+        query = query.filter(Report.status == status)
+    return _page_result(query.order_by(Report.created_at.desc(), Report.id.desc()), page=page, page_size=page_size, serializer=_serialize_report_admin)
+
+
+@router.get("/reports/{report_id}")
+def get_report_detail(report_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return _serialize_report_admin(report)
+
+
+def _apply_report_action(db: Session, report: Report, action_taken: str | None, admin: User, reason: str, request: Request | None) -> None:
+    if action_taken == "hide_post" and report.target_type == "post":
+        post = db.query(Post).filter(Post.id == report.target_id).first()
+        if post:
+            post.hidden_by_admin = True
+            post.hidden_by = admin.id
+            post.hidden_at = datetime.utcnow()
+            record_required_admin_audit(db, admin_user_id=admin.id, action="hide_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_after": "hidden"}, request=request)
+    elif action_taken == "hide_comment" and report.target_type == "comment":
+        comment = db.query(Comment).filter(Comment.id == report.target_id).first()
+        if comment:
+            comment.hidden_by_admin = True
+            comment.hidden_by = admin.id
+            comment.hidden_reason = "report_resolved"
+            comment.hidden_at = datetime.utcnow()
+            record_required_admin_audit(db, admin_user_id=admin.id, action="hide_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_after": "hidden"}, request=request)
+    elif action_taken == "deactivate_user" and report.target_type == "user":
+        user = db.query(User).filter(User.id == report.target_id).first()
+        if user and user.id != admin.id:
+            user.is_active = False
+            record_required_admin_audit(db, admin_user_id=admin.id, action="deactivate_user", target_type="user", target_id=user.id, reason=reason, metadata={"status_after": "inactive"}, request=request)
+
+
+@router.post("/reports/{report_id}/resolve")
+def resolve_report(report_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    action_taken = payload.get("action_taken") or "none"
+    _apply_report_action(db, report, action_taken, admin, reason, request)
+    report.status = "resolved"
+    report.resolution = "resolved"
+    report.resolution_note = reason
+    report.action_taken = action_taken
+    report.resolved_by = admin.id
+    report.resolved_at = datetime.utcnow()
+    record_required_admin_audit(db, admin_user_id=admin.id, action="resolve_report", target_type="report", target_id=report.id, reason=reason, metadata={"report_status": "resolved", "status_after": "resolved"}, request=request)
+    db.commit()
+    return {"message": "Report resolved", "report": _serialize_report_admin(report)}
+
+
+@router.post("/reports/{report_id}/reject")
+def reject_report(report_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    reason = _require_reason(payload)
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    report.status = "rejected"
+    report.resolution = "rejected"
+    report.resolution_note = reason
+    report.action_taken = "none"
+    report.resolved_by = admin.id
+    report.resolved_at = datetime.utcnow()
+    record_required_admin_audit(db, admin_user_id=admin.id, action="reject_report", target_type="report", target_id=report.id, reason=reason, metadata={"report_status": "rejected", "status_after": "rejected"}, request=request)
+    db.commit()
+    return {"message": "Report rejected", "report": _serialize_report_admin(report)}
+
+
+@router.get("/identity-applications")
+def list_identity_applications(status: str | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = db.query(RoleApplication)
+    if status:
+        query = query.filter(RoleApplication.status == status)
+    return _page_result(query.order_by(RoleApplication.created_at.desc(), RoleApplication.id.desc()), page=page, page_size=page_size, serializer=_serialize_identity_application)
+
+
+@router.get("/identity-applications/{application_id}")
+def get_identity_application(application_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    application = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return _serialize_identity_application(application)
+
+
+def _sync_identity_role(db: Session, application: RoleApplication, status: str) -> None:
+    existing = db.query(UserRole).filter(
+        UserRole.user_id == application.user_id,
+        UserRole.role_id == application.role_id,
+    ).first()
+    if status == "verified" and not existing:
+        db.add(UserRole(user_id=application.user_id, role_id=application.role_id))
+    elif status in {"rejected", "suspended"} and existing:
+        db.delete(existing)
+
+
+
+def _review_identity_application(db: Session, application_id: int, admin: User, status: str, reason: str | None, request: Request | None):
+    application = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    status_before = application.status
+    application.status = status
+    application.reviewer_id = admin.id
+    application.reviewed_at = datetime.utcnow()
+    if reason is not None:
+        application.review_comment = reason
+    _sync_identity_role(db, application, status)
+    record_required_admin_audit(db, admin_user_id=admin.id, action=f"identity_{status}", target_type="identity_application", target_id=application.id, reason=reason, metadata={"status_before": status_before, "status_after": status}, request=request)
+    db.commit()
+    return {"message": f"Application {status}", "application": _serialize_identity_application(application)}
+
+
+@router.post("/identity-applications/{application_id}/approve")
+def approve_identity_application(application_id: int, payload: dict = Body(default={}), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return _review_identity_application(db, application_id, admin, "verified", payload.get("reason"), request)
+
+
+@router.post("/identity-applications/{application_id}/reject")
+def reject_identity_application(application_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return _review_identity_application(db, application_id, admin, "rejected", _require_reason(payload), request)
+
+
+@router.post("/identity-applications/{application_id}/suspend")
+def suspend_identity_application(application_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return _review_identity_application(db, application_id, admin, "suspended", _require_reason(payload), request)
+
+
+@router.get("/moderation/events")
+def list_moderation_events(content_type: str | None = Query(None), decision: str | None = Query(None), actor_user_id: int | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = db.query(ModerationEvent)
+    if content_type:
+        query = query.filter(ModerationEvent.content_type == content_type)
+    if decision:
+        query = query.filter(ModerationEvent.decision == decision)
+    if actor_user_id is not None:
+        query = query.filter(ModerationEvent.actor_user_id == actor_user_id)
+    return _page_result(query.order_by(ModerationEvent.created_at.desc(), ModerationEvent.id.desc()), page=page, page_size=page_size, serializer=_serialize_moderation_event)
+
+
+@router.get("/moderation/events/{event_id}")
+def get_moderation_event(event_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    event = db.query(ModerationEvent).filter(ModerationEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Moderation event not found")
+    return _serialize_moderation_event(event)

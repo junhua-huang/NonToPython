@@ -311,6 +311,10 @@ class Comment(Base):
     reply_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    hidden_by_admin = Column(Boolean, default=False)
+    hidden_by = Column(Integer, ForeignKey('users.id', name='fk_comments_hidden_by'), nullable=True)
+    hidden_reason = Column(String(500), nullable=True)
+    hidden_at = Column(DateTime, nullable=True)
     
     author = relationship('User', foreign_keys=[user_id], back_populates='comments')
     post = relationship('Post', back_populates='comments')
@@ -685,10 +689,15 @@ class Report(Base):
     reason = Column(String(200), nullable=False)
     description = Column(Text)
     status = Column(String(20), default='pending')
+    resolution = Column(String(50), nullable=True)
+    resolution_note = Column(String(500), nullable=True)
+    action_taken = Column(String(50), nullable=True)
+    resolved_by = Column(Integer, ForeignKey('users.id', name='fk_reports_resolved_by'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime)
     
     reporter = relationship('User', foreign_keys=[reporter_id])
+    resolver = relationship('User', foreign_keys=[resolved_by])
     
     def to_dict(self):
         return {
@@ -699,6 +708,10 @@ class Report(Base):
             'reason': self.reason,
             'description': self.description,
             'status': self.status,
+            'resolution': self.resolution,
+            'resolution_note': self.resolution_note,
+            'action_taken': self.action_taken,
+            'resolved_by': self.resolved_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
         }
@@ -1215,6 +1228,41 @@ class RoleApplication(Base):
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
         }
 
+
+class ModerationEvent(Base):
+    """内容审核元数据事件，不存正文、COS key 或第三方原始响应。"""
+    __tablename__ = 'moderation_events'
+
+    id = Column(Integer, primary_key=True)
+    provider = Column(String(50), nullable=False, index=True)
+    content_type = Column(String(20), nullable=False, index=True)
+    route_key = Column(String(120), nullable=True, index=True)
+    target_type = Column(String(80), nullable=True, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    decision = Column(String(20), nullable=False, index=True)
+    error_code = Column(String(50), nullable=True, index=True)
+    label = Column(String(80), nullable=True)
+    category = Column(String(80), nullable=True)
+    score = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AdminAuditLog(Base):
+    """管理员后台操作审计日志。"""
+    __tablename__ = 'admin_audit_logs'
+
+    id = Column(Integer, primary_key=True)
+    admin_user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    action = Column(String(80), nullable=False, index=True)
+    target_type = Column(String(50), nullable=False, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    result = Column(String(20), nullable=False, default='success')
+    reason = Column(String(500), nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class EmailOtp(Base):

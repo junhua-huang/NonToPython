@@ -2,7 +2,7 @@
 管理员路由 - FastAPI 重构版
 """
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +23,7 @@ from app.services.local_text_moderator import normalize_text
 from app.services.moderation_route_helpers import moderate_route_fields
 from app.services.moderation_service import moderation_service
 from app.services.moderation_snapshot import RegexValidationError, validate_safe_regex
+from app.services.admin_audit_service import record_required_admin_audit
 from app.services.moderation_types import RiskCategory
 
 router = APIRouter()
@@ -200,6 +201,7 @@ def add_sensitive_word(
     payload: object = Body(...),
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     """添加敏感词"""
     values = _create_payload_values(payload)
@@ -217,6 +219,14 @@ def add_sensitive_word(
         created_by=user.id,
     )
     db.add(row)
+    record_required_admin_audit(
+        db,
+        admin_user_id=user.id,
+        action="create_sensitive_word",
+        target_type="sensitive_word",
+        metadata={"status_after": "created", "content_type": "text"},
+        request=request,
+    )
     _commit_or_conflict(db)
     db.refresh(row)
     return {"message": "Sensitive word added", "word": row.to_dict()}
@@ -228,8 +238,8 @@ def patch_sensitive_word(
     payload: object = Body(...),
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
-    del user
     values = _patch_payload_values(payload)
     version_row = _lock_rule_version(db)
     row = _locked_sensitive_word(db, word_id)
@@ -253,6 +263,15 @@ def patch_sensitive_word(
         row.is_active = next_is_active
     row.row_version = version
     row.updated_at = datetime.utcnow()
+    record_required_admin_audit(
+        db,
+        admin_user_id=user.id,
+        action="update_sensitive_word",
+        target_type="sensitive_word",
+        target_id=row.id,
+        metadata={"status_after": "updated", "content_type": "text"},
+        request=request,
+    )
     _commit_or_conflict(db)
     db.refresh(row)
     return {"message": "Sensitive word updated", "word": row.to_dict()}
@@ -264,14 +283,24 @@ def delete_sensitive_word(
     word_id: int,
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     """删除敏感词"""
-    del user
     version_row = _lock_rule_version(db)
     row = _locked_sensitive_word(db, word_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Sensitive word not found")
     _advance_locked_rule_version(version_row, db)
+    target_id = row.id
+    record_required_admin_audit(
+        db,
+        admin_user_id=user.id,
+        action="delete_sensitive_word",
+        target_type="sensitive_word",
+        target_id=target_id,
+        metadata={"status_after": "deleted", "content_type": "text"},
+        request=request,
+    )
     db.delete(row)
     _commit_or_conflict(db)
     return {"message": "Sensitive word deleted"}

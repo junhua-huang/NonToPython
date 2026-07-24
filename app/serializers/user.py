@@ -52,6 +52,21 @@ def serialize_user_self(user) -> dict:
     }
 
 
+def serialize_user_admin(user) -> dict:
+    """Serialize a user for administrator-only governance views."""
+    roles = user.get_role_names() if hasattr(user, "get_role_names") else []
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "nickname": user.username,
+        "is_active": bool(user.is_active),
+        "created_at": _created_at(user),
+        "roles": roles,
+    }
+
+
+
 def serialize_user_profile(user, viewer_user_id: int | None) -> dict:
     """Serialize profile detail, revealing email only to self or by opt-in."""
     payload = {

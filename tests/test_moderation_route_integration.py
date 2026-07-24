@@ -264,7 +264,7 @@ def test_create_post_moderates_before_file_upload_and_db_mutation(monkeypatch):
         def rollback(self):
             events.append(("db.rollback",))
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public, **kwargs):
         events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
         raise HTTPException(
             status_code=422,
@@ -325,7 +325,7 @@ def test_update_post_moderates_before_db_mutation(monkeypatch):
         def rollback(self):
             pass
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public, **kwargs):
         assert route_key == "PUT /api/posts/{post_id}"
         assert payload == {"content": "blocked", "video_url": "new-video"}
         assert actor_user_id == 42
@@ -382,7 +382,7 @@ def test_create_comment_moderates_before_comment_insert(monkeypatch):
         def rollback(self):
             events.append(("db.rollback",))
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public, **kwargs):
         events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
         raise HTTPException(
             status_code=422,
@@ -419,7 +419,7 @@ def test_update_comment_moderates_before_comment_mutation(monkeypatch):
         def rollback(self):
             pass
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public, **kwargs):
         assert route_key == "PUT /api/comments/{comment_id}"
         assert payload == {"content": "blocked"}
         assert actor_user_id == 42
@@ -524,7 +524,7 @@ def test_private_chat_message_moderates_before_persist_and_fanout(monkeypatch):
         def rollback(self):
             events.append(("db.rollback",))
 
-    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public):
+    def fake_moderate(service, route_key, payload, *, actor_user_id, is_public, **kwargs):
         events.append(("moderate", route_key, sorted(payload), actor_user_id, is_public))
         raise HTTPException(
             status_code=422,

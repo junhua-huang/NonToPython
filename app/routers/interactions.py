@@ -32,7 +32,10 @@ def _enrich_comment_dict(comment: Comment, db: Session, current_user_id: int) ->
 
 def _load_visible_comment(comment_id: int, db: Session, viewer_user_id: int) -> Comment:
     """Load a comment and fail closed when its parent post is not visible."""
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    comment = db.query(Comment).filter(
+        Comment.id == comment_id,
+        Comment.hidden_by_admin.is_not(True),
+    ).first()
     if (
         not comment
         or not load_visible_post(db, comment.post_id, viewer_user_id)
@@ -275,6 +278,8 @@ def create_comment(
         payload,
         actor_user_id=user.id,
         is_public=not bool(getattr(post, "community_only", False)),
+        db=db,
+        target_id=post_id,
     )
 
     comment = Comment(
@@ -348,6 +353,7 @@ def get_comments(
         parent_comment = db.query(Comment).filter(
             Comment.id == parent_id,
             Comment.post_id == post_id,
+            Comment.hidden_by_admin.is_not(True),
             visible_user_predicate(user.id, Comment.user_id),
         ).first()
         if not parent_comment:
@@ -355,7 +361,11 @@ def get_comments(
 
         replies_query = (
             db.query(Comment)
-            .filter(Comment.parent_id == parent_id, Comment.post_id == post_id)
+            .filter(
+                Comment.parent_id == parent_id,
+                Comment.post_id == post_id,
+                Comment.hidden_by_admin.is_not(True),
+            )
             .order_by(Comment.created_at.asc())
         )
         if blocked_ids:
@@ -374,7 +384,11 @@ def get_comments(
 
     comments_query = (
         db.query(Comment)
-        .filter(Comment.post_id == post_id, Comment.parent_id == None)
+        .filter(
+                Comment.post_id == post_id,
+                Comment.parent_id == None,
+                Comment.hidden_by_admin.is_not(True),
+            )
         .order_by(Comment.created_at.desc())
     )
     if blocked_ids:
@@ -388,7 +402,11 @@ def get_comments(
     if parent_ids:
         all_replies = (
             db.query(Comment)
-            .filter(Comment.parent_id.in_(parent_ids), Comment.post_id == post_id)
+            .filter(
+                    Comment.parent_id.in_(parent_ids),
+                    Comment.post_id == post_id,
+                    Comment.hidden_by_admin.is_not(True),
+                )
             .order_by(Comment.parent_id, Comment.created_at.asc())
             .all()
         )
@@ -451,7 +469,11 @@ def get_comment_detail(
     blocked_ids = excluded_user_ids(db, user.id)
     replies_query = (
         db.query(Comment)
-        .filter(Comment.parent_id == comment_id, Comment.post_id == comment.post_id)
+        .filter(
+            Comment.parent_id == comment_id,
+            Comment.post_id == comment.post_id,
+            Comment.hidden_by_admin.is_not(True),
+        )
         .order_by(Comment.created_at.asc())
     )
     if blocked_ids:
@@ -495,6 +517,8 @@ def update_comment(
         payload,
         actor_user_id=user.id,
         is_public=True,
+        db=db,
+        target_id=comment.id,
     )
 
     comment.content = content

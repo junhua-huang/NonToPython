@@ -161,6 +161,7 @@ async def create_post(
         {"content": content},
         actor_user_id=current_user_id,
         is_public=(visibility == "public" and not community_only),
+        db=db,
     )
 
     final_image_url = None
@@ -194,6 +195,8 @@ async def create_post(
                         upload_type="post",
                         is_public=(visibility == "public" and not community_only),
                         data_id=f"post-image-url-{current_user_id}-{index}",
+                        db=db,
+                        route_key="POST /api/posts",
                     )
                     audited_images.append(image_url)
                 images_json = _json.dumps(audited_images)
@@ -230,6 +233,8 @@ async def create_post(
                         is_public=(visibility == "public" and not community_only),
                         content_type="image/jpeg",
                         data_id=f"post-image-{current_user_id}",
+                        db=db,
+                        route_key="POST /api/posts",
                     )
                 except HTTPException as moderation_error:
                     FileUploader.delete_file(result["url"])
@@ -419,6 +424,8 @@ def update_post(
         payload,
         actor_user_id=user.id,
         is_public=((payload.get("visibility", post.visibility) == "public") and not next_community_only),
+        db=db,
+        target_id=post.id,
     )
     if "visibility" in payload:
         try:
