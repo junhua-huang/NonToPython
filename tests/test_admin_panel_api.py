@@ -193,6 +193,44 @@ def test_sensitive_word_mutations_write_admin_audit_logs(admin_panel_client, adm
     assert "delete_sensitive_word" in actions
 
 
+def test_sensitive_word_mutations_attach_required_audit_before_commit(
+    admin_panel_client,
+    monkeypatch,
+):
+    commit_observations = []
+    real_commit_or_conflict = admin._commit_or_conflict
+
+    def observe_commit_boundary(db):
+        commit_observations.append([
+            row.action for row in db.new if isinstance(row, AdminAuditLog)
+        ])
+        real_commit_or_conflict(db)
+
+    monkeypatch.setattr(admin, "_commit_or_conflict", observe_commit_boundary)
+
+    created = admin_panel_client.post(
+        "/api/admin/moderation/sensitive-words",
+        json={"word": "atomic-audit", "match_type": "literal", "category": "spam", "severity": "low", "is_active": True},
+    )
+    assert created.status_code == 201
+    created_id = created.json()["word"]["id"]
+
+    patched = admin_panel_client.patch(
+        f"/api/admin/moderation/sensitive-words/{created_id}",
+        json={"severity": "high", "is_active": False},
+    )
+    assert patched.status_code == 200
+
+    deleted = admin_panel_client.delete(f"/api/admin/moderation/sensitive-words/{created_id}")
+    assert deleted.status_code == 200
+
+    assert commit_observations == [
+        ["create_sensitive_word"],
+        ["update_sensitive_word"],
+        ["delete_sensitive_word"],
+    ]
+
+
 def test_hidden_admin_comment_is_not_visible_to_public_comment_loader(admin_panel_db):
     comment = admin_panel_db.get(Comment, 20)
     comment.hidden_by_admin = True
