@@ -9,6 +9,7 @@ from app.services.media_moderation_types import (
     MediaModerationTarget,
     approved_without_provider,
 )
+from app.services.admin_settings_service import effective_image_moderation_enabled
 from app.services.moderation_errors import ContentRejected, ModerationUnavailable
 from app.services.tencent_cos_image_moderator import (
     TencentCosImageModerationError,
@@ -31,8 +32,9 @@ class MediaModerationService:
         self._provider = provider
         self._config = config
 
-    def moderate(self, target: MediaModerationTarget) -> MediaModerationResult:
-        if not getattr(self._config, "COS_CI_IMAGE_AUDIT_ENABLED", False):
+    def moderate(self, target: MediaModerationTarget, db=None) -> MediaModerationResult:
+        enabled, _source = effective_image_moderation_enabled(db, config=self._config)
+        if not enabled:
             result = approved_without_provider()
             logger.info(
                 "media_moderation_skipped target_type=%s actor_user_id=%s upload_type=%s decision=%s provider=%s",

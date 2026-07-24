@@ -1290,6 +1290,26 @@ class ModerationEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AdminSetting(Base):
+    """管理员可修改的安全业务配置，不存密钥。"""
+    __tablename__ = 'admin_settings'
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String(120), unique=True, nullable=False, index=True)
+    value = Column(String(500), nullable=False)
+    updated_by = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'key': self.key,
+            'value': self.value,
+            'updated_by': self.updated_by,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AdminAuditLog(Base):
     """管理员后台操作审计日志。"""
     __tablename__ = 'admin_audit_logs'

@@ -269,6 +269,49 @@ def test_service_disabled_skips_provider_call():
     assert result.provider == "disabled"
 
 
+def test_service_database_setting_overrides_disabled_environment():
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app.database import Base
+    from app.models.models import AdminSetting
+    from app.services.media_moderation_service import MediaModerationService
+    from app.services.media_moderation_types import MediaModerationDecision, MediaModerationResult
+
+    engine = sa.create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    db = Session()
+    db.add(AdminSetting(key="image_moderation_enabled", value="true", updated_by=1))
+    db.commit()
+
+    class ApprovingProvider:
+        def __init__(self):
+            self.called = False
+
+        def moderate(self, target):
+            self.called = True
+            return MediaModerationResult(decision=MediaModerationDecision.APPROVE, provider="tencent_cos_ci")
+
+    provider = ApprovingProvider()
+    result = MediaModerationService(
+        provider=provider,
+        config=make_config(COS_CI_IMAGE_AUDIT_ENABLED=False),
+    ).moderate(make_target(), db=db)
+
+    assert provider.called is True
+    assert result.decision is MediaModerationDecision.APPROVE
+    assert result.provider == "tencent_cos_ci"
+    db.close()
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
 def test_service_rejection_maps_to_content_rejected_contract(caplog):
     from app.services.media_moderation_service import MediaModerationService
     from app.services.media_moderation_types import (

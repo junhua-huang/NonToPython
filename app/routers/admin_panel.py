@@ -7,11 +7,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.core.config import Config
 from app.database import get_db
 from app.dependencies import require_admin
 from app.models.models import (
     AdminAuditLog,
+    AdminSetting,
     Comment,
     ModerationEvent,
     Post,
@@ -29,6 +29,10 @@ from app.services.admin_governance_notification_service import (
     create_governance_notification,
     dispatch_governance_notifications,
     dispatch_in_app_and_push,
+)
+from app.services.admin_settings_service import (
+    serialize_moderation_settings,
+    set_image_moderation_enabled,
 )
 
 router = APIRouter(prefix="/api/admin", tags=["Admin Panel"])
@@ -276,8 +280,37 @@ def dashboard_summary(
         "reports_pending": db.query(Report).filter(Report.status == "pending").count(),
         "identity_applications_pending": db.query(RoleApplication).filter(RoleApplication.status == "pending").count(),
         "sensitive_words_active": db.query(SensitiveWord).filter(SensitiveWord.is_active.is_(True)).count(),
-        "cos_image_audit_enabled": bool(Config.COS_CI_IMAGE_AUDIT_ENABLED),
+        "cos_image_audit_enabled": serialize_moderation_settings(db)["image_moderation_enabled"],
     }
+
+
+@router.get("/settings/moderation")
+def get_moderation_settings(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return serialize_moderation_settings(db)
+
+
+@router.patch("/settings/moderation")
+def update_moderation_settings(payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if type(payload.get("image_moderation_enabled")) is not bool:
+        raise HTTPException(status_code=422, detail="image_moderation_enabled must be boolean")
+    reason = _require_reason(payload)
+    previous, current = set_image_moderation_enabled(
+        db,
+        enabled=payload["image_moderation_enabled"],
+        admin_user_id=admin.id,
+    )
+    record_required_admin_audit(
+        db,
+        admin_user_id=admin.id,
+        action="update_moderation_settings",
+        target_type="admin_setting",
+        target_id="image_moderation_enabled",
+        reason=reason,
+        metadata={"status_before": previous, "status_after": current},
+        request=request,
+    )
+    db.commit()
+    return serialize_moderation_settings(db)
 
 
 @router.get("/audit-logs")

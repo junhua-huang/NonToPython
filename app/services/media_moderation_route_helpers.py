@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from inspect import signature
+
 from fastapi import HTTPException
 
 from app.services.media_moderation_service import MediaModerationService
@@ -27,6 +29,19 @@ def is_moderated_image_key(cos_key: str | None, *, content_type: str | None = No
     return suffix in _IMAGE_EXTENSIONS
 
 
+def _service_accepts_db(service) -> bool:
+    try:
+        return "db" in signature(service.moderate).parameters
+    except Exception:
+        return False
+
+
+def _moderate_with_optional_db(service, target: MediaModerationTarget, db=None):
+    if _service_accepts_db(service):
+        return service.moderate(target, db=db)
+    return service.moderate(target)
+
+
 def moderate_cos_image_or_raise(
     cos_key: str,
     *,
@@ -44,7 +59,8 @@ def moderate_cos_image_or_raise(
         return None
     active_service = service or media_moderation_service
     try:
-        return active_service.moderate(
+        return _moderate_with_optional_db(
+            active_service,
             MediaModerationTarget(
                 cos_key=cos_key,
                 target_type=target_type,
@@ -53,7 +69,8 @@ def moderate_cos_image_or_raise(
                 is_public=is_public,
                 content_type=content_type,
                 data_id=data_id,
-            )
+            ),
+            db=db,
         )
     except ContentRejected as exc:
         record_moderation_event(

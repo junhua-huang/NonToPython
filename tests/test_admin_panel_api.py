@@ -13,6 +13,7 @@ import app.dependencies as dependencies
 from app.dependencies import require_admin
 from app.models.models import (
     AdminAuditLog,
+    AdminSetting,
     Base,
     Comment,
     ModerationEvent,
@@ -417,3 +418,38 @@ def test_admin_identity_applications_and_moderation_events(admin_panel_client):
     assert "cos_key" not in body
     assert "raw_response" not in body
     assert "body" not in body
+
+
+def test_admin_can_toggle_image_moderation_setting_with_audit(admin_panel_client, admin_panel_db):
+    initial = admin_panel_client.get("/api/admin/settings/moderation")
+    assert initial.status_code == 200
+    assert initial.json()["image_moderation_enabled"] is False
+    assert initial.json()["image_moderation_provider"] == "tencent_cos_ci"
+    assert initial.json()["source"] == "environment"
+    assert "secret" not in json.dumps(initial.json()).lower()
+
+    response = admin_panel_client.patch(
+        "/api/admin/settings/moderation",
+        json={"image_moderation_enabled": True, "reason": "开启图片审核"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["image_moderation_enabled"] is True
+    assert response.json()["source"] == "database"
+    setting = admin_panel_db.query(AdminSetting).filter(AdminSetting.key == "image_moderation_enabled").one()
+    assert setting.value == "true"
+    audit = admin_panel_db.query(AdminAuditLog).filter(AdminAuditLog.action == "update_moderation_settings").one()
+    assert audit.target_type == "admin_setting"
+    assert audit.target_id == "image_moderation_enabled"
+    assert audit.reason == "开启图片审核"
+    assert "true" in audit.metadata_json
+    assert "secret" not in audit.metadata_json.lower()
+
+
+def test_admin_moderation_setting_requires_reason(admin_panel_client):
+    response = admin_panel_client.patch(
+        "/api/admin/settings/moderation",
+        json={"image_moderation_enabled": True},
+    )
+
+    assert response.status_code == 422
