@@ -83,7 +83,14 @@ def require_role(*role_names: str):
         if current_user.is_active is not True:
             raise to_http_exception(AccountDisabled())
 
-        user_roles = {ur.role.name for ur in current_user.user_roles if ur.role}
+        user_role_rows = (
+            db.query(UserRole)
+            .options(joinedload(UserRole.role))
+            .join(Role, UserRole.role_id == Role.id)
+            .filter(UserRole.user_id == current_user.id)
+            .all()
+        )
+        user_roles = {row.role.name for row in user_role_rows if row.role}
 
         if not any(r in user_roles for r in role_names):
             raise HTTPException(status_code=403, detail=f"Required role(s): {', '.join(role_names)}")

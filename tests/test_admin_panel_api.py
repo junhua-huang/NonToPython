@@ -16,6 +16,8 @@ from app.models.models import (
     Base,
     Comment,
     ModerationEvent,
+    Notification,
+    NotificationDelivery,
     Post,
     Report,
     Role,
@@ -91,7 +93,7 @@ def admin_panel_db():
 
 
 @pytest.fixture()
-def admin_panel_client(admin_panel_db):
+def admin_panel_client(admin_panel_db, monkeypatch):
     app = FastAPI()
     app.include_router(admin.moderation_router)
     app.include_router(admin_panel.router)
@@ -101,6 +103,7 @@ def admin_panel_client(admin_panel_db):
 
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[require_admin] = lambda: admin_panel_db.get(User, 1)
+    monkeypatch.setattr(admin_panel, "_dispatch_after_commit", lambda deliveries, notifications: None)
     with TestClient(app) as client:
         yield client
 
@@ -171,6 +174,35 @@ def test_admin_user_deactivate_and_reactivate_write_audit_logs(admin_panel_clien
     assert admin_panel_db.query(AdminAuditLog).filter(AdminAuditLog.action == "reactivate_user").count() == 1
 
 
+def test_account_governance_creates_user_notice_and_required_email_delivery(admin_panel_client, admin_panel_db):
+    response = admin_panel_client.post(
+        "/api/admin/users/2/deactivate",
+        json={
+            "admin_reason": "internal policy note",
+            "user_notice": "你的账号因违反社区规则已被停用。",
+            "notify_channels": ["in_app", "push", "email"],
+        },
+    )
+
+    assert response.status_code == 200
+    notice = admin_panel_db.query(Notification).filter(
+        Notification.user_id == 2,
+        Notification.notification_type == "account_deactivated",
+    ).one()
+    assert notice.content == "你的账号因违反社区规则已被停用。"
+    assert "internal policy note" not in notice.content
+
+    delivery = admin_panel_db.query(NotificationDelivery).filter(
+        NotificationDelivery.user_id == 2,
+        NotificationDelivery.channel == "email",
+        NotificationDelivery.event_type == "account_deactivated",
+    ).one()
+    assert delivery.recipient_email == "target@example.com"
+    assert delivery.status in {"pending", "sent", "failed"}
+    assert "你的账号因违反社区规则已被停用。" in delivery.body
+    assert "internal policy note" not in delivery.body
+
+
 def test_admin_content_hide_restore_and_report_resolution(admin_panel_client, admin_panel_db):
     hidden_post = admin_panel_client.post("/api/admin/posts/10/hide", json={"reason": "violation"})
     assert hidden_post.status_code == 200
@@ -192,6 +224,34 @@ def test_admin_content_hide_restore_and_report_resolution(admin_panel_client, ad
     assert resolved_report.json()["report"]["status"] == "resolved"
     assert admin_panel_db.get(Post, 10).hidden_by_admin is True
     assert admin_panel_db.query(AdminAuditLog).filter(AdminAuditLog.action == "resolve_report").count() == 1
+
+
+def test_admin_comment_detail_and_content_governance_notice(admin_panel_client, admin_panel_db):
+    detail = admin_panel_client.get("/api/admin/comments/20")
+    assert detail.status_code == 200
+    assert detail.json()["content"] == "public comment"
+    assert detail.json()["author"]["id"] == 3
+    assert detail.json()["post"]["id"] == 10
+
+    response = admin_panel_client.post(
+        "/api/admin/posts/10/hide",
+        json={
+            "admin_reason": "internal content review",
+            "user_notice": "你的帖子因违反社区规则已被隐藏。",
+            "notify_channels": ["in_app", "push"],
+        },
+    )
+    assert response.status_code == 200
+    notice = admin_panel_db.query(Notification).filter(
+        Notification.user_id == 2,
+        Notification.notification_type == "post_hidden",
+    ).one()
+    assert notice.content == "你的帖子因违反社区规则已被隐藏。"
+    assert "internal content review" not in notice.content
+    assert admin_panel_db.query(NotificationDelivery).filter(
+        NotificationDelivery.event_type == "post_hidden",
+        NotificationDelivery.channel == "email",
+    ).count() == 0
 
 
 def test_sensitive_word_mutations_write_admin_audit_logs(admin_panel_client, admin_panel_db):
@@ -278,6 +338,66 @@ def test_identity_approval_grants_role_and_suspend_revokes_role(admin_panel_clie
     suspended = admin_panel_client.post("/api/admin/identity-applications/40/suspend", json={"reason": "risk"})
     assert suspended.status_code == 200
     assert admin_panel_db.query(UserRole).filter(UserRole.user_id == 2, UserRole.role_id == 2).first() is None
+
+
+def test_identity_review_creates_user_notice_and_required_email_delivery(admin_panel_client, admin_panel_db):
+    response = admin_panel_client.post(
+        "/api/admin/identity-applications/40/reject",
+        json={
+            "admin_reason": "internal evidence mismatch",
+            "user_notice": "认证资料不完整，请补充清晰证明后重新提交。",
+            "notify_channels": ["in_app", "push", "email"],
+        },
+    )
+
+    assert response.status_code == 200
+    notice = admin_panel_db.query(Notification).filter(
+        Notification.user_id == 2,
+        Notification.notification_type == "identity_rejected",
+    ).one()
+    assert notice.content == "认证资料不完整，请补充清晰证明后重新提交。"
+    assert "internal evidence mismatch" not in notice.content
+
+    delivery = admin_panel_db.query(NotificationDelivery).filter(
+        NotificationDelivery.user_id == 2,
+        NotificationDelivery.channel == "email",
+        NotificationDelivery.event_type == "identity_rejected",
+    ).one()
+    assert delivery.recipient_email == "target@example.com"
+    assert "认证资料不完整，请补充清晰证明后重新提交。" in delivery.body
+    assert "internal evidence mismatch" not in delivery.body
+
+
+def test_report_detail_includes_safe_target_snapshot_and_reporter_notice(admin_panel_client, admin_panel_db):
+    detail = admin_panel_client.get("/api/admin/reports/30")
+    assert detail.status_code == 200
+    assert detail.json()["target_snapshot"]["id"] == 10
+    assert detail.json()["target_snapshot"]["content"] == "public post"
+    assert detail.json()["reporter"]["id"] == 3
+
+    resolved = admin_panel_client.post(
+        "/api/admin/reports/30/resolve",
+        json={
+            "admin_reason": "internal reporter context",
+            "reporter_notice": "你提交的举报已处理，感谢反馈。",
+            "target_notice": "你的帖子因违反社区规则已被隐藏。",
+            "action_taken": "hide_post",
+            "notify_channels": ["in_app", "push"],
+        },
+    )
+    assert resolved.status_code == 200
+    reporter_notice = admin_panel_db.query(Notification).filter(
+        Notification.user_id == 3,
+        Notification.notification_type == "report_resolved",
+    ).one()
+    target_notice = admin_panel_db.query(Notification).filter(
+        Notification.user_id == 2,
+        Notification.notification_type == "post_hidden",
+    ).one()
+    assert "举报已处理" in reporter_notice.content
+    assert "举报" not in target_notice.content
+    assert "reporter" not in target_notice.content.lower()
+
 
 
 def test_admin_identity_applications_and_moderation_events(admin_panel_client):

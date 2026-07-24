@@ -25,6 +25,11 @@ from app.models.models import (
 from app.routers.auth import LoginRequest, login as auth_login
 from app.serializers.user import serialize_user_admin
 from app.services.admin_audit_service import record_required_admin_audit
+from app.services.admin_governance_notification_service import (
+    create_governance_notification,
+    dispatch_governance_notifications,
+    dispatch_in_app_and_push,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["Admin Panel"])
 
@@ -34,6 +39,30 @@ def _require_reason(payload: dict, *, field: str = "reason") -> str:
     if type(reason) is not str or not reason.strip():
         raise HTTPException(status_code=422, detail=f"{field} is required")
     return reason.strip()[:500]
+
+
+def _admin_reason(payload: dict) -> str:
+    if isinstance(payload.get("admin_reason"), str) and payload["admin_reason"].strip():
+        return payload["admin_reason"].strip()[:500]
+    return _require_reason(payload)
+
+
+def _user_notice(payload: dict) -> str | None:
+    value = payload.get("user_notice")
+    return value.strip()[:500] if isinstance(value, str) and value.strip() else None
+
+
+def _notify_channels(payload: dict) -> list[str] | None:
+    value = payload.get("notify_channels")
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
+
+
+def _dispatch_after_commit(deliveries, notifications) -> None:
+    dispatch_governance_notifications(deliveries)
+    for notification in notifications:
+        dispatch_in_app_and_push(notification.user_id, notification)
 
 
 def _page_result(query, *, page: int, page_size: int, serializer):
@@ -85,6 +114,24 @@ def _serialize_post_admin(post: Post) -> dict:
     }
 
 
+def _serialize_post_detail_admin(post: Post, db: Session) -> dict:
+    payload = _serialize_post_admin(post)
+    author = db.query(User).filter(User.id == post.user_id).first()
+    payload.update({
+        "author": _serialize_user_admin(author, db) if author else None,
+        "comments_count": db.query(Comment).filter(Comment.post_id == post.id).count(),
+        "reports_count": db.query(Report).filter(Report.target_type == "post", Report.target_id == post.id).count(),
+        "moderation_events": [
+            _serialize_moderation_event(event)
+            for event in db.query(ModerationEvent).filter(
+                ModerationEvent.target_type == "post",
+                ModerationEvent.target_id == str(post.id),
+            ).order_by(ModerationEvent.created_at.desc()).limit(20).all()
+        ],
+    })
+    return payload
+
+
 def _serialize_comment_admin(comment: Comment) -> dict:
     return {
         "id": comment.id,
@@ -100,8 +147,51 @@ def _serialize_comment_admin(comment: Comment) -> dict:
     }
 
 
+def _serialize_comment_detail_admin(comment: Comment, db: Session) -> dict:
+    payload = _serialize_comment_admin(comment)
+    author = db.query(User).filter(User.id == comment.user_id).first()
+    post = db.query(Post).filter(Post.id == comment.post_id).first()
+    payload.update({
+        "author": _serialize_user_admin(author, db) if author else None,
+        "post": _serialize_post_admin(post) if post else None,
+        "reports_count": db.query(Report).filter(Report.target_type == "comment", Report.target_id == comment.id).count(),
+        "replies_count": db.query(Comment).filter(Comment.parent_id == comment.id).count(),
+        "moderation_events": [
+            _serialize_moderation_event(event)
+            for event in db.query(ModerationEvent).filter(
+                ModerationEvent.target_type == "comment",
+                ModerationEvent.target_id == str(comment.id),
+            ).order_by(ModerationEvent.created_at.desc()).limit(20).all()
+        ],
+    })
+    return payload
+
+
 def _serialize_report_admin(report: Report) -> dict:
     return report.to_dict()
+
+
+def _report_target_snapshot(db: Session, report: Report) -> dict | None:
+    if report.target_type == "post":
+        post = db.query(Post).filter(Post.id == report.target_id).first()
+        return _serialize_post_admin(post) if post else None
+    if report.target_type == "comment":
+        comment = db.query(Comment).filter(Comment.id == report.target_id).first()
+        return _serialize_comment_admin(comment) if comment else None
+    if report.target_type == "user":
+        user = db.query(User).filter(User.id == report.target_id).first()
+        return _serialize_user_admin(user, db) if user else None
+    return None
+
+
+def _serialize_report_detail_admin(report: Report, db: Session) -> dict:
+    payload = _serialize_report_admin(report)
+    reporter = db.query(User).filter(User.id == report.reporter_id).first()
+    payload.update({
+        "reporter": _serialize_user_admin(reporter, db) if reporter else None,
+        "target_snapshot": _report_target_snapshot(db, report),
+    })
+    return payload
 
 
 def _serialize_identity_application(application: RoleApplication) -> dict:
@@ -260,7 +350,7 @@ def deactivate_user(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     if user_id == admin.id:
         raise HTTPException(status_code=422, detail="Cannot deactivate yourself")
     user = db.query(User).filter(User.id == user_id).first()
@@ -268,6 +358,15 @@ def deactivate_user(
         raise HTTPException(status_code=404, detail="User not found")
     status_before = "active" if user.is_active else "inactive"
     user.is_active = False
+    deliveries, notifications = create_governance_notification(
+        db,
+        user=user,
+        event_type="account_deactivated",
+        target_type="user",
+        target_id=user.id,
+        user_notice=_user_notice(payload),
+        notify_channels=_notify_channels(payload),
+    )
     record_required_admin_audit(
         db,
         admin_user_id=admin.id,
@@ -279,6 +378,7 @@ def deactivate_user(
         request=request,
     )
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "User deactivated", "user": _serialize_user_admin(user, db)}
 
 
@@ -290,12 +390,21 @@ def reactivate_user(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     status_before = "active" if user.is_active else "inactive"
     user.is_active = True
+    deliveries, notifications = create_governance_notification(
+        db,
+        user=user,
+        event_type="account_reactivated",
+        target_type="user",
+        target_id=user.id,
+        user_notice=_user_notice(payload),
+        notify_channels=_notify_channels(payload),
+    )
     record_required_admin_audit(
         db,
         admin_user_id=admin.id,
@@ -307,6 +416,7 @@ def reactivate_user(
         request=request,
     )
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "User reactivated", "user": _serialize_user_admin(user, db)}
 
 
@@ -332,12 +442,12 @@ def get_post_detail(post_id: int, admin: User = Depends(require_admin), db: Sess
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    return _serialize_post_admin(post)
+    return _serialize_post_detail_admin(post, db)
 
 
 @router.post("/posts/{post_id}/hide")
 def hide_post(post_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -345,14 +455,17 @@ def hide_post(post_id: int, payload: dict = Body(...), request: Request = None, 
     post.hidden_by_admin = True
     post.hidden_by = admin.id
     post.hidden_at = datetime.utcnow()
+    author = db.query(User).filter(User.id == post.user_id).first()
+    deliveries, notifications = create_governance_notification(db, user=author, event_type="post_hidden", target_type="post", target_id=post.id, user_notice=_user_notice(payload), notify_channels=_notify_channels(payload))
     record_required_admin_audit(db, admin_user_id=admin.id, action="hide_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_before": status_before, "status_after": "hidden"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Post hidden", "post": _serialize_post_admin(post)}
 
 
 @router.post("/posts/{post_id}/restore")
 def restore_post(post_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -360,8 +473,11 @@ def restore_post(post_id: int, payload: dict = Body(...), request: Request = Non
     post.hidden_by_admin = False
     post.hidden_by = None
     post.hidden_at = None
+    author = db.query(User).filter(User.id == post.user_id).first()
+    deliveries, notifications = create_governance_notification(db, user=author, event_type="post_restored", target_type="post", target_id=post.id, user_notice=_user_notice(payload), notify_channels=_notify_channels(payload))
     record_required_admin_audit(db, admin_user_id=admin.id, action="restore_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_before": status_before, "status_after": "visible"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Post restored", "post": _serialize_post_admin(post)}
 
 
@@ -375,9 +491,17 @@ def list_comments(post_id: int | None = Query(None), hidden: bool | None = Query
     return _page_result(query.order_by(Comment.created_at.desc(), Comment.id.desc()), page=page, page_size=page_size, serializer=_serialize_comment_admin)
 
 
+@router.get("/comments/{comment_id}")
+def get_comment_detail(comment_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    return _serialize_comment_detail_admin(comment, db)
+
+
 @router.post("/comments/{comment_id}/hide")
 def hide_comment(comment_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     comment = db.query(Comment).filter(Comment.id == comment_id).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
@@ -386,14 +510,17 @@ def hide_comment(comment_id: int, payload: dict = Body(...), request: Request = 
     comment.hidden_by = admin.id
     comment.hidden_reason = reason
     comment.hidden_at = datetime.utcnow()
+    author = db.query(User).filter(User.id == comment.user_id).first()
+    deliveries, notifications = create_governance_notification(db, user=author, event_type="comment_hidden", target_type="comment", target_id=comment.id, user_notice=_user_notice(payload), notify_channels=_notify_channels(payload))
     record_required_admin_audit(db, admin_user_id=admin.id, action="hide_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_before": status_before, "status_after": "hidden"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Comment hidden", "comment": _serialize_comment_admin(comment)}
 
 
 @router.post("/comments/{comment_id}/restore")
 def restore_comment(comment_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     comment = db.query(Comment).filter(Comment.id == comment_id).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
@@ -402,8 +529,11 @@ def restore_comment(comment_id: int, payload: dict = Body(...), request: Request
     comment.hidden_by = None
     comment.hidden_reason = None
     comment.hidden_at = None
+    author = db.query(User).filter(User.id == comment.user_id).first()
+    deliveries, notifications = create_governance_notification(db, user=author, event_type="comment_restored", target_type="comment", target_id=comment.id, user_notice=_user_notice(payload), notify_channels=_notify_channels(payload))
     record_required_admin_audit(db, admin_user_id=admin.id, action="restore_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_before": status_before, "status_after": "visible"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Comment restored", "comment": _serialize_comment_admin(comment)}
 
 
@@ -420,16 +550,23 @@ def get_report_detail(report_id: int, admin: User = Depends(require_admin), db: 
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    return _serialize_report_admin(report)
+    return _serialize_report_detail_admin(report, db)
 
 
-def _apply_report_action(db: Session, report: Report, action_taken: str | None, admin: User, reason: str, request: Request | None) -> None:
+def _apply_report_action(db: Session, report: Report, action_taken: str | None, admin: User, reason: str, payload: dict, request: Request | None):
+    deliveries = []
+    notifications = []
+    target_notice = payload.get("target_notice") if isinstance(payload.get("target_notice"), str) else None
     if action_taken == "hide_post" and report.target_type == "post":
         post = db.query(Post).filter(Post.id == report.target_id).first()
         if post:
             post.hidden_by_admin = True
             post.hidden_by = admin.id
             post.hidden_at = datetime.utcnow()
+            author = db.query(User).filter(User.id == post.user_id).first()
+            next_deliveries, next_notifications = create_governance_notification(db, user=author, event_type="post_hidden", target_type="post", target_id=post.id, user_notice=target_notice, notify_channels=_notify_channels(payload))
+            deliveries.extend(next_deliveries)
+            notifications.extend(next_notifications)
             record_required_admin_audit(db, admin_user_id=admin.id, action="hide_post", target_type="post", target_id=post.id, reason=reason, metadata={"status_after": "hidden"}, request=request)
     elif action_taken == "hide_comment" and report.target_type == "comment":
         comment = db.query(Comment).filter(Comment.id == report.target_id).first()
@@ -438,22 +575,35 @@ def _apply_report_action(db: Session, report: Report, action_taken: str | None, 
             comment.hidden_by = admin.id
             comment.hidden_reason = "report_resolved"
             comment.hidden_at = datetime.utcnow()
+            author = db.query(User).filter(User.id == comment.user_id).first()
+            next_deliveries, next_notifications = create_governance_notification(db, user=author, event_type="comment_hidden", target_type="comment", target_id=comment.id, user_notice=target_notice, notify_channels=_notify_channels(payload))
+            deliveries.extend(next_deliveries)
+            notifications.extend(next_notifications)
             record_required_admin_audit(db, admin_user_id=admin.id, action="hide_comment", target_type="comment", target_id=comment.id, reason=reason, metadata={"status_after": "hidden"}, request=request)
     elif action_taken == "deactivate_user" and report.target_type == "user":
         user = db.query(User).filter(User.id == report.target_id).first()
         if user and user.id != admin.id:
             user.is_active = False
+            next_deliveries, next_notifications = create_governance_notification(db, user=user, event_type="account_deactivated", target_type="user", target_id=user.id, user_notice=target_notice, notify_channels=_notify_channels(payload))
+            deliveries.extend(next_deliveries)
+            notifications.extend(next_notifications)
             record_required_admin_audit(db, admin_user_id=admin.id, action="deactivate_user", target_type="user", target_id=user.id, reason=reason, metadata={"status_after": "inactive"}, request=request)
+    return deliveries, notifications
 
 
 @router.post("/reports/{report_id}/resolve")
 def resolve_report(report_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     action_taken = payload.get("action_taken") or "none"
-    _apply_report_action(db, report, action_taken, admin, reason, request)
+    deliveries, notifications = _apply_report_action(db, report, action_taken, admin, reason, payload, request)
+    reporter = db.query(User).filter(User.id == report.reporter_id).first()
+    reporter_notice = payload.get("reporter_notice") if isinstance(payload.get("reporter_notice"), str) else _user_notice(payload)
+    reporter_deliveries, reporter_notifications = create_governance_notification(db, user=reporter, event_type="report_resolved", target_type="report", target_id=report.id, user_notice=reporter_notice, notify_channels=_notify_channels(payload))
+    deliveries.extend(reporter_deliveries)
+    notifications.extend(reporter_notifications)
     report.status = "resolved"
     report.resolution = "resolved"
     report.resolution_note = reason
@@ -462,15 +612,19 @@ def resolve_report(report_id: int, payload: dict = Body(...), request: Request =
     report.resolved_at = datetime.utcnow()
     record_required_admin_audit(db, admin_user_id=admin.id, action="resolve_report", target_type="report", target_id=report.id, reason=reason, metadata={"report_status": "resolved", "status_after": "resolved"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Report resolved", "report": _serialize_report_admin(report)}
 
 
 @router.post("/reports/{report_id}/reject")
 def reject_report(report_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    reason = _require_reason(payload)
+    reason = _admin_reason(payload)
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
+    reporter = db.query(User).filter(User.id == report.reporter_id).first()
+    reporter_notice = payload.get("reporter_notice") if isinstance(payload.get("reporter_notice"), str) else _user_notice(payload)
+    deliveries, notifications = create_governance_notification(db, user=reporter, event_type="report_rejected", target_type="report", target_id=report.id, user_notice=reporter_notice, notify_channels=_notify_channels(payload))
     report.status = "rejected"
     report.resolution = "rejected"
     report.resolution_note = reason
@@ -479,6 +633,7 @@ def reject_report(report_id: int, payload: dict = Body(...), request: Request = 
     report.resolved_at = datetime.utcnow()
     record_required_admin_audit(db, admin_user_id=admin.id, action="reject_report", target_type="report", target_id=report.id, reason=reason, metadata={"report_status": "rejected", "status_after": "rejected"}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": "Report rejected", "report": _serialize_report_admin(report)}
 
 
@@ -510,10 +665,12 @@ def _sync_identity_role(db: Session, application: RoleApplication, status: str) 
 
 
 
-def _review_identity_application(db: Session, application_id: int, admin: User, status: str, reason: str | None, request: Request | None):
+def _review_identity_application(db: Session, application_id: int, admin: User, status: str, payload: dict, request: Request | None):
     application = db.query(RoleApplication).filter(RoleApplication.id == application_id).first()
     if not application:
         raise HTTPException(status_code=404, detail="Application not found")
+    reason = _admin_reason(payload) if status in {"rejected", "suspended"} else (payload.get("admin_reason") or payload.get("reason"))
+    reason = reason.strip()[:500] if isinstance(reason, str) and reason.strip() else None
     status_before = application.status
     application.status = status
     application.reviewer_id = admin.id
@@ -521,24 +678,35 @@ def _review_identity_application(db: Session, application_id: int, admin: User, 
     if reason is not None:
         application.review_comment = reason
     _sync_identity_role(db, application, status)
+    applicant = db.query(User).filter(User.id == application.user_id).first()
+    deliveries, notifications = create_governance_notification(
+        db,
+        user=applicant,
+        event_type=f"identity_{status}",
+        target_type="identity_application",
+        target_id=application.id,
+        user_notice=_user_notice(payload),
+        notify_channels=_notify_channels(payload),
+    )
     record_required_admin_audit(db, admin_user_id=admin.id, action=f"identity_{status}", target_type="identity_application", target_id=application.id, reason=reason, metadata={"status_before": status_before, "status_after": status}, request=request)
     db.commit()
+    _dispatch_after_commit(deliveries, notifications)
     return {"message": f"Application {status}", "application": _serialize_identity_application(application)}
 
 
 @router.post("/identity-applications/{application_id}/approve")
 def approve_identity_application(application_id: int, payload: dict = Body(default={}), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    return _review_identity_application(db, application_id, admin, "verified", payload.get("reason"), request)
+    return _review_identity_application(db, application_id, admin, "verified", payload, request)
 
 
 @router.post("/identity-applications/{application_id}/reject")
 def reject_identity_application(application_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    return _review_identity_application(db, application_id, admin, "rejected", _require_reason(payload), request)
+    return _review_identity_application(db, application_id, admin, "rejected", payload, request)
 
 
 @router.post("/identity-applications/{application_id}/suspend")
 def suspend_identity_application(application_id: int, payload: dict = Body(...), request: Request = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    return _review_identity_application(db, application_id, admin, "suspended", _require_reason(payload), request)
+    return _review_identity_application(db, application_id, admin, "suspended", payload, request)
 
 
 @router.get("/moderation/events")

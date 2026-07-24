@@ -540,6 +540,48 @@ class Notification(Base):
         }
 
 
+class NotificationDelivery(Base):
+    """治理通知投递记录，不存敏感凭据或内部处理备注。"""
+    __tablename__ = 'notification_deliveries'
+
+    id = Column(Integer, primary_key=True)
+    notification_id = Column(Integer, ForeignKey('notifications.id'), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    channel = Column(String(20), nullable=False, index=True)
+    event_type = Column(String(80), nullable=False, index=True)
+    target_type = Column(String(50), nullable=True, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    recipient_email = Column(String(120), nullable=True)
+    subject = Column(String(200), nullable=True)
+    body = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default='pending', index=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    last_error_code = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    sent_at = Column(DateTime, nullable=True)
+
+    user = relationship('User')
+    notification = relationship('Notification')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'notification_id': self.notification_id,
+            'user_id': self.user_id,
+            'channel': self.channel,
+            'event_type': self.event_type,
+            'target_type': self.target_type,
+            'target_id': self.target_id,
+            'recipient_email': self.recipient_email,
+            'subject': self.subject,
+            'status': self.status,
+            'retry_count': self.retry_count,
+            'last_error_code': self.last_error_code,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'sent_at': self.sent_at.isoformat() if self.sent_at else None,
+        }
+
+
 class PushDevice(Base):
     """阿里云推送设备绑定。"""
     __tablename__ = 'push_devices'
