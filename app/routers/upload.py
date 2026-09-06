@@ -201,6 +201,7 @@ def presign_upload(
 def confirm_upload(
     payload: dict = Body(...),
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """客户端上传完成后确认，重命名临时文件"""
     cos_key = payload.get("cos_key")
@@ -230,6 +231,8 @@ def confirm_upload(
             is_public=not cos_key.startswith("chat/"),
             content_type=final_content_type,
             data_id=f"upload-confirm-{user.id}",
+            db=db,
+            route_key="POST /api/upload/confirm",
         )
     except HTTPException as moderation_error:
         _delete_rejected_object(moderation_error, cos_key)

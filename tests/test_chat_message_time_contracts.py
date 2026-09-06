@@ -44,6 +44,14 @@ class ChatMessageTimeContractsTest(unittest.TestCase):
             self.assertNotIn(f'"{key}"', persist_source)
             self.assertNotIn(f"'{key}'", persist_source)
 
+    def test_incremental_history_contract_filters_after_id(self):
+        source = inspect.getsource(chat.get_messages)
+
+        self.assertIn("after_id", source)
+        self.assertIn("Message.id > after_id", source)
+        self.assertIn('"has_more": has_more', source)
+        self.assertIn("order_by(Message.id.asc())", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,7 +48,6 @@ class TrackingSession:
         ("notify_comment", (10, 20, 30, "comment")),
         ("notify_friend_request", (10, 20)),
         ("notify_friend_accepted", (10, 20)),
-        ("notify_message", (10, 20, "message", 30)),
         ("notify_mention", (10, 20, 30, "mention context")),
     ],
 )
@@ -99,6 +98,44 @@ def test_caller_owned_helper_session_is_not_closed(method_name, args, monkeypatc
     getattr(NotificationService, method_name)(*args, db=session)
 
     assert session.close_calls == 0
+
+
+def test_message_notification_is_never_persisted(monkeypatch):
+    session = Mock()
+
+    result = NotificationService.create_notification(
+        user_id=10,
+        notification_type="message",
+        title="chat title",
+        content="chat body",
+        sender_id=20,
+        related_id=30,
+        db=session,
+    )
+
+    assert result is None
+    session.add.assert_not_called()
+    session.commit.assert_not_called()
+
+
+def test_push_message_delegates_to_push_only_service(monkeypatch):
+    schedule = Mock()
+    monkeypatch.setattr(
+        notification_service.AliyunPushService,
+        "schedule_message_push",
+        schedule,
+    )
+
+    result = NotificationService.push_message(10, 20, 30, "chat body", 40)
+
+    assert result is schedule.return_value
+    schedule.assert_called_once_with(
+        receiver_id=10,
+        sender_id=20,
+        message_id=30,
+        conversation_id=40,
+        message_content="chat body",
+    )
 
 
 def test_create_notification_delivers_plain_dict_without_closing_caller_session(monkeypatch):

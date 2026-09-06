@@ -80,6 +80,36 @@ def _page_result(query, *, page: int, page_size: int, serializer):
     }
 
 
+def _like(value: str) -> str:
+    return f"%{value.strip()}%"
+
+
+def _parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bool(value) -> bool | None:
+    if value is None:
+        return None
+    if type(value) is bool:
+        return value
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
+def _json_array_has_values(column):
+    return column.isnot(None) & (column != "") & (column != "[]")
+
+
 def _user_roles(user: User) -> list[str]:
     return [ur.role.name for ur in getattr(user, "user_roles", []) if getattr(ur, "role", None)]
 
@@ -101,10 +131,12 @@ def _serialize_user_admin(user: User, db: Session | None = None) -> dict:
     return payload
 
 
-def _serialize_post_admin(post: Post) -> dict:
+def _serialize_post_admin(post: Post, db: Session | None = None) -> dict:
+    author = db.query(User).filter(User.id == post.user_id).first() if db is not None else None
     return {
         "id": post.id,
         "user_id": post.user_id,
+        "author": _serialize_user_admin(author, db) if author else None,
         "content": post.content,
         "images": json.loads(post.images) if post.images else [],
         "video_url": post.video_url,
@@ -120,14 +152,11 @@ def _serialize_post_admin(post: Post) -> dict:
 
 
 def _serialize_quoted_post_admin(post: Post, db: Session) -> dict:
-    payload = _serialize_post_admin(post)
-    author = db.query(User).filter(User.id == post.user_id).first()
-    payload["author"] = _serialize_user_admin(author, db) if author else None
-    return payload
+    return _serialize_post_admin(post, db)
 
 
 def _serialize_post_detail_admin(post: Post, db: Session) -> dict:
-    payload = _serialize_post_admin(post)
+    payload = _serialize_post_admin(post, db)
     author = db.query(User).filter(User.id == post.user_id).first()
     quoted_post = db.query(Post).filter(Post.id == post.quoted_post_id).first() if post.quoted_post_id else None
     payload.update({
@@ -146,11 +175,13 @@ def _serialize_post_detail_admin(post: Post, db: Session) -> dict:
     return payload
 
 
-def _serialize_comment_admin(comment: Comment) -> dict:
+def _serialize_comment_admin(comment: Comment, db: Session | None = None) -> dict:
+    author = db.query(User).filter(User.id == comment.user_id).first() if db is not None else None
     return {
         "id": comment.id,
         "post_id": comment.post_id,
         "user_id": comment.user_id,
+        "author": _serialize_user_admin(author, db) if author else None,
         "parent_id": comment.parent_id,
         "content": comment.content,
         "hidden_by_admin": bool(getattr(comment, "hidden_by_admin", False)),
@@ -162,7 +193,7 @@ def _serialize_comment_admin(comment: Comment) -> dict:
 
 
 def _serialize_comment_detail_admin(comment: Comment, db: Session) -> dict:
-    payload = _serialize_comment_admin(comment)
+    payload = _serialize_comment_admin(comment, db)
     author = db.query(User).filter(User.id == comment.user_id).first()
     post = db.query(Post).filter(Post.id == comment.post_id).first()
     payload.update({
@@ -181,8 +212,12 @@ def _serialize_comment_detail_admin(comment: Comment, db: Session) -> dict:
     return payload
 
 
-def _serialize_report_admin(report: Report) -> dict:
-    return report.to_dict()
+def _serialize_report_admin(report: Report, db: Session | None = None) -> dict:
+    payload = report.to_dict()
+    if db is not None:
+        reporter = db.query(User).filter(User.id == report.reporter_id).first()
+        payload["reporter"] = _serialize_user_admin(reporter, db) if reporter else None
+    return payload
 
 
 def _report_target_snapshot(db: Session, report: Report) -> dict | None:
@@ -325,21 +360,37 @@ def update_moderation_settings(payload: dict = Body(...), request: Request = Non
 
 @router.get("/audit-logs")
 def list_audit_logs(
+    q: str | None = Query(None),
     admin_user_id: int | None = Query(None),
     action: str | None = Query(None),
     target_type: str | None = Query(None),
+    result: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     query = db.query(AdminAuditLog)
+    if q:
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        clauses = [
+            AdminAuditLog.action.like(term),
+            AdminAuditLog.target_type.like(term),
+            AdminAuditLog.target_id.like(term),
+            AdminAuditLog.reason.like(term),
+        ]
+        if numeric_id is not None:
+            clauses.append(AdminAuditLog.admin_user_id == numeric_id)
+        query = query.filter(or_(*clauses))
     if admin_user_id is not None:
         query = query.filter(AdminAuditLog.admin_user_id == admin_user_id)
     if action:
         query = query.filter(AdminAuditLog.action == action)
     if target_type:
         query = query.filter(AdminAuditLog.target_type == target_type)
+    if result:
+        query = query.filter(AdminAuditLog.result == result)
     return _page_result(
         query.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc()),
         page=page,
@@ -352,6 +403,7 @@ def list_audit_logs(
 def list_users(
     q: str | None = Query(None),
     status: str | None = Query(None),
+    role: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     admin: User = Depends(require_admin),
@@ -359,12 +411,18 @@ def list_users(
 ):
     query = db.query(User)
     if q:
-        like = f"%{q}%"
-        query = query.filter(or_(User.username.like(like), User.email.like(like)))
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        clauses = [User.username.like(term), User.email.like(term)]
+        if numeric_id is not None:
+            clauses.append(User.id == numeric_id)
+        query = query.filter(or_(*clauses))
     if status == "active":
         query = query.filter(User.is_active.is_(True))
     elif status == "inactive":
         query = query.filter(User.is_active.is_(False))
+    if role:
+        query = query.join(UserRole, UserRole.user_id == User.id).join(Role, Role.id == UserRole.role_id).filter(Role.name == role)
     return _page_result(
         query.order_by(User.created_at.desc(), User.id.desc()),
         page=page,
@@ -467,6 +525,10 @@ def reactivate_user(
 def list_posts(
     q: str | None = Query(None),
     hidden: bool | None = Query(None),
+    visibility: str | None = Query(None),
+    has_image: bool | None = Query(None),
+    has_video: bool | None = Query(None),
+    is_quote: bool | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     admin: User = Depends(require_admin),
@@ -474,10 +536,30 @@ def list_posts(
 ):
     query = db.query(Post)
     if q:
-        query = query.filter(Post.content.like(f"%{q}%"))
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        query = query.outerjoin(User, User.id == Post.user_id)
+        clauses = [Post.content.like(term), User.username.like(term), User.email.like(term)]
+        if numeric_id is not None:
+            clauses.extend([Post.id == numeric_id, Post.user_id == numeric_id])
+        query = query.filter(or_(*clauses))
     if hidden is not None:
         query = query.filter(Post.hidden_by_admin.is_(hidden))
-    return _page_result(query.order_by(Post.created_at.desc(), Post.id.desc()), page=page, page_size=page_size, serializer=_serialize_post_admin)
+    if visibility:
+        query = query.filter(Post.visibility == visibility)
+    if has_image is True:
+        query = query.filter(_json_array_has_values(Post.images))
+    elif has_image is False:
+        query = query.filter(or_(Post.images.is_(None), Post.images == "", Post.images == "[]"))
+    if has_video is True:
+        query = query.filter(Post.video_url.isnot(None), Post.video_url != "")
+    elif has_video is False:
+        query = query.filter(or_(Post.video_url.is_(None), Post.video_url == ""))
+    if is_quote is True:
+        query = query.filter(Post.quoted_post_id.isnot(None))
+    elif is_quote is False:
+        query = query.filter(Post.quoted_post_id.is_(None))
+    return _page_result(query.order_by(Post.created_at.desc(), Post.id.desc()), page=page, page_size=page_size, serializer=lambda post: _serialize_post_admin(post, db))
 
 
 @router.get("/posts/{post_id}")
@@ -525,13 +607,25 @@ def restore_post(post_id: int, payload: dict = Body(...), request: Request = Non
 
 
 @router.get("/comments")
-def list_comments(post_id: int | None = Query(None), hidden: bool | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def list_comments(q: str | None = Query(None), post_id: int | None = Query(None), hidden: bool | None = Query(None), is_reply: bool | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     query = db.query(Comment)
+    if q:
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        query = query.outerjoin(User, User.id == Comment.user_id)
+        clauses = [Comment.content.like(term), User.username.like(term), User.email.like(term)]
+        if numeric_id is not None:
+            clauses.extend([Comment.id == numeric_id, Comment.post_id == numeric_id, Comment.user_id == numeric_id])
+        query = query.filter(or_(*clauses))
     if post_id is not None:
         query = query.filter(Comment.post_id == post_id)
     if hidden is not None:
         query = query.filter(Comment.hidden_by_admin.is_(hidden))
-    return _page_result(query.order_by(Comment.created_at.desc(), Comment.id.desc()), page=page, page_size=page_size, serializer=_serialize_comment_admin)
+    if is_reply is True:
+        query = query.filter(Comment.parent_id.isnot(None))
+    elif is_reply is False:
+        query = query.filter(Comment.parent_id.is_(None))
+    return _page_result(query.order_by(Comment.created_at.desc(), Comment.id.desc()), page=page, page_size=page_size, serializer=lambda comment: _serialize_comment_admin(comment, db))
 
 
 @router.get("/comments/{comment_id}")
@@ -581,11 +675,21 @@ def restore_comment(comment_id: int, payload: dict = Body(...), request: Request
 
 
 @router.get("/reports")
-def list_reports(status: str | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def list_reports(q: str | None = Query(None), status: str | None = Query(None), target_type: str | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     query = db.query(Report)
+    if q:
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        query = query.outerjoin(User, User.id == Report.reporter_id)
+        clauses = [Report.reason.like(term), User.username.like(term), User.email.like(term)]
+        if numeric_id is not None:
+            clauses.extend([Report.id == numeric_id, Report.target_id == numeric_id, Report.reporter_id == numeric_id])
+        query = query.filter(or_(*clauses))
     if status:
         query = query.filter(Report.status == status)
-    return _page_result(query.order_by(Report.created_at.desc(), Report.id.desc()), page=page, page_size=page_size, serializer=_serialize_report_admin)
+    if target_type:
+        query = query.filter(Report.target_type == target_type)
+    return _page_result(query.order_by(Report.created_at.desc(), Report.id.desc()), page=page, page_size=page_size, serializer=lambda report: _serialize_report_admin(report, db))
 
 
 @router.get("/reports/{report_id}")
@@ -681,10 +785,25 @@ def reject_report(report_id: int, payload: dict = Body(...), request: Request = 
 
 
 @router.get("/identity-applications")
-def list_identity_applications(status: str | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def list_identity_applications(q: str | None = Query(None), status: str | None = Query(None), role_id: int | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     query = db.query(RoleApplication)
+    if q:
+        term = _like(q)
+        numeric_id = _parse_int(q)
+        query = query.outerjoin(User, User.id == RoleApplication.user_id)
+        clauses = [
+            RoleApplication.reason.like(term),
+            RoleApplication.application_text.like(term),
+            User.username.like(term),
+            User.email.like(term),
+        ]
+        if numeric_id is not None:
+            clauses.extend([RoleApplication.id == numeric_id, RoleApplication.user_id == numeric_id])
+        query = query.filter(or_(*clauses))
     if status:
         query = query.filter(RoleApplication.status == status)
+    if role_id is not None:
+        query = query.filter(RoleApplication.role_id == role_id)
     return _page_result(query.order_by(RoleApplication.created_at.desc(), RoleApplication.id.desc()), page=page, page_size=page_size, serializer=_serialize_identity_application)
 
 
@@ -753,12 +872,27 @@ def suspend_identity_application(application_id: int, payload: dict = Body(...),
 
 
 @router.get("/moderation/events")
-def list_moderation_events(content_type: str | None = Query(None), decision: str | None = Query(None), actor_user_id: int | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def list_moderation_events(q: str | None = Query(None), content_type: str | None = Query(None), decision: str | None = Query(None), provider: str | None = Query(None), target_type: str | None = Query(None), actor_user_id: int | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     query = db.query(ModerationEvent)
+    if q:
+        term = _like(q)
+        query = query.filter(or_(
+            ModerationEvent.provider.like(term),
+            ModerationEvent.route_key.like(term),
+            ModerationEvent.target_type.like(term),
+            ModerationEvent.target_id.like(term),
+            ModerationEvent.error_code.like(term),
+            ModerationEvent.label.like(term),
+            ModerationEvent.category.like(term),
+        ))
     if content_type:
         query = query.filter(ModerationEvent.content_type == content_type)
     if decision:
         query = query.filter(ModerationEvent.decision == decision)
+    if provider:
+        query = query.filter(ModerationEvent.provider == provider)
+    if target_type:
+        query = query.filter(ModerationEvent.target_type == target_type)
     if actor_user_id is not None:
         query = query.filter(ModerationEvent.actor_user_id == actor_user_id)
     return _page_result(query.order_by(ModerationEvent.created_at.desc(), ModerationEvent.id.desc()), page=page, page_size=page_size, serializer=_serialize_moderation_event)

@@ -7,6 +7,7 @@ from app.models.models import Post, Role, RoleApplication, User, UserRole
 from app.routers import admin as admin_router
 from app.routers import posts as posts_router
 from app.routers import roles as roles_router
+from app.serializers.user import serialize_user_profile, serialize_user_self
 import app.dependencies as dependencies
 
 
@@ -50,6 +51,40 @@ class IdentityRoleContractTests(unittest.TestCase):
         self.assertEqual(payload["role_labels"], ["Coser", "摄影师"])
         self.assertNotIn("admin", payload["roles"])
         self.assertNotIn("普通用户", payload.get("role_labels", []))
+
+    def test_self_serializer_exposes_verified_identity_fields_without_mixing_system_roles(self):
+        user = User(id=1, username="alice", email="alice@example.com")
+        user.user_roles = [
+            UserRole(role=Role(name="admin", label="管理员")),
+            UserRole(role=Role(name="coser", label="Coser")),
+        ]
+
+        payload = serialize_user_self(user)
+
+        self.assertEqual(payload["roles"], ["admin", "coser"])
+        self.assertEqual(payload["verified_roles"], ["coser"])
+        self.assertEqual(payload["verified_role_labels"], ["Coser"])
+        self.assertNotIn("admin", payload["verified_roles"])
+
+    def test_profile_serializer_exposes_verified_identity_fields(self):
+        user = User(id=1, username="alice", email="alice@example.com")
+        user.user_roles = [
+            UserRole(role=Role(name="admin", label="管理员")),
+            UserRole(role=Role(name="photographer", label="摄影师")),
+        ]
+
+        payload = serialize_user_profile(user, viewer_user_id=2)
+
+        self.assertEqual(payload["verified_roles"], ["photographer"])
+        self.assertEqual(payload["verified_role_labels"], ["摄影师"])
+        self.assertNotIn("roles", payload)
+        self.assertNotIn("email", payload)
+
+    def test_auth_core_eager_loads_user_role_details_before_detaching(self):
+        import app.core.auth_core as auth_core
+
+        source = inspect.getsource(auth_core.verify_token)
+        self.assertIn("joinedload(User.user_roles).joinedload(UserRole.role)", source)
 
     def test_role_application_unified_template_fields_are_serialized(self):
         columns = set(RoleApplication.__table__.columns.keys())

@@ -6,9 +6,9 @@
 """
 from typing import Optional
 from jose import jwt, JWTError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.database import SessionLocal
-from app.models.models import User
+from app.models.models import User, UserRole
 from app.core.config import Config
 from app.services.moderation_errors import AccountDisabled
 
@@ -54,7 +54,10 @@ def verify_token(token: str) -> User:
     # 2. 查数据库验证用户存在
     db: Session = SessionLocal()
     try:
-        user = db.query(User).filter(User.id == user_id).first()
+        query = db.query(User)
+        if hasattr(query, "options"):
+            query = query.options(joinedload(User.user_roles).joinedload(UserRole.role))
+        user = query.filter(User.id == user_id).first()
         if user is None:
             raise AuthError("User not found", 401)
         if user.is_active is not True:

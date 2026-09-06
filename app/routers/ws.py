@@ -61,18 +61,18 @@ def _get_db_session() -> Session:
     return SessionLocal()
 
 
-def _should_create_message_notification(db: Session, user_id: int) -> bool:
-    """消息始终创建通知中心记录；移动推送由设备 app_state 决定。"""
+def _should_send_message_push(db: Session, user_id: int) -> bool:
+    """Return whether an optional mobile chat alert may be attempted."""
     return True
 
 
-def _get_message_notification_targets(sender_id: int, participant_ids: list[int]) -> list[int]:
-    """在独立 DB session 中筛选需要通知中心记录的接收方。"""
+def _get_message_push_targets(sender_id: int, participant_ids: list[int]) -> list[int]:
+    """Select non-sender recipients for optional mobile chat alerts."""
     db = _get_db_session()
     try:
         return [
             pid for pid in participant_ids
-            if pid != sender_id and _should_create_message_notification(db, pid)
+            if pid != sender_id and _should_send_message_push(db, pid)
         ]
     finally:
         db.close()
@@ -816,13 +816,20 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         pass
     # #endregion
 
-    # 消息始终创建通知中心记录；移动推送由设备 app_state 决定。
-    notify_targets = _get_message_notification_targets(user_id, result["participant_ids"])
-    if notify_targets:
+    # Chat messages belong to the conversation stream, not the interaction feed.
+    # Keep an optional mobile alert without creating a Notification row.
+    push_targets = _get_message_push_targets(user_id, result["participant_ids"])
+    if push_targets:
         from app.services.notification_service import NotificationService
         content = result["msg"].get("content") or ""
-        for pid in notify_targets:
-            NotificationService.notify_message(pid, user_id, content, result["conv_id"])
+        for pid in push_targets:
+            NotificationService.push_message(
+                pid,
+                user_id,
+                result["msg"]["id"],
+                content,
+                result["conv_id"],
+            )
 
     # 5. 失效缓存
     ws_manager.invalidate_participant_caches(result["participant_ids"])
@@ -948,6 +955,10 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
     def _mark():
         db = _get_db_session()
         try:
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            if not conversation or not can_access_conversation(db, conversation, user_id):
+                return {"error": "Conversation not found"}
+
             participant = (
                 db.query(ConversationParticipant)
                 .filter(
@@ -957,11 +968,18 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
                 .first()
             )
             if not participant:
-                return {"error": "Not a conversation participant"}
-
-            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
-            if not conversation or not can_access_conversation(db, conversation, user_id):
-                return {"error": "Conversation not found"}
+                is_direct_member = (
+                    conversation.type != 'community'
+                    and user_id in (conversation.user1_id, conversation.user2_id)
+                )
+                if not is_direct_member:
+                    return {"error": "Not a conversation participant"}
+                participant = ConversationParticipant(
+                    conversation_id=conversation.id,
+                    user_id=user_id,
+                )
+                db.add(participant)
+                db.flush()
 
             if conversation.type == 'community':
                 result = mark_community_conversation_read(db, conv_id, user_id)

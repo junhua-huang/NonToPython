@@ -1,10 +1,13 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
+from fastapi import BackgroundTasks
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from app.models.models import User
 from app.routers.auth import RegisterRequest, SendOtpRequest, is_allowed_registration_email, normalize_username, send_otp
 
 
@@ -30,10 +33,84 @@ def test_register_otp_rejects_non_qq_family_email_before_database_lookup():
     data = SendOtpRequest(email="user@gmail.com", purpose="register")
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(send_otp(data, request=request, db=GuardDb()))
+        asyncio.run(send_otp(data, request=request, db=GuardDb(), background_tasks=BackgroundTasks()))
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "目前仅支持 QQ 邮箱注册"
+
+
+def test_send_otp_schedules_email_without_waiting_for_smtp(monkeypatch):
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return None
+
+    class Db:
+        def query(self, model):
+            assert model is User
+            return Query()
+
+    monkeypatch.setattr("app.routers.auth.OtpService.check_rate_limit", lambda *_args: (True, None))
+    monkeypatch.setattr("app.routers.auth.OtpService.generate_and_store", lambda *_args: "123456")
+
+    async def slow_send(*_args):
+        await asyncio.sleep(0.2)
+        return True
+
+    monkeypatch.setattr("app.routers.auth.EmailService.send_otp_email", slow_send)
+
+    request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+    data = SendOtpRequest(email="user@qq.com", purpose="register")
+    background_tasks = BackgroundTasks()
+
+    started = time.perf_counter()
+    result = asyncio.run(send_otp(data, request=request, db=Db(), background_tasks=background_tasks))
+    elapsed = time.perf_counter() - started
+
+    assert result == {"message": "验证码已发送，请查收邮箱"}
+    assert elapsed < 0.1
+    assert len(background_tasks.tasks) == 1
+
+
+def test_forgot_password_schedules_email_without_waiting_for_smtp(monkeypatch):
+    from app.routers.auth import ForgotPasswordRequest, forgot_password
+
+    existing_user = SimpleNamespace(email="user@qq.com")
+
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return existing_user
+
+    class Db:
+        def query(self, model):
+            assert model is User
+            return Query()
+
+    monkeypatch.setattr("app.routers.auth.OtpService.check_rate_limit", lambda *_args: (True, None))
+    monkeypatch.setattr("app.routers.auth.OtpService.generate_and_store", lambda *_args: "123456")
+
+    async def slow_send(*_args):
+        await asyncio.sleep(0.2)
+        return True
+
+    monkeypatch.setattr("app.routers.auth.EmailService.send_otp_email", slow_send)
+
+    request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+    data = ForgotPasswordRequest(email="user@qq.com")
+    background_tasks = BackgroundTasks()
+
+    started = time.perf_counter()
+    result = asyncio.run(forgot_password(data, request=request, db=Db(), background_tasks=background_tasks))
+    elapsed = time.perf_counter() - started
+
+    assert result == {"message": "若该邮箱已注册，验证码已发送"}
+    assert elapsed < 0.1
+    assert len(background_tasks.tasks) == 1
 
 
 def test_username_supports_chinese_english_digits_title_symbols_and_emoji():

@@ -37,6 +37,8 @@ def serialize_user_self(user) -> dict:
     """Serialize the authenticated user's own profile and privacy state."""
     roles = user.get_role_names() if hasattr(user, "get_role_names") else []
     role_labels = user.get_role_labels() if hasattr(user, "get_role_labels") else []
+    verified_roles = user.get_verified_identity_roles() if hasattr(user, "get_verified_identity_roles") else []
+    verified_role_labels = user.get_verified_identity_labels() if hasattr(user, "get_verified_identity_labels") else []
     return {
         "id": user.id,
         "username": user.username,
@@ -49,6 +51,8 @@ def serialize_user_self(user) -> dict:
         "created_at": _created_at(user),
         "roles": roles,
         "role_labels": role_labels,
+        "verified_roles": verified_roles,
+        "verified_role_labels": verified_role_labels,
     }
 
 
@@ -69,6 +73,8 @@ def serialize_user_admin(user) -> dict:
 
 def serialize_user_profile(user, viewer_user_id: int | None) -> dict:
     """Serialize profile detail, revealing email only to self or by opt-in."""
+    verified_roles = user.get_verified_identity_roles() if hasattr(user, "get_verified_identity_roles") else []
+    verified_role_labels = user.get_verified_identity_labels() if hasattr(user, "get_verified_identity_labels") else []
     payload = {
         "id": user.id,
         "username": user.username,
@@ -78,6 +84,8 @@ def serialize_user_profile(user, viewer_user_id: int | None) -> dict:
         "cover_photo_url": user.cover_photo_url,
         "created_at": _created_at(user),
         "show_email": _bool_show_email(user),
+        "verified_roles": verified_roles,
+        "verified_role_labels": verified_role_labels,
     }
     if viewer_user_id == user.id or user.show_email is True:
         payload["email"] = user.email

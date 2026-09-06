@@ -17,7 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models.models import Notification, PushDevice, PushLog, User
+from app.models.models import Block, Notification, PushDevice, PushLog, User
 from app.services import aliyun_push_service
 from app.services.aliyun_push_service import AliyunPushService, ProviderSendResult
 
@@ -49,7 +49,7 @@ def push_db(monkeypatch):
                 id=10,
                 user_id=1,
                 sender_id=2,
-                notification_type="message",
+                notification_type="mention",
                 title="title-10",
                 content="content-10",
                 related_id=501,
@@ -85,7 +85,7 @@ def push_db(monkeypatch):
         engine.dispose()
 
 
-def payload(notification_id=10, notification_type="message", related_id=501, message_id=701):
+def payload(notification_id=10, notification_type="mention", related_id=501, message_id=701):
     return {
         "id": notification_id,
         "user_id": 1,
@@ -100,6 +100,47 @@ def payload(notification_id=10, notification_type="message", related_id=501, mes
 
 def provider_result(body, http_status=200):
     return ProviderSendResult(http_status=http_status, body=body)
+
+
+def test_message_push_is_push_only_and_skips_foreground_device(push_db, monkeypatch):
+    send_request = Mock(
+        return_value=provider_result({"RequestId": "req", "MessageId": "msg"})
+    )
+    monkeypatch.setattr(AliyunPushService, "_send_request", send_request)
+    monkeypatch.setattr(AliyunPushService, "is_configured", classmethod(lambda cls: True))
+
+    AliyunPushService.schedule_message_push(
+        receiver_id=1,
+        sender_id=2,
+        message_id=9001,
+        conversation_id=501,
+        message_content="hello",
+    )
+
+    assert send_request.call_count == 1
+    assert push_db.query(Notification).filter_by(id=-AliyunPushService.MESSAGE_PUSH_ID_OFFSET - 9001).count() == 0
+    assert push_db.query(Notification).count() == 2
+    log = push_db.query(PushLog).one()
+    assert log.notification_id == -AliyunPushService.MESSAGE_PUSH_ID_OFFSET - 9001
+    assert log.notification_type == "message"
+
+    device = push_db.query(PushDevice).filter_by(device_id="device-a").one()
+    device.app_state = "foreground"
+    push_db.commit()
+    AliyunPushService.schedule_message_push(1, 2, 9002, 501, "foreground")
+    assert send_request.call_count == 1
+
+
+def test_message_push_respects_bidirectional_block(push_db, monkeypatch):
+    push_db.add(Block(blocker_id=2, blocked_id=1))
+    push_db.commit()
+    send_request = Mock()
+    monkeypatch.setattr(AliyunPushService, "_send_request", send_request)
+
+    AliyunPushService.schedule_message_push(1, 2, 9003, 501, "blocked")
+
+    send_request.assert_not_called()
+    assert push_db.query(PushLog).count() == 0
 
 
 def test_sequential_duplicate_notification_device_sends_once(push_db, monkeypatch):
@@ -366,7 +407,7 @@ def test_fresh_pending_suppresses_duplicate_and_stale_pending_is_reclaimed(
             user_id=1,
             device_id="device-a",
             notification_id=10,
-            notification_type="message",
+            notification_type="mention",
             title="title-10",
             status="pending",
             claim_token="old-claim",
@@ -415,24 +456,27 @@ def test_repeated_pre_device_visibility_skips_do_not_grow_logs(push_db, monkeypa
 
 
 def test_android_ext_parameters_merge_stable_string_ids_and_canonical_message_dedupe_key():
-    params = AliyunPushService._build_push_params(
-        "device-a",
-        {
-            **payload(message_id=88),
-            "AndroidExtParameters": json.dumps(
-                {
-                    "custom": "kept",
-                    "notification_id": "wrong",
-                    "dedupe_key": "caller:override",
-                }
-            ),
-        },
-    )
+    message_id = 88
+    message_notification = {
+        **payload(
+            notification_id=-AliyunPushService.MESSAGE_PUSH_ID_OFFSET - message_id,
+            notification_type="message",
+            message_id=message_id,
+        ),
+        "AndroidExtParameters": json.dumps(
+            {
+                "custom": "kept",
+                "notification_id": "wrong",
+                "dedupe_key": "caller:override",
+            }
+        ),
+    }
+    params = AliyunPushService._build_push_params("device-a", message_notification)
 
     ext = json.loads(params["AndroidExtParameters"])
     assert ext == {
         "custom": "kept",
-        "notification_id": "10",
+        "notification_id": str(-AliyunPushService.MESSAGE_PUSH_ID_OFFSET - message_id),
         "type": "message",
         "related_id": "501",
         "message_id": "88",

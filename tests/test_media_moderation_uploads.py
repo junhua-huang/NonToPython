@@ -56,6 +56,7 @@ def test_upload_confirm_rejects_image_before_confirm_and_cleans_up(monkeypatch):
         upload_router.confirm_upload(
             {"cos_key": IMAGE_KEY, "final_filename": "final.jpg"},
             user=SimpleNamespace(id=42),
+            db=None,
         )
 
     assert excinfo.value.status_code == 422
@@ -84,6 +85,7 @@ def test_upload_confirm_unavailable_is_retryable_safe_and_keeps_object(monkeypat
         upload_router.confirm_upload(
             {"cos_key": IMAGE_KEY, "final_filename": "final.jpg"},
             user=SimpleNamespace(id=42),
+            db=None,
         )
 
     assert excinfo.value.status_code == 503
@@ -120,6 +122,7 @@ def test_upload_confirm_skips_chat_path(monkeypatch):
     result = upload_router.confirm_upload(
         {"cos_key": CHAT_KEY, "final_filename": "final.jpg"},
         user=SimpleNamespace(id=42),
+        db=None,
     )
 
     assert result["url"] == "https://example.com/final.jpg"
@@ -143,6 +146,7 @@ def test_upload_confirm_requires_owned_key_before_moderation_or_confirm(monkeypa
         upload_router.confirm_upload(
             {"cos_key": "posts/7/20260724/image.jpg", "final_filename": "final.jpg"},
             user=SimpleNamespace(id=42),
+            db=None,
         )
 
     assert excinfo.value.status_code == 403
@@ -167,6 +171,7 @@ def test_upload_confirm_rejects_path_traversal_final_filename(monkeypatch):
         upload_router.confirm_upload(
             {"cos_key": IMAGE_KEY, "final_filename": "../final.jpg"},
             user=SimpleNamespace(id=42),
+            db=None,
         )
 
     assert excinfo.value.status_code == 400
@@ -195,11 +200,47 @@ def test_upload_confirm_audits_image_final_filename_even_when_temp_key_has_no_im
     result = upload_router.confirm_upload(
         {"cos_key": "posts/42/20260724/upload.bin", "final_filename": "final.jpg"},
         user=SimpleNamespace(id=42),
+        db=None,
     )
 
     assert result["url"] == "https://example.com/final.jpg"
     assert len(service.calls) == 1
     assert service.calls[0].content_type == "image/jpeg"
+
+
+def test_upload_confirm_passes_db_to_moderation_service(monkeypatch):
+    from app.routers import upload as upload_router
+
+    calls = []
+    fake_db = object()
+
+    class DbAwareMediaService:
+        def moderate(self, target, db=None):
+            calls.append((target, db))
+            return SimpleNamespace(decision="approve")
+
+    monkeypatch.setattr(
+        "app.services.media_moderation_route_helpers.media_moderation_service",
+        DbAwareMediaService(),
+    )
+    monkeypatch.setattr(
+        upload_router.FileUploader,
+        "confirm_upload",
+        lambda cos_key, final_filename: {
+            "success": True,
+            "final_url": "https://example.com/final.jpg",
+            "final_cos_key": "posts/42/20260724/final.jpg",
+        },
+    )
+
+    result = upload_router.confirm_upload(
+        {"cos_key": IMAGE_KEY, "final_filename": "final.jpg"},
+        user=SimpleNamespace(id=42),
+        db=fake_db,
+    )
+
+    assert result["url"] == "https://example.com/final.jpg"
+    assert calls[0][1] is fake_db
 
 
 @pytest.mark.parametrize(

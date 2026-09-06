@@ -77,6 +77,14 @@ class NotificationService:
     @staticmethod
     def create_notification(user_id, notification_type, title, content,
                            sender_id=None, related_id=None, related_type=None, db=None):
+        if notification_type == "message":
+            # Chat alerts use the conversation stream and optional vendor push;
+            # never allow a stale caller to recreate an interaction-feed row.
+            logger.warning(
+                "[NOTIFY] message notification persistence rejected user=%s",
+                user_id,
+            )
+            return None
         own_db = db is None
         if own_db:
             db = NotificationService._get_session()
@@ -241,32 +249,52 @@ class NotificationService:
                 db.close()
 
     @staticmethod
-    def notify_message(receiver_id, sender_id, message_content, conversation_id, db=None):
-        if receiver_id == sender_id:
-            return
-        own_db = db is None
-        if own_db:
-            db = NotificationService._get_session()
-        try:
-            sender = db.query(User).filter(User.id == sender_id).first()
-            if not sender:
-                return
-            preview = message_content[:50] + '...' if len(message_content) > 50 else message_content
-            title = f"来自 {sender.username} 的新消息"
-            content = preview
-            return NotificationService.create_notification(
-                user_id=receiver_id,
-                notification_type="message",
-                title=title,
-                content=content,
-                sender_id=sender_id,
-                related_id=conversation_id,
-                related_type='conversation',
-                db=db,
+    def push_message(
+        receiver_id,
+        sender_id,
+        message_id,
+        message_content,
+        conversation_id,
+    ):
+        """Send a chat alert without creating an interaction notification row."""
+        return AliyunPushService.schedule_message_push(
+            receiver_id=receiver_id,
+            sender_id=sender_id,
+            message_id=message_id,
+            conversation_id=conversation_id,
+            message_content=message_content,
+        )
+
+    @staticmethod
+    def notify_message(
+        receiver_id,
+        sender_id,
+        message_content,
+        conversation_id,
+        db=None,
+        message_id=None,
+    ):
+        """Deprecated chat helper; message alerts are push-only.
+
+        A persisted message ID is required to build a stable push delivery key.
+        In particular, this method never falls back to creating a Notification
+        row, so an outdated caller cannot put chat messages in the interaction
+        feed.
+        """
+        if message_id is None:
+            logger.warning(
+                "[NOTIFY] chat push skipped without message_id receiver=%s sender=%s",
+                receiver_id,
+                sender_id,
             )
-        finally:
-            if own_db:
-                db.close()
+            return None
+        return NotificationService.push_message(
+            receiver_id,
+            sender_id,
+            message_id,
+            message_content,
+            conversation_id,
+        )
 
     @staticmethod
     def notify_mention(mentioned_user_id, mentioner_id, post_id, context, db=None):

@@ -43,8 +43,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _should_create_message_notification(db: Session, user_id: int) -> bool:
-    """消息始终创建通知中心记录；移动推送由设备 app_state 决定。"""
+def _ensure_direct_conversation_participants(db: Session, conversation: Conversation) -> None:
+    """Backfill participant rows for legacy direct conversations."""
+    if getattr(conversation, "type", "single") == "community":
+        return
+    expected_ids = {conversation.user1_id, conversation.user2_id}
+    existing_ids = {
+        row.user_id
+        for row in db.query(ConversationParticipant)
+        .filter(ConversationParticipant.conversation_id == conversation.id)
+        .all()
+    }
+    missing = expected_ids - existing_ids
+    if missing:
+        db.add_all(
+            [
+                ConversationParticipant(
+                    conversation_id=conversation.id,
+                    user_id=user_id,
+                )
+                for user_id in missing
+            ]
+        )
+        db.flush()
+
+
+def _should_send_message_push(db: Session, user_id: int) -> bool:
+    """Return whether an optional mobile chat alert may be attempted.
+
+    Recipient preferences and bidirectional block checks are enforced again by
+    the push service, because this route's session is also used for the chat
+    transaction.
+    """
     return True
 
 
@@ -383,6 +413,10 @@ def get_conversation_with_user(
         db.add_all([participant1, participant2])
         db.commit()
         db.refresh(conversation)
+    else:
+        _ensure_direct_conversation_participants(db, conversation)
+        db.commit()
+        db.refresh(conversation)
 
     messages = (
         db.query(Message)
@@ -411,6 +445,8 @@ def get_messages(
     conversation_id: int,
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
+    after_id: int | None = Query(None, ge=1),
+    limit: int | None = Query(None, ge=1, le=200),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -421,14 +457,40 @@ def get_messages(
     if not can_access_conversation(db, conversation, user.id):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    messages_query = (
-        db.query(Message)
-        .filter(
-            Message.conversation_id == conversation_id,
-            visible_user_predicate(user.id, Message.sender_id),
-        )
-        .order_by(Message.created_at.desc())
+    # Direct unit tests call this function without FastAPI resolving Query
+    # defaults, so normalize those wrapper objects before applying filters.
+    if not isinstance(after_id, int) or isinstance(after_id, bool):
+        after_id = None
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        limit = None
+
+    request_limit = limit or per_page
+    messages_query = db.query(Message).filter(
+        Message.conversation_id == conversation_id,
+        visible_user_predicate(user.id, Message.sender_id),
     )
+    if after_id is not None:
+        messages_query = messages_query.filter(Message.id > after_id)
+        messages = (
+            messages_query.order_by(Message.id.asc())
+            .limit(request_limit + 1)
+            .all()
+        )
+        has_more = len(messages) > request_limit
+        if has_more:
+            messages = messages[:request_limit]
+        return {
+            "messages": _serialize_messages_for_viewer(
+                db, [msg.to_dict() for msg in messages], user.id,
+            ),
+            "total": len(messages),
+            "has_more": has_more,
+            "current_page": 1,
+            "limit": request_limit,
+            "after_id": after_id,
+        }
+
+    messages_query = messages_query.order_by(Message.created_at.desc(), Message.id.desc())
     total = messages_query.count()
     messages = messages_query.offset((page - 1) * per_page).limit(per_page).all()
     pages = (total + per_page - 1) // per_page if total > 0 else 0
@@ -441,6 +503,7 @@ def get_messages(
         "pages": pages,
         "current_page": page,
         "per_page": per_page,
+        "has_more": page < pages,
     }
 
 
@@ -712,13 +775,18 @@ async def send_message(
                 "unread_count": unread_counts.get(pid, 0),
             })
 
-        # --- 通知中心记录 ---
-        # 消息始终创建通知中心记录；移动推送由设备 app_state 决定。
+        # Chat messages belong to the conversation stream, not the interaction feed.
+        # Keep an optional mobile alert without creating a Notification row.
         from app.services.notification_service import NotificationService
-        preview = content[:50] + '...' if len(content) > 50 else content
         for pid in participant_ids:
-            if pid != user.id and _should_create_message_notification(db, pid):
-                NotificationService.notify_message(pid, user.id, preview, conversation_id)
+            if pid != user.id and _should_send_message_push(db, pid):
+                NotificationService.push_message(
+                    pid,
+                    user.id,
+                    message.id,
+                    content,
+                    conversation_id,
+                )
 
         # 失效缓存（新消息导致 last_message / unread_count 变化）
         ws_manager.invalidate_participant_caches(participant_ids)

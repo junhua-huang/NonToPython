@@ -268,7 +268,7 @@ def test_generic_http_community_send_excludes_blocked_recipient(community_block_
     monkeypatch.setattr(chat_router.ws_manager, "send_with_seq", sent)
     monkeypatch.setattr(chat_router.ws_manager, "invalidate_participant_caches", lambda ids: None)
 
-    with patch("app.services.notification_service.NotificationService.notify_message") as notify:
+    with patch("app.services.notification_service.NotificationService.push_message") as notify:
         asyncio.run(chat_router.send_message(
             conversation_id=1,
             payload={"content": "http hello"},
@@ -311,7 +311,7 @@ def test_generic_http_community_quote_preview_is_pairwise_per_recipient(communit
     monkeypatch.setattr(chat_router.ws_manager, "send_with_seq", sent)
     monkeypatch.setattr(chat_router.ws_manager, "invalidate_participant_caches", lambda ids: None)
 
-    with patch("app.services.notification_service.NotificationService.notify_message"):
+    with patch("app.services.notification_service.NotificationService.push_message"):
         result = asyncio.run(chat_router.send_message(
             conversation_id=1,
             payload={"content": "reply", "quote_message_id": 1},
@@ -334,7 +334,7 @@ def test_generic_ws_community_send_excludes_blocked_recipient(community_block_db
     monkeypatch.setattr(ws_router.ws_manager, "send_with_seq", AsyncMock())
     monkeypatch.setattr(ws_router.ws_manager, "invalidate_participant_caches", lambda ids: None)
 
-    with enqueue as queued, patch("app.services.notification_service.NotificationService.notify_message") as notify:
+    with enqueue as queued, patch("app.services.notification_service.NotificationService.push_message") as notify:
         asyncio.run(ws_router._handle_send_message(
             websocket=None,
             user_id=1,
@@ -359,7 +359,7 @@ def test_generic_ws_community_quote_preview_is_pairwise_per_recipient(community_
     monkeypatch.setattr(ws_router.ws_manager, "send_with_seq", AsyncMock())
     monkeypatch.setattr(ws_router.ws_manager, "invalidate_participant_caches", lambda ids: None)
 
-    with enqueue as queued, patch("app.services.notification_service.NotificationService.notify_message"):
+    with enqueue as queued, patch("app.services.notification_service.NotificationService.push_message"):
         asyncio.run(ws_router._handle_send_message(
             websocket=None,
             user_id=3,

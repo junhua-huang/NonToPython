@@ -4,7 +4,7 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -161,6 +161,10 @@ def _commit_or_conflict(db: Session) -> None:
 @moderation_router.get("/sensitive-words")
 @router.get("/sensitive-words")
 def get_sensitive_words(
+    q: str | None = Query(None),
+    is_active: bool | None = Query(None),
+    match_type: str | None = Query(None),
+    severity: str | None = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     user: User = Depends(require_admin),
@@ -168,7 +172,17 @@ def get_sensitive_words(
 ):
     """获取敏感词列表"""
     del user
-    words_query = db.query(SensitiveWord).order_by(SensitiveWord.id.asc())
+    words_query = db.query(SensitiveWord)
+    if q:
+        term = f"%{q.strip()}%"
+        words_query = words_query.filter(or_(SensitiveWord.word.like(term), SensitiveWord.category.like(term)))
+    if is_active is not None:
+        words_query = words_query.filter(SensitiveWord.is_active.is_(is_active))
+    if match_type:
+        words_query = words_query.filter(SensitiveWord.match_type == match_type)
+    if severity:
+        words_query = words_query.filter(SensitiveWord.severity == severity)
+    words_query = words_query.order_by(SensitiveWord.id.asc())
     total = words_query.count()
     words = words_query.offset((page - 1) * per_page).limit(per_page).all()
     pages = (total + per_page - 1) // per_page if total > 0 else 0

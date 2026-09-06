@@ -367,6 +367,75 @@ def get_posts(
     }
 
 
+@router.get("/related-to-me")
+def get_related_to_me_posts(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取与当前用户相关的帖子流：通知、评论、点赞归并，按时间倒序。"""
+    current_user_id = user.id
+    candidate_ids = set()
+
+    notification_rows = (
+        db.query(Notification.related_id)
+        .filter(
+            Notification.user_id == current_user_id,
+            Notification.related_type == "post",
+            Notification.related_id.isnot(None),
+        )
+        .order_by(Notification.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    candidate_ids.update(row.related_id for row in notification_rows if row.related_id)
+
+    comment_rows = (
+        db.query(Comment.post_id)
+        .filter(Comment.user_id == current_user_id, Comment.post_id.isnot(None))
+        .order_by(Comment.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    candidate_ids.update(row.post_id for row in comment_rows if row.post_id)
+
+    like_rows = (
+        db.query(Like.post_id)
+        .filter(Like.user_id == current_user_id, Like.post_id.isnot(None))
+        .order_by(Like.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    candidate_ids.update(row.post_id for row in like_rows if row.post_id)
+
+    if not candidate_ids:
+        return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
+
+    offset = (page - 1) * per_page
+    posts = (
+        db.query(Post)
+        .filter(Post.id.in_(candidate_ids), Post.hidden_by_admin == False)
+        .order_by(Post.created_at.desc())
+        .offset(offset)
+        .limit(per_page + 1)
+        .all()
+    )
+    has_more = len(posts) > per_page
+    if has_more:
+        posts = posts[:per_page]
+    posts = [post for post in posts if can_view_post(db, post, current_user_id)]
+
+    from app.services.recommendation_service import RecommendationService
+    batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
+    return {
+        "posts": RecommendationService._serialize_posts(posts, batch_data, current_user_id=current_user_id, db=db),
+        "has_more": has_more,
+        "current_page": page,
+        "per_page": per_page,
+    }
+
+
 @router.get("/user/{user_id}")
 def get_user_posts(
     user_id: int,

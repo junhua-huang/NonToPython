@@ -69,19 +69,30 @@ def admin_panel_db():
         is_active=True,
         created_at=datetime.utcnow(),
     )
-    db.add_all([admin_role, user_role, admin, target, reporter])
+    inactive = User(
+        id=4,
+        username="inactive",
+        email="inactive@qq.com",
+        password_hash="x",
+        is_active=False,
+        created_at=datetime.utcnow(),
+    )
+    db.add_all([admin_role, user_role, admin, target, reporter, inactive])
     db.flush()
     db.add_all([
         UserRole(user_id=1, role_id=1),
         UserRole(user_id=2, role_id=2),
         UserRole(user_id=3, role_id=2),
+        UserRole(user_id=4, role_id=2),
     ])
     db.add(SensitiveWordVersion(id=1, version=1))
     db.add(SensitiveWord(id=70, word="spam", match_type="literal", category="spam", severity="medium", is_active=True, row_version=1))
     db.add(Post(id=10, user_id=2, content="public post", images=json.dumps(["https://example.com/image.jpg"]), visibility="public", created_at=datetime.utcnow()))
     db.add(Post(id=11, user_id=3, content="quoted original", images=json.dumps(["https://example.com/quoted.jpg"]), visibility="public", created_at=datetime.utcnow()))
     db.add(Post(id=12, user_id=2, content="quote wrapper", quoted_post_id=11, visibility="public", created_at=datetime.utcnow()))
+    db.add(Post(id=13, user_id=4, content="hidden inactive author post", visibility="private", hidden_by_admin=True, created_at=datetime.utcnow()))
     db.add(Comment(id=20, post_id=10, user_id=3, content="public comment", created_at=datetime.utcnow()))
+    db.add(Comment(id=21, post_id=10, user_id=4, content="hidden inactive comment", hidden_by_admin=True, created_at=datetime.utcnow()))
     db.add(Report(id=30, reporter_id=3, target_type="post", target_id=10, reason="spam", status="pending", created_at=datetime.utcnow()))
     db.add(RoleApplication(id=40, user_id=2, role_id=2, status="pending", reason="verify me", proof_images=json.dumps(["https://example.com/proof.jpg"]), created_at=datetime.utcnow()))
     db.add(ModerationEvent(id=50, provider="local", content_type="text", route_key="posts.create", target_type="post", target_id="10", actor_user_id=2, decision="reject", error_code="CONTENT_REJECTED", label="spam", category="spam", score=90.0, created_at=datetime.utcnow()))
@@ -126,7 +137,7 @@ def test_admin_base_routes_return_safe_dashboard_and_audit_logs(admin_panel_clie
 
     summary = admin_panel_client.get("/api/admin/dashboard/summary")
     assert summary.status_code == 200
-    assert summary.json()["users_total"] == 3
+    assert summary.json()["users_total"] == 4
     assert summary.json()["reports_pending"] == 1
 
     logs = admin_panel_client.get("/api/admin/audit-logs")
@@ -136,6 +147,92 @@ def test_admin_base_routes_return_safe_dashboard_and_audit_logs(admin_panel_clie
     assert "signed_url" not in body
     assert "SecretKey" not in body
     assert "raw_response" not in body
+
+
+def test_admin_users_search_by_username_email_id_status_and_role(admin_panel_client):
+    by_username = admin_panel_client.get("/api/admin/users", params={"q": "target"})
+    assert by_username.status_code == 200
+    assert [item["id"] for item in by_username.json()["items"]] == [2]
+
+    by_email = admin_panel_client.get("/api/admin/users", params={"q": "inactive@qq.com"})
+    assert by_email.status_code == 200
+    assert [item["id"] for item in by_email.json()["items"]] == [4]
+
+    by_id = admin_panel_client.get("/api/admin/users", params={"q": "3"})
+    assert by_id.status_code == 200
+    assert any(item["id"] == 3 for item in by_id.json()["items"])
+
+    inactive = admin_panel_client.get("/api/admin/users", params={"status": "inactive", "role": "user"})
+    assert inactive.status_code == 200
+    assert inactive.json()["total"] == 1
+    assert inactive.json()["items"][0]["email"] == "inactive@qq.com"
+    assert inactive.json()["items"][0]["is_active"] is False
+
+
+def test_admin_posts_search_filters_and_author_snapshot(admin_panel_client):
+    by_content = admin_panel_client.get("/api/admin/posts", params={"q": "quoted original"})
+    assert by_content.status_code == 200
+    assert [item["id"] for item in by_content.json()["items"]] == [11]
+    assert by_content.json()["items"][0]["author"]["email"] == "reporter@example.com"
+
+    by_author_email = admin_panel_client.get("/api/admin/posts", params={"q": "inactive@qq.com"})
+    assert by_author_email.status_code == 200
+    assert [item["id"] for item in by_author_email.json()["items"]] == [13]
+
+    hidden = admin_panel_client.get("/api/admin/posts", params={"hidden": "true", "visibility": "private"})
+    assert hidden.status_code == 200
+    assert [item["id"] for item in hidden.json()["items"]] == [13]
+
+    quotes = admin_panel_client.get("/api/admin/posts", params={"is_quote": "true"})
+    assert quotes.status_code == 200
+    assert [item["id"] for item in quotes.json()["items"]] == [12]
+
+
+def test_admin_comments_search_filters_and_author_snapshot(admin_panel_client):
+    by_content = admin_panel_client.get("/api/admin/comments", params={"q": "public comment"})
+    assert by_content.status_code == 200
+    assert [item["id"] for item in by_content.json()["items"]] == [20]
+    assert by_content.json()["items"][0]["author"]["email"] == "reporter@example.com"
+
+    by_author_email = admin_panel_client.get("/api/admin/comments", params={"q": "inactive@qq.com"})
+    assert by_author_email.status_code == 200
+    assert [item["id"] for item in by_author_email.json()["items"]] == [21]
+
+    hidden = admin_panel_client.get("/api/admin/comments", params={"hidden": "true"})
+    assert hidden.status_code == 200
+    assert [item["id"] for item in hidden.json()["items"]] == [21]
+
+
+def test_admin_reports_identity_moderation_and_audit_filters(admin_panel_client):
+    reports = admin_panel_client.get("/api/admin/reports", params={"q": "reporter@example.com", "status": "pending", "target_type": "post"})
+    assert reports.status_code == 200
+    assert reports.json()["total"] == 1
+    assert reports.json()["items"][0]["reporter"]["email"] == "reporter@example.com"
+
+    applications = admin_panel_client.get("/api/admin/identity-applications", params={"q": "target@example.com", "status": "pending", "role_id": "2"})
+    assert applications.status_code == 200
+    assert applications.json()["total"] == 1
+    assert applications.json()["items"][0]["user"]["email"] == "target@example.com"
+
+    events = admin_panel_client.get("/api/admin/moderation/events", params={"q": "CONTENT", "decision": "reject", "content_type": "text", "provider": "local", "target_type": "post"})
+    assert events.status_code == 200
+    assert events.json()["total"] == 1
+    assert events.json()["items"][0]["error_code"] == "CONTENT_REJECTED"
+
+    audit_logs = admin_panel_client.get("/api/admin/audit-logs", params={"q": "system", "result": "success", "target_type": "system"})
+    assert audit_logs.status_code == 200
+    assert audit_logs.json()["total"] == 1
+    assert audit_logs.json()["items"][0]["action"] == "seed"
+
+
+def test_admin_sensitive_words_search_and_filter(admin_panel_client):
+    response = admin_panel_client.get(
+        "/api/admin/moderation/sensitive-words",
+        params={"q": "spa", "is_active": "true", "match_type": "literal", "severity": "medium"},
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["words"][0]["word"] == "spam"
 
 
 def test_admin_me_serializes_roles_from_request_db_when_token_user_is_detached(

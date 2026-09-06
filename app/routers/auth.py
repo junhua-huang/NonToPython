@@ -9,7 +9,7 @@ import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Body, Query, Request
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy.orm import Session
@@ -36,6 +36,13 @@ security = HTTPBearer()
 
 _ALLOWED_REGISTRATION_EMAIL_DOMAINS = {"qq.com", "foxmail.com", "vip.qq.com"}
 _FORBIDDEN_USERNAME_CHARS = set('/\\?#@:\r\n\t')
+
+
+async def _send_otp_email_background(email: str, code: str, purpose: str) -> None:
+    sent = await EmailService.send_otp_email(email, code, purpose)
+    if not sent and Config.DEBUG:
+        # 开发模式：邮件发不出时把验证码打到日志，方便本地测试
+        logger.info("[OTP DEV] email=%s purpose=%s code=%s", email, purpose, code)
 
 
 def is_allowed_registration_email(email: str) -> bool:
@@ -305,7 +312,12 @@ def _build_public_user_response(user: User, viewer_user_id: int | None = None) -
 # ============================================================
 
 @router.post("/send-otp")
-async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends(get_db)):
+async def send_otp(
+    data: SendOtpRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     发送邮箱验证码。
 
@@ -339,11 +351,7 @@ async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends
         raise HTTPException(status_code=429, detail=reason)
 
     code = OtpService.generate_and_store(email, purpose, ip, db)
-    # 异步发邮件，不阻塞响应；失败仅记日志
-    sent = await EmailService.send_otp_email(email, code, purpose)
-    if not sent and Config.DEBUG:
-        # 开发模式：邮件发不出时把验证码打到日志，方便本地测试
-        logger.info("[OTP DEV] email=%s purpose=%s code=%s", email, purpose, code)
+    background_tasks.add_task(_send_otp_email_background, email, code, purpose)
 
     return {"message": "验证码已发送，请查收邮箱"}
 
@@ -643,6 +651,7 @@ def delete_account(
 async def forgot_password(
     data: ForgotPasswordRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
@@ -659,9 +668,7 @@ async def forgot_password(
         if not ok:
             raise HTTPException(status_code=429, detail=reason)
         code = OtpService.generate_and_store(email, "reset_password", ip, db)
-        sent = await EmailService.send_otp_email(email, code, "reset_password")
-        if not sent and Config.DEBUG:
-            logger.info("[OTP DEV] email=%s purpose=reset_password code=%s", email, code)
+        background_tasks.add_task(_send_otp_email_background, email, code, "reset_password")
     return {"message": "若该邮箱已注册，验证码已发送"}
 
 

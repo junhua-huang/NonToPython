@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Config
 from app.database import SessionLocal
 from app.models.models import PushDevice, PushLog, User
+from app.services.block_service import has_block_between
 from app.services.notification_query_service import is_notification_visible
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class AliyunPushService:
     VERSION = "2016-08-01"
     PENDING_CLAIM_TTL_SECONDS = 120
     PRE_DEVICE_LOG_KEY = "__pre_device__"
+    MESSAGE_PUSH_ID_OFFSET = 1_000_000_000_000
     MAX_ERROR_MESSAGE_LENGTH = 500
     MAX_PROVIDER_CODE_LENGTH = 80
     MAX_PROVIDER_ID_LENGTH = 128
@@ -65,7 +67,17 @@ class AliyunPushService:
         notification_id = notification.get("id")
         if isinstance(notification_id, bool) or not isinstance(notification_id, int):
             return None
-        return notification_id if notification_id > 0 else None
+        if notification_id > 0:
+            return notification_id
+        # Message-only push records use a negative synthetic ID because they are
+        # delivery bookkeeping, never rows in the notifications table.
+        if (
+            notification.get("notification_type") == "message"
+            and notification_id < 0
+            and str(notification.get("message_id") or "").strip()
+        ):
+            return notification_id
+        return None
 
     @classmethod
     def _canonical_dedupe_key(cls, notification: dict) -> str | None:
@@ -102,15 +114,19 @@ class AliyunPushService:
         return value[:max_length] if isinstance(value, str) else None
 
     @classmethod
-    def schedule_notification_push(cls, user_id: int, notification_dict: dict) -> None:
+    def schedule_notification_push(
+        cls,
+        user_id: int,
+        notification_dict: dict,
+        *,
+        require_visible: bool = True,
+        background_only: bool = False,
+    ) -> None:
         """Best-effort push with one durable delivery state per device.
 
-        The visibility decision is DB-authoritative and happens before device lookup or
-        claiming. Each claim is committed before the provider request, so no database
-        transaction is held open while waiting on the network. A process crash after the
-        provider accepts a request but before local finalization can still cause a retry;
-        stable payload IDs and client-side persistent dedupe mitigate that unavoidable
-        cross-system acknowledgement window.
+        Ordinary notifications must be visible in the notification center before they
+        can be pushed. Message alerts are allowed to use this same delivery machinery
+        through ``schedule_message_push`` without creating a Notification row.
         """
         db = SessionLocal()
         try:
@@ -121,43 +137,48 @@ class AliyunPushService:
                     user_id,
                 )
                 return
-            try:
-                is_visible = is_notification_visible(db, user_id, notification_id)
-            except Exception as exc:
-                db.rollback()
-                exception_type = cls._safe_exception_type(exc)
-                logger.warning(
-                    "[ALIYUN PUSH] notification visibility lookup failed uid=%s notification_id=%s error_code=%s exception_type=%s",
-                    user_id,
-                    notification_id,
-                    "NOTIFICATION_VISIBILITY_CHECK_FAILED",
-                    exception_type,
-                )
-                cls._write_log(
-                    db,
-                    user_id=user_id,
-                    notification={"id": notification_id},
-                    status="skipped",
-                    error_code="NOTIFICATION_VISIBILITY_CHECK_FAILED",
-                    error_message=(
-                        "Notification visibility lookup failed; push suppressed "
-                        f"(exception_type={exception_type})"
-                    ),
-                )
-                db.commit()
-                return
+            if require_visible:
+                try:
+                    is_visible = is_notification_visible(
+                        db,
+                        user_id,
+                        notification_id,
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    exception_type = cls._safe_exception_type(exc)
+                    logger.warning(
+                        "[ALIYUN PUSH] notification visibility lookup failed uid=%s notification_id=%s error_code=%s exception_type=%s",
+                        user_id,
+                        notification_id,
+                        "NOTIFICATION_VISIBILITY_CHECK_FAILED",
+                        exception_type,
+                    )
+                    cls._write_log(
+                        db,
+                        user_id=user_id,
+                        notification={"id": notification_id},
+                        status="skipped",
+                        error_code="NOTIFICATION_VISIBILITY_CHECK_FAILED",
+                        error_message=(
+                            "Notification visibility lookup failed; push suppressed "
+                            f"(exception_type={exception_type})"
+                        ),
+                    )
+                    db.commit()
+                    return
 
-            if not is_visible:
-                cls._write_log(
-                    db,
-                    user_id=user_id,
-                    notification={"id": notification_id},
-                    status="skipped",
-                    error_code="NOTIFICATION_NOT_VISIBLE",
-                    error_message="Notification is not visible to recipient; push suppressed",
-                )
-                db.commit()
-                return
+                if not is_visible:
+                    cls._write_log(
+                        db,
+                        user_id=user_id,
+                        notification={"id": notification_id},
+                        status="skipped",
+                        error_code="NOTIFICATION_NOT_VISIBLE",
+                        error_message="Notification is not visible to recipient; push suppressed",
+                    )
+                    db.commit()
+                    return
 
             if cls._should_skip_for_user(db, user_id):
                 cls._write_log(
@@ -172,6 +193,11 @@ class AliyunPushService:
                 return
 
             devices = cls._load_enabled_devices(db, user_id)
+            if background_only:
+                devices = [
+                    device for device in devices
+                    if device.app_state != "foreground"
+                ]
             if not devices:
                 return
 
@@ -229,6 +255,52 @@ class AliyunPushService:
             )
         finally:
             db.close()
+
+    @classmethod
+    def schedule_message_push(
+        cls,
+        receiver_id: int,
+        sender_id: int,
+        message_id: int,
+        conversation_id: int,
+        message_content: str | None,
+    ) -> None:
+        """Push a chat alert without creating a notification-center row."""
+        if receiver_id == sender_id or message_id <= 0:
+            return
+        preview = str(message_content or "")
+        if len(preview) > 50:
+            preview = f"{preview[:50]}..."
+        db = SessionLocal()
+        try:
+            sender = db.query(User).filter(User.id == sender_id).first()
+            recipient = db.query(User).filter(User.id == receiver_id).first()
+            if (
+                not sender
+                or not recipient
+                or recipient.notify_message is False
+                or has_block_between(db, receiver_id, sender_id)
+            ):
+                return
+            payload = {
+                "id": -cls.MESSAGE_PUSH_ID_OFFSET - message_id,
+                "user_id": receiver_id,
+                "sender_id": sender_id,
+                "notification_type": "message",
+                "title": f"来自 {sender.username} 的新消息",
+                "content": preview,
+                "related_id": conversation_id,
+                "related_type": "conversation",
+                "message_id": message_id,
+            }
+        finally:
+            db.close()
+        cls.schedule_notification_push(
+            receiver_id,
+            payload,
+            require_visible=False,
+            background_only=True,
+        )
 
     @classmethod
     def _should_skip_for_user(cls, db: Session, user_id: int) -> bool:
