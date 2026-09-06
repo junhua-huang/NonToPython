@@ -1315,6 +1315,95 @@ class ModerationEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AppRelease(Base):
+    """客户端发布版本和升级策略。"""
+    __tablename__ = 'app_releases'
+    __table_args__ = (
+        UniqueConstraint(
+            'platform', 'channel', 'build_number',
+            name='uq_app_releases_platform_channel_build',
+        ),
+        CheckConstraint(
+            "platform IN ('android','ios','windows','web')",
+            name='ck_app_releases_platform',
+        ),
+        CheckConstraint('build_number >= 1', name='ck_app_releases_build_number'),
+        CheckConstraint(
+            'minimum_supported_build_number >= 0 '
+            'AND minimum_supported_build_number <= build_number',
+            name='ck_app_releases_minimum_build',
+        ),
+        CheckConstraint(
+            "update_action IN ('download','store','refresh')",
+            name='ck_app_releases_update_action',
+        ),
+        Index('ix_app_releases_lookup', 'platform', 'channel', 'enabled', 'build_number'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    platform = Column(String(16), nullable=False, index=True)
+    channel = Column(String(32), nullable=False, default='stable', index=True)
+    version_name = Column(String(64), nullable=False)
+    build_number = Column(Integer, nullable=False)
+    minimum_supported_build_number = Column(Integer, nullable=False, default=0)
+    force_update = Column(Boolean, nullable=False, default=False)
+    update_action = Column(String(16), nullable=False, default='download')
+    download_url = Column(String(2048), nullable=False)
+    release_notes = Column(Text, nullable=True)
+    published_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    sha256 = Column(String(128), nullable=True)
+    file_size = Column(Integer, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def notes(self):
+        return _json_list(self.release_notes)
+
+    def to_public_dict(self, *, current_build_number: int) -> dict:
+        update_available = current_build_number < self.build_number
+        forced = update_available and (
+            self.force_update or
+            current_build_number < self.minimum_supported_build_number
+        )
+        return {
+            'platform': self.platform,
+            'channel': self.channel,
+            'release_id': self.id,
+            'latest_version': self.version_name,
+            'latest_build_number': self.build_number,
+            'minimum_supported_build_number': self.minimum_supported_build_number,
+            'update_available': update_available,
+            'force_update': forced,
+            'update_action': self.update_action if update_available else None,
+            'download_url': self.download_url if update_available else None,
+            'release_notes': self.notes() if update_available else [],
+            'published_at': _utc_z(self.published_at),
+            'sha256': self.sha256 if update_available else None,
+            'file_size': self.file_size if update_available else None,
+        }
+
+    def to_admin_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'platform': self.platform,
+            'channel': self.channel,
+            'version_name': self.version_name,
+            'build_number': self.build_number,
+            'minimum_supported_build_number': self.minimum_supported_build_number,
+            'force_update': self.force_update,
+            'update_action': self.update_action,
+            'download_url': self.download_url,
+            'release_notes': self.notes(),
+            'published_at': _utc_z(self.published_at),
+            'sha256': self.sha256,
+            'file_size': self.file_size,
+            'enabled': self.enabled,
+            'created_at': _utc_z(self.created_at),
+            'updated_at': _utc_z(self.updated_at),
+        }
+
+
 class AdminSetting(Base):
     """管理员可修改的安全业务配置，不存密钥。"""
     __tablename__ = 'admin_settings'
