@@ -20,7 +20,8 @@ from app.services.moderation_service import moderation_service
 from app.services.moderation_snapshot import poll_snapshots, snapshot_store
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
-from app.routers import communities, push, admin_panel, app_updates
+from app.routers import communities, push, admin_panel, app_updates, deployments
+import app.models.deployment  # Register deployment tables with the shared Base.
 
 # 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
 # 通过 LOG_LEVEL 环境变量覆盖（DEBUG/INFO/WARNING）。
@@ -198,6 +199,7 @@ app.include_router(communities.router, prefix="/api/communities", tags=["Communi
 app.include_router(push.router, prefix="/api/push", tags=["Push"])
 app.include_router(app_updates.public_router)
 app.include_router(app_updates.admin_router)
+app.include_router(deployments.router)
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 

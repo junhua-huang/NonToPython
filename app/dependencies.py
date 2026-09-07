@@ -1,7 +1,7 @@
 """
-FastAPI 依赖注入 — 统一 Query 参数鉴权
+FastAPI 依赖注入 — Bearer 优先，兼容 Query 参数鉴权
 
-Token 传参方式: ?access_token=<jwt>
+Token: Authorization: Bearer <jwt> 或 ?access_token=<jwt>
 
 核心校验逻辑统一走 app.core.auth_core.verify_token()，
 HTTP / WebSocket 完全复用同一套规则。
@@ -14,6 +14,18 @@ from app.models.models import User
 from app.services.moderation_errors import AccountDisabled, AppContractError, to_http_exception
 
 
+def _request_token(request, access_token):
+    """Explicit Authorization always wins; malformed headers never fall back."""
+    headers = getattr(request, "headers", {})
+    authorization = headers.get("authorization")
+    if authorization is None:
+        return access_token
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    return parts[1]
+
+
 def get_current_user(
     request: Request,
     access_token: str = Query("", alias="access_token"),
@@ -21,7 +33,7 @@ def get_current_user(
 ) -> User:
     """从 Query 参数 access_token 获取当前登录用户"""
     try:
-        return verify_token(access_token)
+        return verify_token(_request_token(request, access_token))
     except AppContractError as e:
         raise to_http_exception(e) from None
     except AuthError as e:
@@ -34,13 +46,17 @@ def get_optional_user(
     db: Session = Depends(get_db),
 ):
     """可选认证 — 未传 access_token 返回 None"""
+    explicit_header = getattr(request, "headers", {}).get("authorization") is not None
+    access_token = _request_token(request, access_token)
     if not access_token:
         return None
     try:
-        return verify_token(access_token)
+        return verify_token(_request_token(request, access_token))
     except AppContractError as e:
         raise to_http_exception(e) from None
-    except AuthError:
+    except AuthError as e:
+        if explicit_header:
+            raise HTTPException(status_code=e.code, detail=e.message) from None
         return None
 
 
@@ -64,7 +80,7 @@ def require_role(*role_names: str):
         db: Session = Depends(get_db),
     ) -> User:
         try:
-            user = verify_token(access_token)
+            user = verify_token(_request_token(request, access_token))
         except AppContractError as e:
             raise to_http_exception(e) from None
         except AuthError as e:
