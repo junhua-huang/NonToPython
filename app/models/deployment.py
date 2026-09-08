@@ -39,3 +39,19 @@ class DeploymentJob(Base):
     result_json = Column(Text, nullable=True)
     migration_confirmed = Column(Boolean, nullable=False, default=False)
     schema_compatible = Column(Boolean, nullable=False, default=False)
+
+
+class DeploymentSettings(Base):
+    __tablename__ = "deployment_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    enabled = Column(Boolean, nullable=False, default=False)
+    operator_ids_json = Column(Text, nullable=False, default="[]")
+    max_bytes = Column(Integer, nullable=False, default=524288000)
+    max_expanded_bytes = Column(Integer, nullable=False, default=1073741824)
+    max_files = Column(Integer, nullable=False, default=10000)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    worker_heartbeat_at = Column(DateTime, nullable=True)
+    worker_status = Column(String(32), nullable=False, default="offline")
+    last_error_code = Column(String(64), nullable=True)

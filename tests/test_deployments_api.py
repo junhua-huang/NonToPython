@@ -16,7 +16,7 @@ from app.core import auth_core
 from app.core.config import Config
 from app.database import Base, get_db
 from app.dependencies import get_current_user, get_optional_user
-from app.models.deployment import DeploymentArtifact, DeploymentJob
+from app.models.deployment import DeploymentArtifact, DeploymentJob, DeploymentSettings
 from app.models.models import AdminAuditLog, Role, User, UserRole
 from app.routers import deployments
 from app.services import deployment_service
@@ -119,12 +119,67 @@ def test_permission_default_disabled_and_origin_not_auth(setup, monkeypatch):
     assert client.get(PREFIX, headers=headers(2)).status_code == 403
     assert client.get(PREFIX, headers=headers(3)).status_code == 403
     assert client.get(PREFIX, headers=headers(4)).status_code == 403
-    assert client.get(PREFIX + "/capabilities", headers=headers(2)).json() == {"enabled": True, "can_deploy": False}
+    assert client.get(PREFIX + "/capabilities", headers=headers(2)).json() == {
+        "enabled": True, "can_deploy": False, "can_configure": True,
+    }
     monkeypatch.delenv("DEPLOYMENT_ENABLED")
-    assert client.get(PREFIX + "/capabilities", headers=headers()).json() == {"enabled": False, "can_deploy": False}
+    assert client.get(PREFIX + "/capabilities", headers=headers()).json() == {
+        "enabled": False, "can_deploy": False, "can_configure": True,
+    }
     assert client.get(PREFIX, headers=headers()).status_code == 403
     with factory() as db:
         assert not deployment_service.worker_authorized(db, 1)
+
+
+def test_settings_persist_restrict_fields_and_drive_permissions(setup):
+    client, factory, _ = setup
+    initial = client.get(PREFIX + "/settings", headers=headers(2))
+    assert initial.status_code == 200
+    assert initial.json()["enabled"] is True
+    assert initial.json()["operator_ids"] == [1]
+    payload = {
+        "enabled": True,
+        "operator_ids": [1, 2],
+        "max_bytes": 1024,
+        "max_expanded_bytes": 2048,
+        "max_files": 20,
+        "reason": "Initialize deployment console",
+    }
+    response = client.patch(PREFIX + "/settings", headers=headers(2), json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["operator_ids"] == [1, 2]
+    assert client.get(PREFIX + "/capabilities", headers=headers(2)).json()["can_deploy"] is True
+    assert client.get(PREFIX + "/artifacts", headers=headers(2)).status_code == 200
+    assert client.patch(PREFIX + "/settings", headers=headers(3), json=payload).status_code == 403
+    for extra in ("database_password", "ssh_private_key", "server_path", "shell_command", "access_token"):
+        rejected = client.patch(PREFIX + "/settings", headers=headers(2), json={**payload, extra: "secret"})
+        assert rejected.status_code == 422
+    with factory() as db:
+        row = db.get(DeploymentSettings, 1)
+        assert row.updated_by == 2
+        assert json.loads(row.operator_ids_json) == [1, 2]
+        assert deployment_service.get_deployment_config(db).max_files == 20
+        assert db.query(AdminAuditLog).filter_by(action="deployment.settings_update").count() == 1
+
+
+def test_settings_health_heartbeat_and_reload_are_sanitized(setup):
+    client, factory, _ = setup
+    with factory() as db:
+        deployment_service.worker_heartbeat(db, "idle", "SETTINGS_UNAVAILABLE")
+        db.commit()
+    health = client.get(PREFIX + "/settings/health", headers=headers()).json()
+    assert health["worker_online"] is True
+    assert health["worker_status"] == "idle"
+    assert health["last_error_code"] == "SETTINGS_UNAVAILABLE"
+    assert health["queue"] == {"queued": 0, "running": 0}
+    text = json.dumps(health)
+    for forbidden in ("DEPLOYMENT_ARTIFACT_DIR", "database_url", "private_key", "systemctl"):
+        assert forbidden not in text
+    assert client.post(PREFIX + "/settings/reload", headers=headers(), json={}).status_code == 422
+    reloaded = client.post(PREFIX + "/settings/reload", headers=headers(), json={"reason": "Refresh settings"}).json()
+    assert reloaded["readiness"]["database"] is True
+    with factory() as db:
+        assert db.query(AdminAuditLog).filter_by(action="deployment.settings_reload").count() == 1
 
 
 def test_upload_create_idempotency_approval_cancel_and_audit(setup, monkeypatch):

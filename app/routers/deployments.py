@@ -8,17 +8,18 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import require_admin
-from app.models.deployment import DeploymentArtifact, DeploymentJob
+from app.models.deployment import DeploymentArtifact, DeploymentJob, DeploymentSettings
 from app.services.admin_audit_service import record_required_admin_audit
 from app.services.deployment_artifacts import MAX_MANIFEST_BYTES, parse_manifest, validate_bundle
 from app.services.deployment_service import (
-    artifact_directory, get_deployment_config, serialize_artifact, serialize_job, timestamp,
+    artifact_directory, get_deployment_config, serialize_artifact, serialize_job, serialize_settings,
+    serialize_settings_health, timestamp,
 )
 
 
@@ -54,8 +55,11 @@ class BoundedRoute(APIRoute):
 router = APIRouter(prefix="/api/admin/deployments", tags=["Deployments"], route_class=BoundedRoute)
 
 
-def operator(user=Depends(require_admin)):
-    config = configuration()
+def operator(user=Depends(require_admin), db: Session = Depends(get_db)):
+    try:
+        config = get_deployment_config(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
     if not config.enabled or user.id not in config.operator_ids:
         raise HTTPException(403, "deployment_not_authorized")
     return user
@@ -84,6 +88,25 @@ class ApproveRequest(ReasonRequest):
     schema_compatible: StrictBool = False
 
 
+class ReloadSettingsRequest(ReasonRequest):
+    pass
+
+
+class SettingsRequest(ReasonRequest):
+    enabled: StrictBool
+    operator_ids: list[StrictInt] = Field(default_factory=list, max_length=100)
+    max_bytes: StrictInt = Field(ge=1)
+    max_expanded_bytes: StrictInt = Field(ge=1)
+    max_files: StrictInt = Field(ge=1)
+
+    @field_validator("operator_ids")
+    @classmethod
+    def valid_operators(cls, value):
+        if any(identifier < 1 for identifier in value) or len(set(value)) != len(value):
+            raise ValueError("invalid operator ids")
+        return value
+
+
 def audit(db, user, request, action, target, reason, **metadata):
     record_required_admin_audit(db, admin_user_id=user.id, action="deployment." + action,
                                target_type="deployment", target_id=target, reason=reason,
@@ -109,9 +132,63 @@ def job_dto(db, job):
 
 
 @router.get("/capabilities")
-def capabilities(user=Depends(require_admin)):
+def capabilities(user=Depends(require_admin), db: Session = Depends(get_db)):
+    try:
+        config = get_deployment_config(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
+    return {
+        "enabled": config.enabled,
+        "can_deploy": config.enabled and user.id in config.operator_ids,
+        "can_configure": True,
+    }
+
+
+@router.get("/settings")
+def settings(user=Depends(require_admin), db: Session = Depends(get_db)):
+    try:
+        return serialize_settings(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
+
+
+@router.patch("/settings")
+def update_settings(payload: SettingsRequest, request: Request, user=Depends(require_admin), db: Session = Depends(get_db)):
     config = configuration()
-    return {"enabled": config.enabled, "can_deploy": config.enabled and user.id in config.operator_ids}
+    limits = (payload.max_bytes, payload.max_expanded_bytes, payload.max_files)
+    if any(value > maximum for value, maximum in zip(limits, (config.max_bytes, config.max_expanded_bytes, config.max_files))):
+        raise HTTPException(422, "deployment_limit_exceeded")
+    row = db.get(DeploymentSettings, 1)
+    if row is None:
+        row = DeploymentSettings(id=1)
+        db.add(row)
+    row.enabled = payload.enabled
+    row.operator_ids_json = json.dumps(payload.operator_ids, separators=(",", ":"))
+    row.max_bytes, row.max_expanded_bytes, row.max_files = limits
+    row.updated_by = user.id
+    audit(db, user, request, "settings_update", "settings", payload.reason,
+          enabled=payload.enabled, operator_count=len(payload.operator_ids))
+    db.commit()
+    db.refresh(row)
+    return serialize_settings(db)
+
+
+@router.post("/settings/reload")
+def reload_settings(payload: ReloadSettingsRequest, request: Request, user=Depends(require_admin), db: Session = Depends(get_db)):
+    audit(db, user, request, "settings_reload", "settings", payload.reason)
+    db.commit()
+    try:
+        return serialize_settings(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
+
+
+@router.get("/settings/health")
+def settings_health(user=Depends(require_admin), db: Session = Depends(get_db)):
+    try:
+        return serialize_settings_health(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
 
 
 @router.get("/artifacts")
@@ -142,7 +219,10 @@ async def upload_artifact(request: Request, manifest: UploadFile = File(...), bu
     form = await request.form()
     if sorted(key for key, _ in form.multi_items()) != ["bundle", "manifest", "reason"] or not reason.strip():
         raise HTTPException(422, "invalid_upload_fields")
-    config = configuration()
+    try:
+        config = get_deployment_config(db)
+    except ValueError:
+        raise HTTPException(503, "deployment_configuration_invalid") from None
     identifier = str(uuid.uuid4())
     directory = artifact_directory(identifier, config)
     try:

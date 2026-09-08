@@ -1,6 +1,6 @@
 """Configuration, permissions and public DTOs shared with the deployment worker."""
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -8,6 +8,7 @@ import re
 from uuid import UUID
 
 from app.models.models import Role, User, UserRole
+from app.models.deployment import DeploymentSettings
 from app.services.deployment_artifacts import DEFAULT_MAX_BYTES, DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_FILES
 
 
@@ -21,7 +22,7 @@ class DeploymentConfig:
     max_files: int = DEFAULT_MAX_FILES
 
 
-def get_deployment_config():
+def get_deployment_config(db=None):
     backend = Path(__file__).resolve().parents[2]
     configured_root = Path(os.environ.get("DEPLOYMENT_ARTIFACT_DIR", str(backend.parent / "deployment-artifacts"))).expanduser().absolute()
     if any(part.is_symlink() for part in (configured_root, *configured_root.parents)):
@@ -38,7 +39,7 @@ def get_deployment_config():
         if not raw.isdigit() or not 1 <= int(raw) <= default:
             raise ValueError("invalid_deployment_limit")
         return int(raw)
-    return DeploymentConfig(
+    config = DeploymentConfig(
         enabled=os.environ.get("DEPLOYMENT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
         operator_ids=frozenset(int(value.strip()) for value in ids.split(",") if value.strip()),
         artifact_dir=root,
@@ -46,11 +47,35 @@ def get_deployment_config():
         max_expanded_bytes=limit("DEPLOYMENT_MAX_EXPANDED_BYTES", DEFAULT_MAX_EXPANDED_BYTES),
         max_files=limit("DEPLOYMENT_MAX_FILES", DEFAULT_MAX_FILES),
     )
+    stored = _stored_settings(db) if db is not None else None
+    if stored is None:
+        return config
+    ids = _json(stored.operator_ids_json, [])
+    if not isinstance(ids, list) or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in ids):
+        raise ValueError("invalid_stored_operator_ids")
+    values = (stored.max_bytes, stored.max_expanded_bytes, stored.max_files)
+    if any(not isinstance(value, int) or value < 1 for value in values):
+        raise ValueError("invalid_stored_deployment_limits")
+    return DeploymentConfig(bool(stored.enabled), frozenset(ids), config.artifact_dir, *values)
+
+
+def _stored_settings(db):
+    return db.get(DeploymentSettings, 1)
+
+
+def worker_heartbeat(db, status='online', error_code=None):
+    row = _stored_settings(db)
+    if row is None:
+        row = DeploymentSettings(id=1)
+        db.add(row)
+    row.worker_status = status if status in {'idle', 'disabled', 'running', 'error', 'online', 'offline'} else 'error'
+    row.worker_heartbeat_at = datetime.utcnow()
+    row.last_error_code = error_code if isinstance(error_code, str) and re.fullmatch(r'[A-Z0-9_:-]{1,64}', error_code) else None
 
 
 def worker_authorized(db, user_id):
     try:
-        config = get_deployment_config()
+        config = get_deployment_config(db)
     except ValueError:
         return False
     if not config.enabled or user_id not in config.operator_ids:
@@ -87,6 +112,43 @@ def _json(value, default):
         return result if isinstance(result, type(default)) else default
     except (ValueError, TypeError):
         return default
+
+
+def serialize_settings(db):
+    config = get_deployment_config(db)
+    stored = _stored_settings(db)
+    return {
+        "enabled": config.enabled,
+        "operator_ids": sorted(config.operator_ids),
+        "max_bytes": config.max_bytes,
+        "max_expanded_bytes": config.max_expanded_bytes,
+        "max_files": config.max_files,
+        "worker_status": stored.worker_status if stored else "offline",
+        "worker_heartbeat_at": timestamp(stored.worker_heartbeat_at) if stored else None,
+        "last_error_code": _code(stored.last_error_code) if stored else None,
+        "readiness": {
+            "artifact_storage": True,
+            "server_configuration": True,
+            "database": True,
+            "worker_configuration": stored is not None,
+        },
+    }
+
+
+def serialize_settings_health(db):
+    settings = serialize_settings(db)
+    stored = _stored_settings(db)
+    age = None if not stored or not stored.worker_heartbeat_at else (datetime.utcnow() - stored.worker_heartbeat_at).total_seconds()
+    from app.models.deployment import DeploymentJob
+    settings.update({
+        "worker_online": bool(age is not None and age <= 30 and stored.worker_status not in {"offline", "error"}),
+        "heartbeat_age_seconds": int(age) if age is not None and age >= 0 else None,
+        "queue": {
+            "queued": db.query(DeploymentJob).filter_by(status="queued").count(),
+            "running": db.query(DeploymentJob).filter(DeploymentJob.status.in_(["running", "verifying"])).count(),
+        },
+    })
+    return settings
 
 
 def serialize_artifact(artifact):
