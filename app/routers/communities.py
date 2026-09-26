@@ -13,6 +13,26 @@ from app.dependencies import get_current_user, get_optional_user
 from app.models.models import User, Conversation, Message
 from app.models.community import Community, CommunityMember
 from app.services.community_service import CommunityService, CommunityError, MAX_ADMINS
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
+from app.ws_manager import ws_manager
+from app.services.message_type_service import (
+    normalize_user_message_payload,
+    redact_unavailable_post_card,
+    redact_unavailable_post_cards_batch,
+)
+from app.services.quote_service import (
+    build_quote_preview,
+    inject_quote_preview,
+    inject_quote_preview_batch,
+    validate_quote,
+)
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_route_helpers import (
+    message_text_payload_for_moderation,
+    moderate_route_fields,
+)
+from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,6 +45,54 @@ def _handle(fn):
         raise HTTPException(status_code=e.code, detail=e.message)
 
 
+_COMMUNITY_MODERATION_CHECKS = {
+    "POST /api/communities": ("community_create", ("name", "description", "rules")),
+    "PATCH /api/communities/{community_id}": ("community_edit", ("name", "description", "rules")),
+    "POST /api/communities/{community_id}/join": ("community_join_request", ("message",)),
+    "POST /api/communities/{community_id}/announcements": ("community_announcement", ("title", "content")),
+    "PATCH /api/communities/{community_id}/announcements/{announcement_id}": ("community_announcement", ("title", "content")),
+    "POST /api/communities/{community_id}/bans": ("community_ban", ("reason",)),
+}
+
+
+def _moderate_community_fields(
+    route_key: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    target_type, field_names = _COMMUNITY_MODERATION_CHECKS[route_key]
+    fields = {}
+    for field in field_names:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=target_type,
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
+
+
 def _community_message_to_dict(message: Message):
     data = message.to_dict()
     return {
@@ -33,31 +101,38 @@ def _community_message_to_dict(message: Message):
     }
 
 
-def _normalize_community_message_payload(payload: dict):
-    content = (payload.get("content") or "").strip()
-    message_type = (payload.get("message_type") or "text").strip().lower()
-    media_url = (payload.get("media_url") or "").strip()
+def _serialize_community_messages_for_viewer(
+    db: Session,
+    messages: list[dict],
+    viewer_user_id: int,
+) -> list[dict]:
+    inject_quote_preview_batch(db, messages, viewer_user_id=viewer_user_id)
+    return redact_unavailable_post_cards_batch(db, messages, viewer_user_id)
+
+
+def _normalize_community_message_payload(
+    payload: dict,
+    db: Session,
+    sender_user_id: int,
+    community_id: int,
+):
+    normalized = normalize_user_message_payload(
+        payload,
+        db,
+        viewer_user_id=sender_user_id,
+        destination_community_id=community_id,
+    )
     mention_user_ids = payload.get("mention_user_ids", [])
-    allowed_types = {'text', 'image', 'video'}
-
-    if message_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="不支持的消息类型")
-
-    if message_type == 'text' and not content:
-        raise HTTPException(status_code=400, detail="消息内容不能为空")
-
-    if message_type in {'image', 'video'}:
-        if not (media_url or content):
-            raise HTTPException(status_code=400, detail="媒体消息不能为空")
-        if not media_url:
-            media_url = content
-        if not content:
-            content = media_url
-
     if not isinstance(mention_user_ids, list):
         mention_user_ids = []
 
-    return content, message_type, media_url or None, mention_user_ids
+    return (
+        normalized["content"],
+        normalized["message_type"],
+        normalized["media_url"],
+        normalized["related_id"],
+        mention_user_ids,
+    )
 
 
 # ============================================================
@@ -72,7 +147,21 @@ def my_communities(
 ):
     """我加入的社群（manage_only=True 仅返回我管理的）"""
     items = CommunityService.list_my_communities(db, user.id, manage_only=manage_only)
-    return {"communities": [c.to_dict() for c in items]}
+    community_ids = [community.id for community in items]
+    members = db.query(CommunityMember).filter(
+        CommunityMember.user_id == user.id,
+        CommunityMember.community_id.in_(community_ids),
+    ).all() if community_ids else []
+    member_by_community = {member.community_id: member for member in members}
+    communities = []
+    for community in items:
+        data = community.to_dict()
+        member = member_by_community.get(community.id)
+        if member:
+            data['my_role'] = member.role
+            data['my_status'] = member.status
+        communities.append(data)
+    return {"communities": communities}
 
 
 # ============================================================
@@ -86,6 +175,12 @@ def create_community(
     db: Session = Depends(get_db),
 ):
     """创建社群"""
+    _moderate_community_fields(
+        "POST /api/communities",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         c = CommunityService.create_community(
             db=db, owner_id=user.id,
@@ -142,6 +237,12 @@ def update_community(
     db: Session = Depends(get_db),
 ):
     """编辑社群（owner/admin）"""
+    _moderate_community_fields(
+        "PATCH /api/communities/{community_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         c = CommunityService.update_community(db, community_id, user.id, **payload)
         return {"community": c.to_dict()}
@@ -173,6 +274,12 @@ def join_community(
     db: Session = Depends(get_db),
 ):
     """申请加群"""
+    _moderate_community_fields(
+        "POST /api/communities/{community_id}/join",
+        payload,
+        actor_user_id=user.id,
+        is_public=False,
+    )
     def _do():
         return CommunityService.request_join(db, community_id, user.id, payload.get("message"))
     return _handle(_do)
@@ -228,10 +335,11 @@ def list_members(
     community_id: int,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """成员列表"""
-    items = CommunityService.list_members(db, community_id, limit, offset)
+    items = CommunityService.list_members(db, community_id, limit, offset, viewer_user_id=user.id)
     return {"members": [m.to_dict() for m in items]}
 
 
@@ -285,6 +393,12 @@ def create_announcement(
     db: Session = Depends(get_db),
 ):
     """发布公告（管理员+）"""
+    _moderate_community_fields(
+        "POST /api/communities/{community_id}/announcements",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         a = CommunityService.create_announcement(
             db, community_id, user.id,
@@ -305,6 +419,12 @@ def update_announcement(
     db: Session = Depends(get_db),
 ):
     """编辑公告（管理员+）"""
+    _moderate_community_fields(
+        "PATCH /api/communities/{community_id}/announcements/{announcement_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
     def _do():
         a = CommunityService.update_announcement(
             db, community_id, announcement_id, user.id, **payload
@@ -354,6 +474,12 @@ def ban_user(
     db: Session = Depends(get_db),
 ):
     """拉黑用户（管理员+）"""
+    _moderate_community_fields(
+        "POST /api/communities/{community_id}/bans",
+        payload,
+        actor_user_id=user.id,
+        is_public=False,
+    )
     def _do():
         b = CommunityService.ban_user(
             db, community_id, user.id,
@@ -386,10 +512,16 @@ def unban_user(
 def list_hot_posts(
     community_id: int,
     limit: int = Query(20, ge=1, le=50),
+    user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    """社群热门帖子（公开）"""
-    posts = CommunityService.list_hot_posts(db, community_id, limit=limit)
+    """社群热门帖子（公开帖子匿名可见，仅社群帖子要求活跃成员身份）。"""
+    posts = CommunityService.list_hot_posts(
+        db,
+        community_id,
+        limit=limit,
+        current_user_id=user.id if user else None,
+    )
     return {"posts": [p.to_dict() for p in posts]}
 
 
@@ -416,10 +548,15 @@ def set_member_role(
 def get_community_chat(
     community_id: int,
     limit: int = Query(50, ge=1, le=100),
+    before_id: int = Query(None, ge=1),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """获取社群群聊会话 + 最近消息"""
+    """获取社群群聊会话 + 最近消息
+
+    - 不传 before_id：返回最近 limit 条（含撤回的也排除）
+    - 传 before_id：返回 id < before_id 的最近 limit 条，用于向上翻页
+    """
     c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
     if not c:
         raise HTTPException(status_code=404, detail="社群不存在")
@@ -440,14 +577,104 @@ def get_community_chat(
     if not conv:
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
-    messages = db.query(Message).filter(
+    query = db.query(Message).filter(
         Message.conversation_id == conv.id,
         Message.is_recalled == False,
-    ).order_by(Message.created_at.desc()).limit(limit).all()
+        visible_user_predicate(user.id, Message.sender_id),
+    )
+    if before_id is not None:
+        query = query.filter(Message.id < before_id)
+    messages = query.order_by(Message.created_at.desc()).limit(limit + 1).all()
+
+    has_more = len(messages) > limit
+    messages = messages[:limit]
 
     return {
         "conversation": conv.to_dict(),
-        "messages": [_community_message_to_dict(msg) for msg in reversed(messages)],
+        "messages": _serialize_community_messages_for_viewer(
+            db,
+            [_community_message_to_dict(msg) for msg in reversed(messages)],
+            user.id,
+        ),
+        "has_more": has_more,
+    }
+
+
+@router.get("/{community_id}/chat/messages/around")
+def get_community_message_around(
+    community_id: int,
+    target_id: int = Query(..., ge=1),
+    before: int = Query(20, ge=1, le=50),
+    after: int = Query(20, ge=1, le=50),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """群聊内某条消息的上下文窗口（点击引用 → 定位原消息）。"""
+    c = db.query(Community).filter(Community.id == community_id, Community.status == 'active').first()
+    if not c:
+        raise HTTPException(status_code=404, detail="社群不存在")
+
+    m = db.query(CommunityMember).filter(
+        CommunityMember.community_id == community_id,
+        CommunityMember.user_id == user.id,
+        CommunityMember.status == 'active',
+    ).first()
+    if not m:
+        raise HTTPException(status_code=403, detail="你不是该社群成员")
+
+    conv = db.query(Conversation).filter(
+        Conversation.type == 'community',
+        Conversation.community_id == community_id,
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="群聊会话不存在")
+
+    target = db.query(Message).filter(
+        Message.id == target_id,
+        Message.conversation_id == conv.id,
+        visible_user_predicate(user.id, Message.sender_id),
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target message not found")
+
+    before_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conv.id,
+            Message.created_at < target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
+        )
+        .order_by(Message.created_at.desc())
+        .limit(before + 1)
+        .all()
+    )
+    has_more_before = len(before_msgs) > before
+    before_msgs = list(reversed(before_msgs[:before]))
+
+    after_msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conv.id,
+            Message.created_at > target.created_at,
+            visible_user_predicate(user.id, Message.sender_id),
+        )
+        .order_by(Message.created_at.asc())
+        .limit(after + 1)
+        .all()
+    )
+    has_more_after = len(after_msgs) > after
+    after_msgs = after_msgs[:after]
+
+    window = before_msgs + [target] + after_msgs
+    return {
+        "messages": _serialize_community_messages_for_viewer(
+            db,
+            [_community_message_to_dict(msg) for msg in window],
+            user.id,
+        ),
+        "target_id": target_id,
+        "has_more_before": has_more_before,
+        "has_more_after": has_more_after,
     }
 
 
@@ -478,9 +705,23 @@ async def send_community_message(
     if not conv:
         raise HTTPException(status_code=404, detail="群聊会话不存在")
 
-    content, message_type, media_url, mention_user_ids = (
-        _normalize_community_message_payload(payload)
+    content, message_type, media_url, related_id, mention_user_ids = (
+        _normalize_community_message_payload(payload, db, user.id, community_id)
     )
+    moderation_payload = message_text_payload_for_moderation(payload)
+    if moderation_payload:
+        moderate_route_fields(
+            moderation_service,
+            "POST /api/communities/{community_id}/chat/messages",
+            moderation_payload,
+            actor_user_id=user.id,
+            is_public=False,
+        )
+
+    # 校验并生成引用预览（实时生成，不入库 quote_preview）
+    quote_message_id = payload.get("quote_message_id")
+    quoted = validate_quote(db, conv.id, quote_message_id)
+    client_msg_id = payload.get("client_msg_id")
 
     now = datetime.utcnow()
     msg = Message(
@@ -489,6 +730,9 @@ async def send_community_message(
         content=content,
         message_type=message_type,
         media_url=media_url,
+        related_id=related_id,
+        client_msg_id=client_msg_id,
+        quote_message_id=quote_message_id if quoted else None,
         created_at=now,
     )
     db.add(msg)
@@ -496,20 +740,40 @@ async def send_community_message(
     db.commit()
     db.refresh(msg)
 
-    msg_dict = _community_message_to_dict(msg)
+    msg_dict = inject_quote_preview(
+        db,
+        _community_message_to_dict(msg),
+        viewer_user_id=user.id,
+    )
+    redact_unavailable_post_card(db, msg_dict, user.id)
     msg_dict["community_id"] = community_id
     msg_dict["community_name"] = c.name
 
-    # WS 扇出给所有在线成员
-    from app.ws_manager import ws_manager
-    members = db.query(CommunityMember).filter(
+    # WS 扇出给未与发送者互相屏蔽的在线成员。
+    blocked_ids = excluded_user_ids(db, user.id)
+    members_query = db.query(CommunityMember).filter(
         CommunityMember.community_id == community_id,
         CommunityMember.status == 'active',
-    ).all()
+    )
+    if blocked_ids:
+        members_query = members_query.filter(~CommunityMember.user_id.in_(blocked_ids))
+    members = members_query.all()
     for member in members:
         if ws_manager.is_connected(member.user_id):
+            delivered_message = (
+                msg_dict
+                if member.user_id == user.id
+                else inject_quote_preview(
+                    db,
+                    _community_message_to_dict(msg),
+                    viewer_user_id=member.user_id,
+                )
+            )
+            redact_unavailable_post_card(db, delivered_message, member.user_id)
+            delivered_message["community_id"] = community_id
+            delivered_message["community_name"] = c.name
             await ws_manager.send_with_seq(member.user_id, "new_message", {
-                "message": msg_dict,
+                "message": delivered_message,
                 "conversation_id": conv.id,
                 "community_id": community_id,
             })
@@ -517,7 +781,7 @@ async def send_community_message(
     # @提及通知（离线/在线都推）
     if mention_user_ids:
         for uid in mention_user_ids:
-            if uid == user.id:
+            if uid == user.id or uid in blocked_ids:
                 continue
             # 验证被 @ 者是成员
             tm = db.query(CommunityMember).filter(

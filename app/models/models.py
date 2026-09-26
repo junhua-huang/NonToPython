@@ -2,10 +2,11 @@
 FastAPI 版本 - 数据模型定义
 从 Flask-SQLAlchemy 迁移至 SQLAlchemy 2.0+ Declarative
 """
-from datetime import datetime
+from datetime import datetime, timezone
+import json
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime, Float, ForeignKey,
-    Table, Index, func, UniqueConstraint
+    Table, Index, func, UniqueConstraint, CheckConstraint
 )
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -15,6 +16,54 @@ def _get_ws_manager():
     """延迟导入，避免循环依赖"""
     from app.ws_manager import ws_manager
     return ws_manager
+
+
+def _utc_z(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace('+00:00', 'Z')
+
+
+BUSINESS_IDENTITY_ROLES = {
+    "event_organizer": "活动方",
+    "coser": "Coser",
+    "photographer": "摄影师",
+    "wig_stylist": "毛娘",
+    "makeup_artist": "妆娘",
+    "ticket_agent": "票代",
+    "prop_maker": "道具师",
+    "costume_maker": "服装师",
+    "retoucher": "后期师",
+}
+
+SYSTEM_ROLE_NAMES = {"admin", "super_admin", "moderator"}
+ROLE_APPLICATION_STATUSES = {"pending", "verified", "rejected", "suspended"}
+
+
+def is_business_identity_role(role_name: str | None) -> bool:
+    return bool(role_name) and role_name in BUSINESS_IDENTITY_ROLES
+
+
+def get_business_identity_label(role_name: str | None) -> str | None:
+    if not role_name:
+        return None
+    return BUSINESS_IDENTITY_ROLES.get(role_name)
+
+
+def _json_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
 
 
 # ============================================================
@@ -62,6 +111,8 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     # 邮箱是否已验证（注册时通过邮箱验证码验证后置 True）
     is_email_verified = Column(Boolean, default=False)
+    # 是否为受控机器人/测试账号（仅管理员通过 bots provisioning 创建，非真实用户）
+    is_bot = Column(Boolean, default=False, nullable=False)
 
     # 隐私设置
     profile_visibility = Column(String(20), default='public')
@@ -93,34 +144,30 @@ class User(Base):
     user_roles = relationship('UserRole', back_populates='user', lazy='joined', cascade='all, delete-orphan')
     
     def get_role_names(self):
-        """返回当前用户的角色名列表"""
+        """返回当前用户的全部系统角色名，用于权限判断。"""
         return [ur.role.name for ur in self.user_roles if ur.role]
 
     def get_role_labels(self):
-        """返回当前用户的角色标签列表"""
+        """返回当前用户的全部系统角色标签，用于后台/鉴权响应。"""
         return [ur.role.label for ur in self.user_roles if ur.role]
+
+    def get_verified_identity_roles(self):
+        """返回公开展示的已认证业务身份。"""
+        return [ur.role.name for ur in self.user_roles if ur.role and is_business_identity_role(ur.role.name)]
+
+    def get_verified_identity_labels(self):
+        """返回公开展示的已认证业务身份标签。"""
+        return [ur.role.label for ur in self.user_roles if ur.role and is_business_identity_role(ur.role.name)]
 
     def has_role(self, role_name: str) -> bool:
         """检查用户是否拥有某个角色"""
         return role_name in self.get_role_names()
 
     def to_dict(self):
-        ws_manager = _get_ws_manager()
-        is_online = ws_manager.is_connected(self.id) if self.id else False
-        return {
-            'id': self.id,
-            'username': self.username,
-            'email': self.email,
-            'display_name': self.username,
-            'bio': self.bio,
-            'avatar': self.avatar_url,
-            'avatar_url': self.avatar_url,
-            'cover_photo_url': self.cover_photo_url,
-            'is_online': is_online,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'roles': self.get_role_names(),
-            'role_labels': self.get_role_labels(),
-        }
+        """Safe card serialization for list and nested response contexts."""
+        from app.serializers.user import serialize_user_card
+
+        return serialize_user_card(self)
 
 
 class Post(Base):
@@ -135,7 +182,10 @@ class Post(Base):
     images = Column(Text)  # JSON array string for multi-image support
     video_url = Column(String(255))
     post_type = Column(String(20), default='text')
+    content_category = Column(String(32), nullable=True)
+    display_role_type = Column(String(32), nullable=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    quoted_post_id = Column(Integer, ForeignKey('posts.id'), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     visibility = Column(String(20), default='public')
@@ -151,6 +201,7 @@ class Post(Base):
     
     # 关系
     author = relationship('User', back_populates='posts', foreign_keys=[user_id])
+    quoted_post = relationship('Post', remote_side=[id], foreign_keys=[quoted_post_id], uselist=False)
     comments = relationship('Comment', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     likes = relationship('Like', back_populates='post', lazy='dynamic', cascade='all, delete-orphan')
     
@@ -197,6 +248,9 @@ class Post(Base):
         # is_liked 必须由调用方传入，不再内部创建 Session
         # 如果调用方未传入且 current_user_id 不为 None，说明调用方未做批量查询，
         # 此时使用默认值 False（避免 N+1 反模式）
+        effective_display_role_type = self.display_role_type
+        if self.author is not None and self.display_role_type not in self.author.get_verified_identity_roles():
+            effective_display_role_type = None
 
         result = {
             'id': self.id,
@@ -205,7 +259,11 @@ class Post(Base):
             'image_urls': images_list,
             'video_url': self.video_url,
             'post_type': self.post_type,
+            'content_category': self.content_category,
+            'display_role_type': effective_display_role_type,
+            'display_role_label': get_business_identity_label(effective_display_role_type),
             'user_id': self.user_id,
+            'quoted_post_id': self.quoted_post_id,
             'author': self.author.to_dict() if self.author else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
@@ -218,6 +276,28 @@ class Post(Base):
             'topics': topics if topics is not None else self.get_topics(db=db),
             'is_liked': is_liked if is_liked is not None else False,
         }
+        quoted_post = self.quoted_post
+        if quoted_post is None and self.quoted_post_id and db is not None:
+            quoted_post = db.query(Post).filter(Post.id == self.quoted_post_id).first()
+        if quoted_post is not None:
+            try:
+                from app.services.post_visibility_service import can_view_post
+                visible = can_view_post(db, quoted_post, current_user_id) if db is not None else not quoted_post.hidden_by_admin
+            except Exception:
+                visible = False
+            if visible and quoted_post.hidden_by_admin is not True:
+                result['quoted_post'] = quoted_post.to_dict(
+                    current_user_id=current_user_id,
+                    like_count=0,
+                    comment_count=0,
+                    topics=[],
+                    is_liked=False,
+                    db=None,
+                )
+            else:
+                result['quoted_post'] = {'id': self.quoted_post_id, 'unavailable': True}
+        else:
+            result['quoted_post'] = None
         return result
 
 
@@ -258,6 +338,10 @@ class Comment(Base):
     reply_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    hidden_by_admin = Column(Boolean, default=False)
+    hidden_by = Column(Integer, ForeignKey('users.id', name='fk_comments_hidden_by'), nullable=True)
+    hidden_reason = Column(String(500), nullable=True)
+    hidden_at = Column(DateTime, nullable=True)
     
     author = relationship('User', foreign_keys=[user_id], back_populates='comments')
     post = relationship('Post', back_populates='comments')
@@ -394,6 +478,8 @@ class ConversationParticipant(Base):
     conversation_id = Column(Integer, ForeignKey('conversations.id'), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     joined_at = Column(DateTime, default=datetime.utcnow)
+    last_read_at = Column(DateTime, nullable=True)
+    last_read_message_id = Column(Integer, nullable=True)
     
     conversation = relationship('Conversation', back_populates='participants')
     user = relationship('User')
@@ -411,9 +497,10 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey('conversations.id'), nullable=False, index=True)
     sender_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     content = Column(Text)
-    message_type = Column(String(20), default='text')  # text, image, system
+    message_type = Column(String(20), default='text')  # text, image, video, post, system
     media_url = Column(String(255))
     related_id = Column(Integer)
+    client_msg_id = Column(String(128), nullable=True, index=True)
     quote_message_id = Column(Integer, nullable=True)
     quote_preview = Column(Text, nullable=True)
     is_read = Column(Boolean, default=False)
@@ -434,12 +521,13 @@ class Message(Base):
             'message_type': self.message_type,
             'media_url': self.media_url,
             'related_id': self.related_id,
+            'client_msg_id': self.client_msg_id,
             'quote_message_id': self.quote_message_id,
             'quote_preview': self.quote_preview,
             'is_read': self.is_read,
             'is_recalled': self.is_recalled,
-            'recalled_at': self.recalled_at.isoformat() if self.recalled_at else None,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'recalled_at': _utc_z(self.recalled_at),
+            'created_at': _utc_z(self.created_at),
         }
 
 
@@ -477,6 +565,124 @@ class Notification(Base):
             'is_read': self.is_read,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class NotificationDelivery(Base):
+    """治理通知投递记录，不存敏感凭据或内部处理备注。"""
+    __tablename__ = 'notification_deliveries'
+
+    id = Column(Integer, primary_key=True)
+    notification_id = Column(Integer, ForeignKey('notifications.id'), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    channel = Column(String(20), nullable=False, index=True)
+    event_type = Column(String(80), nullable=False, index=True)
+    target_type = Column(String(50), nullable=True, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    recipient_email = Column(String(120), nullable=True)
+    subject = Column(String(200), nullable=True)
+    body = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default='pending', index=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    last_error_code = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    sent_at = Column(DateTime, nullable=True)
+
+    user = relationship('User')
+    notification = relationship('Notification')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'notification_id': self.notification_id,
+            'user_id': self.user_id,
+            'channel': self.channel,
+            'event_type': self.event_type,
+            'target_type': self.target_type,
+            'target_id': self.target_id,
+            'recipient_email': self.recipient_email,
+            'subject': self.subject,
+            'status': self.status,
+            'retry_count': self.retry_count,
+            'last_error_code': self.last_error_code,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'sent_at': self.sent_at.isoformat() if self.sent_at else None,
+        }
+
+
+class PushDevice(Base):
+    """阿里云推送设备绑定。"""
+    __tablename__ = 'push_devices'
+    __table_args__ = (
+        UniqueConstraint('device_id', name='uq_push_devices_device_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    platform = Column(String(20), default='android')
+    provider = Column(String(30), default='aliyun')
+    device_id = Column(String(128), nullable=False, index=True)
+    manufacturer = Column(String(80))
+    model = Column(String(120))
+    app_version = Column(String(50))
+    enabled = Column(Boolean, default=True)
+    app_state = Column(String(20), default='unknown')
+    app_state_updated_at = Column(DateTime, default=datetime.utcnow)
+    last_foreground_at = Column(DateTime)
+    last_background_at = Column(DateTime)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'platform': self.platform,
+            'provider': self.provider,
+            'device_id': self.device_id,
+            'manufacturer': self.manufacturer,
+            'model': self.model,
+            'app_version': self.app_version,
+            'enabled': self.enabled,
+            'app_state': self.app_state,
+            'app_state_updated_at': self.app_state_updated_at.isoformat() if self.app_state_updated_at else None,
+            'last_foreground_at': self.last_foreground_at.isoformat() if self.last_foreground_at else None,
+            'last_background_at': self.last_background_at.isoformat() if self.last_background_at else None,
+            'last_seen_at': self.last_seen_at.isoformat() if self.last_seen_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PushLog(Base):
+    """One delivery-state row for a notification/device pair."""
+    __tablename__ = 'push_logs'
+    __table_args__ = (
+        UniqueConstraint(
+            'notification_id',
+            'device_id',
+            name='uq_push_logs_notification_device',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    device_id = Column(String(128), nullable=False)
+    notification_id = Column(Integer, nullable=False, index=True)
+    notification_type = Column(String(50))
+    title = Column(String(200))
+    status = Column(String(30))
+    claim_token = Column(String(36))
+    claimed_at = Column(DateTime)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    request_id = Column(String(128))
+    message_id = Column(String(128))
+    error_code = Column(String(80))
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Topic(Base):
@@ -552,10 +758,15 @@ class Report(Base):
     reason = Column(String(200), nullable=False)
     description = Column(Text)
     status = Column(String(20), default='pending')
+    resolution = Column(String(50), nullable=True)
+    resolution_note = Column(String(500), nullable=True)
+    action_taken = Column(String(50), nullable=True)
+    resolved_by = Column(Integer, ForeignKey('users.id', name='fk_reports_resolved_by'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime)
     
     reporter = relationship('User', foreign_keys=[reporter_id])
+    resolver = relationship('User', foreign_keys=[resolved_by])
     
     def to_dict(self):
         return {
@@ -566,6 +777,10 @@ class Report(Base):
             'reason': self.reason,
             'description': self.description,
             'status': self.status,
+            'resolution': self.resolution,
+            'resolution_note': self.resolution_note,
+            'action_taken': self.action_taken,
+            'resolved_by': self.resolved_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
         }
@@ -613,19 +828,77 @@ class SearchHistory(Base):
 
 
 class SensitiveWord(Base):
-    """敏感词模型"""
+    """Versioned dynamic moderation rule."""
     __tablename__ = 'sensitive_words'
+    __table_args__ = (
+        UniqueConstraint(
+            'word', 'match_type', name='uq_sensitive_word_expression_type'
+        ),
+        CheckConstraint(
+            "match_type IN ('literal','regex')",
+            name='ck_sensitive_word_match_type',
+        ),
+        CheckConstraint(
+            "category IN ('sexual','violence','illegal','abuse','hate','spam','privacy','other')",
+            name='ck_sensitive_word_category',
+        ),
+        CheckConstraint(
+            "severity IN ('low','medium','high')",
+            name='ck_sensitive_word_severity',
+        ),
+        Index('ix_sensitive_word_active_version', 'is_active', 'row_version'),
+    )
 
     id = Column(Integer, primary_key=True)
-    word = Column(String(100), nullable=False, unique=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    word = Column(String(500), nullable=False)
+    match_type = Column(String(16), nullable=False, default='literal')
+    category = Column(String(32), nullable=False, default='other')
+    severity = Column(String(16), nullable=False, default='medium')
+    is_active = Column(Boolean, nullable=False, default=True)
+    row_version = Column(Integer, nullable=False, default=1)
+    created_by = Column(
+        Integer,
+        ForeignKey('users.id', name='fk_sensitive_words_creator'),
+        nullable=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
     def to_dict(self):
         return {
             'id': self.id,
             'word': self.word,
+            'match_type': self.match_type,
+            'category': self.category,
+            'severity': self.severity,
+            'is_active': bool(self.is_active),
+            'row_version': self.row_version,
+            'created_by': self.created_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class SensitiveWordVersion(Base):
+    """Singleton row used to invalidate cached moderation rules."""
+    __tablename__ = 'sensitive_word_versions'
+    __table_args__ = (
+        CheckConstraint('id = 1', name='ck_sensitive_word_version_singleton'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=False)
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
 
 # ============================================================
@@ -825,11 +1098,11 @@ class WSUserSeq(Base):
 
 
 class WSAckDedup(Base):
-    """ACK 去重表（clientMsgId 幂等，定期清理 24h 前记录）"""
+    """ACK 去重表（clientMsgId 对单用户幂等，定期清理 24h 前记录）"""
     __tablename__ = 'ws_ack_dedup'
 
+    user_id = Column(Integer, ForeignKey('users.id'), primary_key=True)
     client_msg_id = Column(String(36), primary_key=True)  # UUID
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     message_id = Column(Integer, nullable=True)  # 首次处理时记录的 message_id，重复 ACK 时回传
     processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -856,6 +1129,7 @@ class Role(Base):
             'label': self.label,
             'description': self.description,
             'sort_order': self.sort_order,
+            'is_business_identity': is_business_identity_role(self.name),
         }
 
 
@@ -944,10 +1218,13 @@ class PhotographerProfile(Base):
 class ServiceProfile(Base):
     """通用服务商资料（毛娘 / 妆娘 / 后期师 / 票务代理）"""
     __tablename__ = 'service_profiles'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'service_type', name='uq_service_profiles_user_type'),
+    )
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
-    service_type = Column(String(32), nullable=False)  # wig_stylist / makeup_artist / editor / ticket_agent
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    service_type = Column(String(32), nullable=False)  # wig_stylist / makeup_artist / retoucher / ticket_agent / prop_maker / costume_maker
     description = Column(Text)
     city = Column(String(32), default='')
     is_available = Column(Boolean, default=True)
@@ -978,8 +1255,13 @@ class RoleApplication(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     role_id = Column(Integer, ForeignKey('roles.id', ondelete='CASCADE'), nullable=False)
-    status = Column(String(16), default='pending')   # pending / approved / rejected
+    status = Column(String(16), default='pending')   # pending / verified / rejected / suspended
     reason = Column(Text)
+    application_text = Column(Text)
+    proof_images = Column(Text)
+    portfolio_links = Column(Text)
+    contact_info = Column(String(255))
+    extra_note = Column(Text)
     review_comment = Column(Text)
     reviewer_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -989,45 +1271,179 @@ class RoleApplication(Base):
     role = relationship('Role')
     reviewer = relationship('User', foreign_keys=[reviewer_id])
 
-    def to_dict(self):
+    def to_dict(self, include_private_user=False):
+        from app.serializers.user import serialize_user_self
+
         return {
             'id': self.id,
             'user_id': self.user_id,
             'role_id': self.role_id,
             'role': self.role.to_dict() if self.role else None,
-            'status': self.status,
+            'status': 'verified' if self.status == 'approved' else self.status,
             'reason': self.reason,
+            'application_text': self.application_text or self.reason,
+            'proof_images': _json_list(self.proof_images),
+            'portfolio_links': _json_list(self.portfolio_links),
+            'contact_info': self.contact_info,
+            'extra_note': self.extra_note,
             'review_comment': self.review_comment,
             'reviewer_id': self.reviewer_id,
-            'user': self.user.to_dict() if self.user else None,
+            'user': (
+                serialize_user_self(self.user)
+                if self.user and include_private_user
+                else self.user.to_dict() if self.user else None
+            ),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
         }
 
 
-class UserDevice(Base):
-    """用户设备 - 存储极光推送 registrationId，支持多设备登录"""
-    __tablename__ = 'user_devices'
+class ModerationEvent(Base):
+    """内容审核元数据事件，不存正文、COS key 或第三方原始响应。"""
+    __tablename__ = 'moderation_events'
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
-    registration_id = Column(String(255), nullable=False, index=True)
-    platform = Column(String(20), default='android')  # android / ios / harmony
-    app_version = Column(String(50))
-    last_active_at = Column(DateTime, default=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    is_active = Column(Boolean, default=True)
+    provider = Column(String(50), nullable=False, index=True)
+    content_type = Column(String(20), nullable=False, index=True)
+    route_key = Column(String(120), nullable=True, index=True)
+    target_type = Column(String(80), nullable=True, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    decision = Column(String(20), nullable=False, index=True)
+    error_code = Column(String(50), nullable=True, index=True)
+    label = Column(String(80), nullable=True)
+    category = Column(String(80), nullable=True)
+    score = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AppRelease(Base):
+    """客户端发布版本和升级策略。"""
+    __tablename__ = 'app_releases'
+    __table_args__ = (
+        UniqueConstraint(
+            'platform', 'channel', 'build_number',
+            name='uq_app_releases_platform_channel_build',
+        ),
+        CheckConstraint(
+            "platform IN ('android','ios','windows','web')",
+            name='ck_app_releases_platform',
+        ),
+        CheckConstraint('build_number >= 1', name='ck_app_releases_build_number'),
+        CheckConstraint(
+            'minimum_supported_build_number >= 0 '
+            'AND minimum_supported_build_number <= build_number',
+            name='ck_app_releases_minimum_build',
+        ),
+        CheckConstraint(
+            "update_action IN ('download','store','refresh')",
+            name='ck_app_releases_update_action',
+        ),
+        Index('ix_app_releases_lookup', 'platform', 'channel', 'enabled', 'build_number'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    platform = Column(String(16), nullable=False, index=True)
+    channel = Column(String(32), nullable=False, default='stable', index=True)
+    version_name = Column(String(64), nullable=False)
+    build_number = Column(Integer, nullable=False)
+    minimum_supported_build_number = Column(Integer, nullable=False, default=0)
+    force_update = Column(Boolean, nullable=False, default=False)
+    update_action = Column(String(16), nullable=False, default='download')
+    download_url = Column(String(2048), nullable=False)
+    release_notes = Column(Text, nullable=True)
+    published_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    sha256 = Column(String(128), nullable=True)
+    file_size = Column(Integer, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def notes(self):
+        return _json_list(self.release_notes)
+
+    def to_public_dict(self, *, current_build_number: int) -> dict:
+        update_available = current_build_number < self.build_number
+        forced = update_available and (
+            self.force_update or
+            current_build_number < self.minimum_supported_build_number
+        )
+        return {
+            'platform': self.platform,
+            'channel': self.channel,
+            'release_id': self.id,
+            'latest_version': self.version_name,
+            'latest_build_number': self.build_number,
+            'minimum_supported_build_number': self.minimum_supported_build_number,
+            'update_available': update_available,
+            'force_update': forced,
+            'update_action': self.update_action if update_available else None,
+            'download_url': self.download_url if update_available else None,
+            'release_notes': self.notes() if update_available else [],
+            'published_at': _utc_z(self.published_at),
+            'sha256': self.sha256 if update_available else None,
+            'file_size': self.file_size if update_available else None,
+        }
+
+    def to_admin_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'platform': self.platform,
+            'channel': self.channel,
+            'version_name': self.version_name,
+            'build_number': self.build_number,
+            'minimum_supported_build_number': self.minimum_supported_build_number,
+            'force_update': self.force_update,
+            'update_action': self.update_action,
+            'download_url': self.download_url,
+            'release_notes': self.notes(),
+            'published_at': _utc_z(self.published_at),
+            'sha256': self.sha256,
+            'file_size': self.file_size,
+            'enabled': self.enabled,
+            'created_at': _utc_z(self.created_at),
+            'updated_at': _utc_z(self.updated_at),
+        }
+
+
+class AdminSetting(Base):
+    """管理员可修改的安全业务配置，不存密钥。"""
+    __tablename__ = 'admin_settings'
+    __table_args__ = (
+        UniqueConstraint('key', name='uq_admin_settings_key'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String(120), nullable=False, index=True)
+    value = Column(String(500), nullable=False)
+    updated_by = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
 
     def to_dict(self):
         return {
             'id': self.id,
-            'user_id': self.user_id,
-            'registration_id': self.registration_id,
-            'platform': self.platform,
-            'app_version': self.app_version,
-            'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
-            'is_active': self.is_active,
+            'key': self.key,
+            'value': self.value,
+            'updated_by': self.updated_by,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class AdminAuditLog(Base):
+    """管理员后台操作审计日志。"""
+    __tablename__ = 'admin_audit_logs'
+
+    id = Column(Integer, primary_key=True)
+    admin_user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    action = Column(String(80), nullable=False, index=True)
+    target_type = Column(String(50), nullable=False, index=True)
+    target_id = Column(String(80), nullable=True, index=True)
+    result = Column(String(20), nullable=False, default='success')
+    reason = Column(String(500), nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class EmailOtp(Base):

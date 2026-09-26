@@ -2,14 +2,19 @@
 屏蔽路由 - FastAPI 重构版
 """
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Block
+from app.models.models import User, Block, Conversation, Friendship
 from app.ws_manager import ws_manager
 
 router = APIRouter()
+
+
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("")
@@ -32,18 +37,54 @@ def block_user(
     existing = db.query(Block).filter(
         Block.blocker_id == user.id, Block.blocked_id == target_id
     ).first()
-    if existing:
-        return {"message": "User already blocked", "block": existing.to_dict()}
-
-    block = Block(blocker_id=user.id, blocked_id=target_id)
+    block = existing or Block(blocker_id=user.id, blocked_id=target_id)
     try:
-        db.add(block)
+        if existing is None:
+            db.add(block)
+        db.query(Friendship).filter(
+            ((Friendship.sender_id == user.id) & (Friendship.receiver_id == target_id))
+            | ((Friendship.sender_id == target_id) & (Friendship.receiver_id == user.id))
+        ).delete(synchronize_session=False)
         db.commit()
-        ws_manager.invalidate_blocked_cache(user.id)
-        return {"message": "User blocked successfully", "block": block.to_dict()}
+    except IntegrityError:
+        # A concurrent identical request may win the unique constraint. Treat it
+        # as idempotent, then still enforce relationship cleanup transactionally.
+        db.rollback()
+        block = db.query(Block).filter(
+            Block.blocker_id == user.id, Block.blocked_id == target_id
+        ).first()
+        if block is None:
+            raise HTTPException(status_code=500, detail="Failed to create block")
+        try:
+            db.query(Friendship).filter(
+                ((Friendship.sender_id == user.id) & (Friendship.receiver_id == target_id))
+                | ((Friendship.sender_id == target_id) & (Friendship.receiver_id == user.id))
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as cleanup_error:
+            db.rollback()
+            raise _internal_error()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
+
+    direct_conversation_ids = [
+        row.id
+        for row in db.query(Conversation.id).filter(
+            Conversation.type != 'community',
+            ((Conversation.user1_id == user.id) & (Conversation.user2_id == target_id))
+            | ((Conversation.user1_id == target_id) & (Conversation.user2_id == user.id)),
+        ).all()
+    ]
+    for affected_user_id in (user.id, target_id):
+        ws_manager.invalidate_blocked_cache(affected_user_id)
+        ws_manager.invalidate_user_caches(affected_user_id)
+        for conversation_id in direct_conversation_ids:
+            ws_manager.leave_conversation(affected_user_id, conversation_id)
+    return {
+        "message": "User already blocked" if existing else "User blocked successfully",
+        "block": block.to_dict(),
+    }
 
 
 @router.delete("/{user_id}")
@@ -57,16 +98,18 @@ def unblock_user(
         Block.blocker_id == user.id, Block.blocked_id == user_id
     ).first()
     if not block:
-        raise HTTPException(status_code=404, detail="User is not blocked")
+        return {"message": "User already unblocked"}
 
     try:
         db.delete(block)
         db.commit()
-        ws_manager.invalidate_blocked_cache(user.id)
+        for affected_user_id in (user.id, user_id):
+            ws_manager.invalidate_blocked_cache(affected_user_id)
+            ws_manager.invalidate_user_caches(affected_user_id)
         return {"message": "User unblocked successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/")

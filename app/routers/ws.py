@@ -10,16 +10,41 @@ WebSocket 端点 — 即时通讯协议
 连接后先收到 auth 消息鉴权，通过后自动推送 session_list + auth_result。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
-import json
 import logging
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.ws_manager import ws_manager
+from app.services.message_type_service import (
+    normalize_user_message_payload,
+    redact_unavailable_post_card,
+    redact_unavailable_post_cards_batch,
+)
+from app.services.notification_query_service import (
+    visible_notification_query,
+    visible_unread_count,
+)
+from app.services.quote_service import (
+    inject_quote_preview,
+    validate_quote,
+)
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
+from app.services.chat_read_state_service import (
+    can_access_conversation,
+    get_active_conversation_participant_ids,
+    get_community_unread_counts,
+    mark_community_conversation_read,
+)
+from app.services.moderation_route_helpers import (
+    message_text_payload_for_moderation,
+    moderate_route_fields,
+)
+from app.services.moderation_service import moderation_service
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +59,23 @@ AUTH_TIMEOUT = 15  # 连接后 15s 内必须发 auth，否则断开
 
 def _get_db_session() -> Session:
     return SessionLocal()
+
+
+def _should_send_message_push(db: Session, user_id: int) -> bool:
+    """Return whether an optional mobile chat alert may be attempted."""
+    return True
+
+
+def _get_message_push_targets(sender_id: int, participant_ids: list[int]) -> list[int]:
+    """Select non-sender recipients for optional mobile chat alerts."""
+    db = _get_db_session()
+    try:
+        return [
+            pid for pid in participant_ids
+            if pid != sender_id and _should_send_message_push(db, pid)
+        ]
+    finally:
+        db.close()
 
 
 def _get_conversation(db: Session, user_id: int, other_id: int):
@@ -60,7 +102,10 @@ def _get_conversation(db: Session, user_id: int, other_id: int):
 
 
 def _get_conversation_participant_ids(db: Session, conversation_id: int) -> list[int]:
-    from app.models.models import ConversationParticipant
+    from app.models.models import Conversation, ConversationParticipant
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if conversation:
+        return get_active_conversation_participant_ids(db, conversation)
     return [
         r.user_id
         for r in db.query(ConversationParticipant)
@@ -76,11 +121,7 @@ def _can_send_to_user(db: Session, from_user_id: int, to_user_id: int) -> bool:
     if not target:
         return False
 
-    blocked_by_to = ws_manager.get_blocked_user_ids(to_user_id)
-    if from_user_id in blocked_by_to:
-        return False
-    blocked_by_from = ws_manager.get_blocked_user_ids(from_user_id)
-    if to_user_id in blocked_by_from:
+    if has_block_between(db, from_user_id, to_user_id):
         return False
 
     is_friend = (
@@ -95,29 +136,64 @@ def _can_send_to_user(db: Session, from_user_id: int, to_user_id: int) -> bool:
     return is_friend is not None
 
 
-def _can_send_to_participants(from_user_id: int, participant_ids: list[int]) -> bool:
-    """Return whether a user can send to all other participants in an existing conversation."""
-    for participant_id in participant_ids:
-        if participant_id == from_user_id:
-            continue
-        if from_user_id in ws_manager.get_blocked_user_ids(participant_id):
-            return False
-        if participant_id in ws_manager.get_blocked_user_ids(from_user_id):
-            return False
-    return True
+def _get_dedup_state(user_id: int, client_msg_id: str) -> dict | None:
+    if not client_msg_id:
+        return None
+    db = _get_db_session()
+    try:
+        from app.models.models import WSAckDedup
+        row = db.query(WSAckDedup).filter(
+            WSAckDedup.user_id == user_id,
+            WSAckDedup.client_msg_id == client_msg_id,
+        ).first()
+        if not row:
+            return None
+        if row.processed_at and row.processed_at < datetime.utcnow() - timedelta(hours=24):
+            return None
+        return {"user_id": row.user_id, "message_id": row.message_id}
+    finally:
+        db.close()
+
+
+def _can_send_to_participants(
+    from_user_id: int,
+    participant_ids: list[int],
+    db: Session | None = None,
+) -> bool:
+    """Return whether a direct sender is isolated from any participant."""
+    owns_session = db is None
+    db = db or _get_db_session()
+    try:
+        blocked_ids = excluded_user_ids(db, from_user_id)
+        return not any(
+            participant_id != from_user_id and participant_id in blocked_ids
+            for participant_id in participant_ids
+        )
+    finally:
+        if owns_session:
+            db.close()
 
 
 def _validate_send_message_payload(payload: dict) -> dict | None:
     """Validate send_message payload. Returns {'code', 'error'} when invalid."""
     conversation_id = payload.get("conversation_id")
     receiver_id = payload.get("receiver_id")
-    message_type = payload.get("message_type", "text")
+    message_type = (payload.get("message_type") or "text").strip().lower()
     content = (payload.get("content") or "").strip()
+    client_msg_id = payload.get("client_msg_id")
 
+    if client_msg_id is not None and (not isinstance(client_msg_id, str) or len(client_msg_id) > 36):
+        return {"code": 400, "error": "Invalid client_msg_id"}
     if not conversation_id and not receiver_id:
         return {"code": 400, "error": "conversation_id or receiver_id required"}
     if message_type == "text" and not content:
         return {"code": 400, "error": "Content cannot be empty"}
+    if message_type == "post":
+        return None
+    try:
+        normalize_user_message_payload(payload, db=None)
+    except HTTPException as exc:
+        return {"code": exc.status_code, "error": exc.detail}
     return None
 
 
@@ -132,64 +208,68 @@ def _send_error_status(error: str) -> int:
 
 
 def _build_session_list(db: Session, user_id: int) -> list[dict]:
-    from sqlalchemy import func
+    from sqlalchemy import case, func
     from app.models.models import Conversation, ConversationParticipant, Message, User
     from app.models.community import CommunityMember
+    from app.services.quote_service import inject_quote_preview_batch
 
-    conversations = (
+    other_user_expr = case(
+        (Conversation.user1_id == user_id, Conversation.user2_id),
+        else_=Conversation.user1_id,
+    )
+    blocked_ids = excluded_user_ids(db, user_id)
+    query = (
         db.query(Conversation)
         .outerjoin(ConversationParticipant)
         .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
         .filter(
-            (ConversationParticipant.user_id == user_id)
+            (
+                (Conversation.type != 'community')
+                & (ConversationParticipant.user_id == user_id)
+            )
             | (
                 (Conversation.type == 'community')
                 & (CommunityMember.user_id == user_id)
                 & (CommunityMember.status == 'active')
             )
         )
-        .order_by(Conversation.last_message_at.desc())
-        .limit(50)
-        .all()
     )
+    if blocked_ids:
+        query = query.filter(
+            (Conversation.type == 'community') | ~other_user_expr.in_(blocked_ids)
+        )
+    conversations = query.order_by(Conversation.last_message_at.desc()).limit(50).all()
 
     if not conversations:
         return []
-
-    blocked_ids = ws_manager.get_blocked_user_ids(user_id)
-    if blocked_ids:
-        conversations = [
-            c for c in conversations
-            if c.type == 'community'
-            or (c.user1_id if c.user2_id == user_id else c.user2_id) not in blocked_ids
-        ]
-        if not conversations:
-            return []
 
     conv_ids = [c.id for c in conversations]
 
     unread_counts = dict(
         db.query(Message.conversation_id, func.count(Message.id))
-        .filter(Message.conversation_id.in_(conv_ids), Message.is_read == False, Message.sender_id != user_id)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .filter(
+            Message.conversation_id.in_(conv_ids),
+            Conversation.type != 'community',
+            Message.is_read == False,
+            Message.sender_id != user_id,
+        )
         .group_by(Message.conversation_id)
         .all()
     )
+    unread_counts.update(get_community_unread_counts(db, user_id, conv_ids))
 
-    last_messages = {}
+    last_messages = []
     for conv_id in conv_ids:
-        msg = db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.desc()).first()
+        msg = db.query(Message).filter(
+            Message.conversation_id == conv_id,
+            visible_user_predicate(user_id, Message.sender_id),
+        ).order_by(Message.created_at.desc()).first()
         if msg:
-            last_messages[conv_id] = {
-                'id': msg.id,
-                'conversation_id': msg.conversation_id,
-                'sender_id': msg.sender_id,
-                'content': msg.content,
-                'message_type': msg.message_type,
-                'media_url': msg.media_url,
-                'related_id': msg.related_id,
-                'is_read': msg.is_read,
-                'created_at': msg.created_at.isoformat() if msg.created_at else None,
-            }
+            last_messages.append(msg.to_dict())
+    inject_quote_preview_batch(db, last_messages, viewer_user_id=user_id)
+    redact_unavailable_post_cards_batch(db, last_messages, user_id)
+    last_message_map = {msg["conversation_id"]: msg for msg in last_messages}
 
     all_partner_ids = set()
     for conv in conversations:
@@ -214,7 +294,7 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
                 'community_id': conv.community_id,
                 'community_name': conv.community.name if conv.community else None,
                 'community_avatar': conv.community.avatar_url if conv.community else None,
-                'last_message': last_messages.get(conv.id),
+                'last_message': last_message_map.get(conv.id),
                 'unread_count': unread_counts.get(conv.id, 0),
                 'created_at': conv.created_at.isoformat() if conv.created_at else None,
                 'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
@@ -230,7 +310,7 @@ def _build_session_list(db: Session, user_id: int) -> list[dict]:
             'type': conv.type,
             'partner_id': partner_id,
             'partner': partners.get(partner_id),
-            'last_message': last_messages.get(conv.id),
+            'last_message': last_message_map.get(conv.id),
             'unread_count': unread_counts.get(conv.id, 0),
             'created_at': conv.created_at.isoformat() if conv.created_at else None,
             'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
@@ -267,6 +347,8 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
     """鉴权通过后的初始化流程：注册连接 + 推会话列表 + 加入房间 + 通知好友。返回 (auth_result_dict, conn_id)"""
     from app.models.models import Conversation, ConversationParticipant
 
+    was_raw_ws_offline = not ws_manager.is_connected(user_id)
+    was_product_online = await ws_manager.is_product_online_async(user_id)
     conn_id = await ws_manager.connect(user_id, websocket)
     loop = asyncio.get_event_loop()
 
@@ -279,9 +361,14 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
                 ((Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)),
                 Friendship.status == 'accepted'
             ).all()
+            blocked_ids = excluded_user_ids(db, user_id)
             return [
-                f.sender_id if f.receiver_id == user_id else f.receiver_id
-                for f in friends
+                friend_id
+                for friend_id in (
+                    f.sender_id if f.receiver_id == user_id else f.receiver_id
+                    for f in friends
+                )
+                if friend_id not in blocked_ids
             ]
         finally:
             db.close()
@@ -289,96 +376,79 @@ async def _do_auth_init(websocket: WebSocket, user_id: int, request_id: str = No
     friend_ids = await loop.run_in_executor(None, _get_friend_ids)
 
     # ── 会话列表 ──
-    sessions = ws_manager.get_cached_sessions(user_id)
-    if sessions is not None:
-        logger.info(f"[WS AUTH] uid={user_id} sessions=cache count={len(sessions)}")
-    else:
-        def _load():
-            db = _get_db_session()
-            try:
-                return _build_session_list(db, user_id)
-            finally:
-                db.close()
-        sessions = await loop.run_in_executor(None, _load)
-        ws_manager.set_cached_sessions(user_id, sessions)
-        logger.info(f"[WS AUTH] uid={user_id} sessions=db count={len(sessions)}")
+    # Authentication boundaries must revalidate against the database; cached
+    # sessions may predate a block created by either participant.
+    def _load():
+        db = _get_db_session()
+        try:
+            return _build_session_list(db, user_id)
+        finally:
+            db.close()
+    sessions = await loop.run_in_executor(None, _load)
+    ws_manager.set_cached_sessions(user_id, sessions)
+    logger.info(f"[WS AUTH] uid={user_id} sessions=db count={len(sessions)}")
 
     if sessions:
         await ws_manager.send_with_seq(user_id, "session_list", {"sessions": sessions})
 
     # ── 通知当前用户哪些好友已在线 ──
     # （friend_online 事件只会通知别人"你上线了"，但你自己看不到之前已在线的好友）
-    online_friend_ids = [fid for fid in friend_ids if ws_manager.is_connected(fid)]
+    online_friend_ids = []
+    for fid in friend_ids:
+        if await ws_manager.is_product_online_async(fid):
+            online_friend_ids.append(fid)
     if online_friend_ids:
         await ws_manager.send_with_seq(user_id, "online_friends", {"user_ids": online_friend_ids})
         logger.info(f"[WS AUTH] uid={user_id} online_friends={online_friend_ids}")
 
     # ── 自动加入会话房间 ──
-    conv_ids = ws_manager.get_cached_conv_ids(user_id)
-    if conv_ids is not None:
-        logger.debug(f"[WS AUTH] uid={user_id} conv_ids=cache count={len(conv_ids)}")
-    else:
-        def _load_convs():
-            db = _get_db_session()
-            try:
-                from app.models.community import CommunityMember
+    def _load_convs():
+        db = _get_db_session()
+        try:
+            from app.models.community import CommunityMember
 
-                return [
-                    c.id for c in
-                    db.query(Conversation)
-                    .outerjoin(ConversationParticipant)
-                    .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
-                    .filter(
-                        (ConversationParticipant.user_id == user_id)
-                        | (
-                            (Conversation.type == 'community')
-                            & (CommunityMember.user_id == user_id)
-                            & (CommunityMember.status == 'active')
-                        )
+            conversations = (
+                db.query(Conversation)
+                .outerjoin(ConversationParticipant)
+                .outerjoin(CommunityMember, CommunityMember.community_id == Conversation.community_id)
+                .filter(
+                    (ConversationParticipant.user_id == user_id)
+                    | (
+                        (Conversation.type == 'community')
+                        & (CommunityMember.user_id == user_id)
+                        & (CommunityMember.status == 'active')
                     )
-                    .all()
-                ]
-            finally:
-                db.close()
-        conv_ids = await loop.run_in_executor(None, _load_convs)
-        ws_manager.set_cached_conv_ids(user_id, conv_ids)
+                )
+                .all()
+            )
+            blocked_ids = excluded_user_ids(db, user_id)
+            return [
+                conversation.id
+                for conversation in conversations
+                if conversation.type == 'community'
+                or (
+                    conversation.user1_id
+                    if conversation.user2_id == user_id
+                    else conversation.user2_id
+                ) not in blocked_ids
+            ]
+        finally:
+            db.close()
+    conv_ids = await loop.run_in_executor(None, _load_convs)
+    ws_manager.set_cached_conv_ids(user_id, conv_ids)
 
     for cid in conv_ids:
         ws_manager.join_conversation(user_id, cid)
 
+    if not was_product_online:
+        presence_generation = ws_manager.bump_presence_generation(user_id)
+        await ws_manager.notify_community_presence(user_id, True, presence_generation)
+        await ws_manager._notify_friends_online(user_id, presence_generation)
+
     # ── 通知在线好友该用户已上线 ──
-    for fid in online_friend_ids:
-        # online_friend_ids 就是当前在线的好友，直接推送 friend_online
-        pass  # 已通过上方的 online_friends 推送，不需要重复
-    for fid in friend_ids:
-        if ws_manager.is_connected(fid):
-            await ws_manager.send_with_seq(fid, "friend_online", {"user_id": user_id})
+    # 产品级在线状态没有发生变化时，不重复广播 friend_online。
 
     return _make_response("auth_result", request_id, success=True, user_id=user_id), conn_id
-
-
-async def _notify_friends_online(websocket: WebSocket, user_id: int):
-    loop = asyncio.get_event_loop()
-
-    def _get_friend_ids():
-        db = _get_db_session()
-        try:
-            from app.models.models import Friendship
-            friends = db.query(Friendship).filter(
-                ((Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)),
-                Friendship.status == 'accepted'
-            ).all()
-            return [
-                f.sender_id if f.receiver_id == user_id else f.receiver_id
-                for f in friends
-            ]
-        finally:
-            db.close()
-
-    friend_ids = await loop.run_in_executor(None, _get_friend_ids)
-    for fid in friend_ids:
-        if ws_manager.is_connected(fid):
-            await ws_manager.send_with_seq(fid, "friend_online", {"user_id": user_id})
 
 
 # ================================================================
@@ -400,17 +470,51 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     related_id = payload.get("related_id")
     message_type = payload.get("message_type", "text")
     quote_message_id = payload.get("quote_message_id")
-    quote_preview = payload.get("quote_preview")
 
     validation_error = _validate_send_message_payload(payload)
     if validation_error:
         await _send_error(user_id, request_id, validation_error["code"], validation_error["error"])
         return
 
-    # 1. 幂等
-    if client_msg_id and await ws_manager.check_and_record_dedup(user_id, client_msg_id):
-        # 尝试获取首次处理时的 message_id，以便重复 ACK 也能携带
-        dedup_msg_id = await ws_manager.get_dedup_message_id(client_msg_id)
+    try:
+        dedup_state = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _get_dedup_state,
+            user_id,
+            client_msg_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "[WS DEDUP] lookup failed uid=%s error_type=%s",
+            user_id,
+            type(e).__name__,
+        )
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=503,
+            code="MODERATION_UNAVAILABLE",
+            retryable=True,
+            message="内容审核服务暂不可用，请稍后重试",
+        )
+        return
+    if dedup_state:
+        if dedup_state["user_id"] != user_id:
+            await _send_error(user_id, request_id, 403, "Cannot send message to this user")
+            return
+        dedup_msg_id = dedup_state["message_id"]
+        if dedup_msg_id is None:
+            await _send_failed_ack(
+                user_id,
+                request_id,
+                client_msg_id,
+                status=503,
+                code="MODERATION_UNAVAILABLE",
+                retryable=True,
+                message="内容审核服务暂不可用，请稍后重试",
+            )
+            return
         await ws_manager.send_raw(user_id, _make_response("ack", request_id,
             client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
             status=200, msg="duplicate"))
@@ -424,7 +528,54 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             })
         return
 
-    # 2. 持久化
+    def _authorize_destination():
+        db = _get_db_session()
+        try:
+            if conversation_id:
+                from app.models.models import Conversation
+                conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+                if not conv:
+                    return {"error": "Conversation not found"}
+                if not can_access_conversation(db, conv, user_id):
+                    return {"error": "Not a conversation participant"}
+                participant_ids = get_active_conversation_participant_ids(db, conv)
+                if conv.type != 'community' and not _can_send_to_participants(user_id, participant_ids, db=db):
+                    return {"error": "Cannot send message to this user"}
+            elif receiver_id and not _can_send_to_user(db, user_id, receiver_id):
+                return {"error": "Cannot send message to this user"}
+            return None
+        finally:
+            db.close()
+
+    auth_error = await asyncio.get_event_loop().run_in_executor(None, _authorize_destination)
+    if auth_error:
+        await _send_error(user_id, request_id, _send_error_status(auth_error["error"]), auth_error["error"])
+        return
+    try:
+        moderation_payload = message_text_payload_for_moderation(payload)
+        if moderation_payload:
+            moderate_route_fields(
+                moderation_service,
+                "WS send_message",
+                moderation_payload,
+                actor_user_id=user_id,
+                is_public=False,
+            )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        message = detail.get("message") or "内容审核失败"
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=exc.status_code,
+            code=detail.get("code") or "MODERATION_UNAVAILABLE",
+            retryable=bool(detail.get("retryable")),
+            message=message,
+        )
+        return
+
+    # 1. 持久化（与 client_msg_id 幂等记录共用事务）
     def _persist():
         db = _get_db_session()
         try:
@@ -432,15 +583,78 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
                 if not conv:
                     return {"error": "Conversation not found"}
-                participant_ids = _get_conversation_participant_ids(db, conversation_id)
-                if user_id not in participant_ids:
+                if not can_access_conversation(db, conv, user_id):
                     return {"error": "Not a conversation participant"}
-                if not _can_send_to_participants(user_id, participant_ids):
+                participant_ids = get_active_conversation_participant_ids(db, conv)
+                if conv.type != 'community' and not _can_send_to_participants(user_id, participant_ids, db=db):
                     return {"error": "Cannot send message to this user"}
             elif receiver_id:
                 if not _can_send_to_user(db, user_id, receiver_id):
                     return {"error": "Cannot send message to this user"}
                 conv = _get_conversation(db, user_id, receiver_id)
+
+            participant_ids = get_active_conversation_participant_ids(db, conv)
+            dedup_entry = None
+            if client_msg_id:
+                try:
+                    from app.models.models import WSAckDedup
+                    cutoff = datetime.utcnow() - timedelta(hours=24)
+                    db.query(WSAckDedup).filter(
+                        WSAckDedup.processed_at < cutoff,
+                    ).delete(synchronize_session=False)
+                    dedup_entry = db.query(WSAckDedup).filter(
+                        WSAckDedup.user_id == user_id,
+                        WSAckDedup.client_msg_id == client_msg_id,
+                    ).first()
+                    if dedup_entry:
+                        if dedup_entry.message_id is None:
+                            return {"dedup_unavailable": True}
+                        return {"duplicate_message_id": dedup_entry.message_id}
+                    dedup_entry = WSAckDedup(
+                        user_id=user_id,
+                        client_msg_id=client_msg_id,
+                        processed_at=datetime.utcnow(),
+                    )
+                    db.add(dedup_entry)
+                    db.flush()
+                except IntegrityError as e:
+                    logger.warning(
+                        "[WS DEDUP] transactional reservation raced uid=%s error_type=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+                    db.rollback()
+                    dedup_state = _get_dedup_state(user_id, client_msg_id)
+                    if dedup_state and dedup_state["message_id"] is not None:
+                        return {"duplicate_message_id": dedup_state["message_id"]}
+                    return {"dedup_unavailable": True}
+                except SQLAlchemyError as e:
+                    logger.warning(
+                        "[WS DEDUP] transactional reservation failed uid=%s error_type=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+                    db.rollback()
+                    return {"dedup_unavailable": True}
+
+            normalized = normalize_user_message_payload(
+                payload,
+                db,
+                viewer_user_id=user_id,
+                recipient_user_ids=participant_ids,
+                destination_community_id=(
+                    conv.community_id if conv.type == "community" else None
+                ),
+            )
+            content = normalized["content"]
+            media_url = normalized["media_url"]
+            related_id = normalized["related_id"]
+            message_type = normalized["message_type"]
+
+            # 校验并生成引用预览（后端实时生成，不入库 quote_preview）
+            quoted = validate_quote(db, conv.id, quote_message_id)
+            from app.services.quote_service import build_quote_preview
+            quote_preview = build_quote_preview(quoted)
 
             msg = Message(
                 conversation_id=conv.id,
@@ -449,48 +663,77 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
                 message_type=message_type,
                 media_url=media_url,
                 related_id=related_id,
-                quote_message_id=quote_message_id,
-                quote_preview=quote_preview,
+                client_msg_id=client_msg_id,
+                quote_message_id=quote_message_id if quoted else None,
                 is_read=False,
             )
             db.add(msg)
             conv.last_message_at = datetime.utcnow()
+            db.flush()
+            if dedup_entry is not None:
+                dedup_entry.message_id = msg.id
             db.commit()
             db.refresh(msg)
 
-            participant_ids = _get_conversation_participant_ids(db, conv.id)
-            unread_counts = {}
-            for pid in participant_ids:
-                unread_counts[pid] = (
-                    db.query(Message)
-                    .filter(
-                        Message.conversation_id == conv.id,
-                        Message.is_read == False,
-                        Message.sender_id != pid,
+            participant_ids = get_active_conversation_participant_ids(db, conv)
+            if conv.type == 'community':
+                blocked_ids = excluded_user_ids(db, user_id)
+                participant_ids = [
+                    participant_id
+                    for participant_id in participant_ids
+                    if participant_id == user_id or participant_id not in blocked_ids
+                ]
+                unread_counts = {
+                    pid: get_community_unread_counts(db, pid, [conv.id]).get(conv.id, 0)
+                    for pid in participant_ids
+                }
+            else:
+                unread_counts = {}
+                for pid in participant_ids:
+                    unread_counts[pid] = (
+                        db.query(Message)
+                        .filter(
+                            Message.conversation_id == conv.id,
+                            Message.is_read == False,
+                            Message.sender_id != pid,
+                        )
+                        .count()
                     )
-                    .count()
+
+            msg_dict = inject_quote_preview(
+                db,
+                msg.to_dict(),
+                viewer_user_id=user_id,
+            )
+            redact_unavailable_post_card(db, msg_dict, user_id)
+            participant_messages = {user_id: msg_dict}
+            for participant_id in participant_ids:
+                if participant_id == user_id:
+                    continue
+                participant_message = inject_quote_preview(
+                    db,
+                    msg.to_dict(),
+                    viewer_user_id=participant_id,
                 )
+                redact_unavailable_post_card(db, participant_message, participant_id)
+                participant_messages[participant_id] = participant_message
 
             return {
                 "conv_id": conv.id,
-                "msg": {
-                    "id": msg.id,
-                    "conversation_id": conv.id,
-                    "sender_id": user_id,
-                    "content": msg.content,
-                    "message_type": msg.message_type,
-                    "media_url": msg.media_url,
-                    "related_id": msg.related_id,
-                    "quote_message_id": msg.quote_message_id,
-                    "quote_preview": msg.quote_preview,
-                    "is_read": False,
-                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                },
+                "msg": msg_dict,
                 "participant_ids": participant_ids,
+                "participant_messages": participant_messages,
                 "unread_counts": unread_counts,
             }
+        except HTTPException as e:
+            db.rollback()
+            return {"error": e.detail, "code": e.status_code}
         except Exception as e:
-            logger.error(f"[WS SEND] uid={user_id} persist_error: {e}")
+            logger.error(
+                "[WS SEND] uid=%s persist_error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
             db.rollback()
             return {"error": "Message send failed"}
         finally:
@@ -500,7 +743,31 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
     result = await loop.run_in_executor(None, _persist)
 
     if isinstance(result, dict) and "error" in result:
-        await _send_error(user_id, request_id, _send_error_status(result["error"]), result["error"])
+        await _send_error(user_id, request_id, result.get("code", _send_error_status(result["error"])), result["error"])
+        return
+    if isinstance(result, dict) and result.get("dedup_unavailable"):
+        await _send_failed_ack(
+            user_id,
+            request_id,
+            client_msg_id,
+            status=503,
+            code="MODERATION_UNAVAILABLE",
+            retryable=True,
+            message="内容审核服务暂不可用，请稍后重试",
+        )
+        return
+    if isinstance(result, dict) and "duplicate_message_id" in result:
+        dedup_msg_id = result["duplicate_message_id"]
+        await ws_manager.send_raw(user_id, _make_response("ack", request_id,
+            client_msg_id=client_msg_id, server_seq=0, message_id=dedup_msg_id,
+            status=200, msg="duplicate"))
+        await ws_manager.send_raw(user_id, {
+            "type": "ack",
+            "clientMsgId": client_msg_id,
+            "client_msg_id": client_msg_id,
+            "message_id": dedup_msg_id,
+            "server_seq": 0,
+        })
         return
 
     # 3. ACK
@@ -518,15 +785,12 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
             "message_id": msg_id,
             "server_seq": ack_seq,
         })
-        # 记录 message_id 到 dedup 表，后续重复请求可回传
-        await ws_manager.update_dedup_message_id(client_msg_id, msg_id)
-
     # 4. 推送接收方（异步入队）
     push_items = []
     for pid in result["participant_ids"]:
         if pid != user_id:
             push_items.append((pid, "new_message", {
-                **result["msg"],
+                **result.get("participant_messages", {}).get(pid, result["msg"]),
                 "unread_count": result.get("unread_counts", {}).get(pid),
             }))
     if push_items:
@@ -552,16 +816,20 @@ async def _handle_send_message(websocket: WebSocket, user_id: int, data: dict):
         pass
     # #endregion
 
-    # 离线用户写入通知中心（在线用户已通过 WS 实时推送）
-    offline_targets = [
-        p for p in result["participant_ids"]
-        if p != user_id and not ws_manager.is_connected(p)
-    ]
-    if offline_targets:
+    # Chat messages belong to the conversation stream, not the interaction feed.
+    # Keep an optional mobile alert without creating a Notification row.
+    push_targets = _get_message_push_targets(user_id, result["participant_ids"])
+    if push_targets:
         from app.services.notification_service import NotificationService
         content = result["msg"].get("content") or ""
-        for pid in offline_targets:
-            NotificationService.notify_message(pid, user_id, content, result["conv_id"])
+        for pid in push_targets:
+            NotificationService.push_message(
+                pid,
+                user_id,
+                result["msg"]["id"],
+                content,
+                result["conv_id"],
+            )
 
     # 5. 失效缓存
     ws_manager.invalidate_participant_caches(result["participant_ids"])
@@ -607,6 +875,9 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
                 return {"error": "Message not found"}
             if msg.sender_id != user_id:
                 return {"error": "Cannot recall other's message"}
+            conv = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
+            if not can_access_conversation(db, conv, user_id):
+                return {"error": "Message not found", "code": 404}
             if msg.is_recalled:
                 return {"error": "Message already recalled"}
 
@@ -622,6 +893,12 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
 
             conv = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
             participant_ids = _get_conversation_participant_ids(db, msg.conversation_id) if conv else []
+            blocked_ids = excluded_user_ids(db, user_id)
+            participant_ids = [
+                participant_id
+                for participant_id in participant_ids
+                if participant_id == user_id or participant_id not in blocked_ids
+            ]
 
             return {
                 "msg_id": msg.id,
@@ -631,7 +908,11 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
                 "participant_ids": participant_ids,
             }
         except Exception as e:
-            logger.error(f"[WS RECALL] uid={user_id} error: {e}")
+            logger.error(
+                "[WS RECALL] uid=%s error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
             db.rollback()
             return {"error": "Recall failed"}
         finally:
@@ -652,6 +933,7 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
     recall_data = {
         "message_id": result["msg_id"],
         "conversation_id": result["conv_id"],
+        "sender_id": user_id,
         "is_recalled": True,
         "recalled_at": result["recalled_at"],
     }
@@ -664,7 +946,7 @@ async def _handle_recall_message(websocket: WebSocket, user_id: int, data: dict)
 
 async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload: dict):
     """会话标记已读"""
-    from app.models.models import Message, ConversationParticipant
+    from app.models.models import Message, Conversation, ConversationParticipant
 
     conv_id = payload.get("conversation_id")
     if not conv_id:
@@ -673,6 +955,10 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
     def _mark():
         db = _get_db_session()
         try:
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            if not conversation or not can_access_conversation(db, conversation, user_id):
+                return {"error": "Conversation not found"}
+
             participant = (
                 db.query(ConversationParticipant)
                 .filter(
@@ -682,15 +968,35 @@ async def _handle_conversation_read(websocket: WebSocket, user_id: int, payload:
                 .first()
             )
             if not participant:
-                return {"error": "Not a conversation participant"}
+                is_direct_member = (
+                    conversation.type != 'community'
+                    and user_id in (conversation.user1_id, conversation.user2_id)
+                )
+                if not is_direct_member:
+                    return {"error": "Not a conversation participant"}
+                participant = ConversationParticipant(
+                    conversation_id=conversation.id,
+                    user_id=user_id,
+                )
+                db.add(participant)
+                db.flush()
 
-            result = (
-                db.query(Message)
-                .filter(Message.conversation_id == conv_id, Message.sender_id != user_id, Message.is_read == False)
-                .update({"is_read": True})
-            )
+            if conversation.type == 'community':
+                result = mark_community_conversation_read(db, conv_id, user_id)
+            else:
+                result = (
+                    db.query(Message)
+                    .filter(Message.conversation_id == conv_id, Message.sender_id != user_id, Message.is_read == False)
+                    .update({"is_read": True})
+                )
             db.commit()
             participant_ids = _get_conversation_participant_ids(db, conv_id)
+            blocked_ids = excluded_user_ids(db, user_id)
+            participant_ids = [
+                participant_id
+                for participant_id in participant_ids
+                if participant_id == user_id or participant_id not in blocked_ids
+            ]
             return participant_ids if result > 0 else []
         finally:
             db.close()
@@ -722,28 +1028,31 @@ async def _handle_notifications_read(websocket: WebSocket, user_id: int, payload
     def _mark():
         db = _get_db_session()
         try:
-            query = db.query(Notification).filter(Notification.user_id == user_id)
+            query = visible_notification_query(db, user_id)
             if notif_ids:
                 query = query.filter(Notification.id.in_(notif_ids))
             elif not mark_all:
                 return None
             query.update({"is_read": True}, synchronize_session=False)
             db.commit()
-            unread_count = db.query(Notification).filter(
-                Notification.user_id == user_id,
-                Notification.is_read == False,
-            ).count()
-            return unread_count
+            return visible_unread_count(db, user_id)
         finally:
             db.close()
 
     loop = asyncio.get_event_loop()
     unread_count = await loop.run_in_executor(None, _mark)
     if unread_count is not None:
-        await ws_manager.send_with_seq(user_id, "notifications_read", {
-            "notification_ids": notif_ids,
-            "unread_count": unread_count,
-        })
+        try:
+            await ws_manager.send_with_seq(user_id, "notifications_read", {
+                "notification_ids": notif_ids,
+                "unread_count": unread_count,
+            })
+        except Exception as e:
+            logger.warning(
+                "Failed to deliver notifications_read event uid=%s error_type=%s",
+                user_id,
+                type(e).__name__,
+            )
 
 
 async def _handle_sync(websocket: WebSocket, user_id: int, data: dict):
@@ -782,30 +1091,10 @@ async def _handle_join(websocket: WebSocket, user_id: int, data: dict):
     def _check():
         db = _get_db_session()
         try:
-            from app.models.models import Conversation, ConversationParticipant
-            from app.models.community import CommunityMember
+            from app.models.models import Conversation
 
-            participant = (
-                db.query(ConversationParticipant)
-                .filter(ConversationParticipant.conversation_id == conv_id,
-                        ConversationParticipant.user_id == user_id)
-                .first()
-            )
-            if participant:
-                return True
-
-            community_member = (
-                db.query(Conversation)
-                .join(CommunityMember, CommunityMember.community_id == Conversation.community_id)
-                .filter(
-                    Conversation.id == conv_id,
-                    Conversation.type == 'community',
-                    CommunityMember.user_id == user_id,
-                    CommunityMember.status == 'active',
-                )
-                .first()
-            )
-            return community_member is not None
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            return can_access_conversation(db, conversation, user_id)
         finally:
             db.close()
 
@@ -828,6 +1117,19 @@ async def _handle_typing(websocket: WebSocket, user_id: int, data: dict, is_typi
     if not conv_id:
         return
 
+    def _can_access():
+        db = _get_db_session()
+        try:
+            from app.models.models import Conversation
+
+            conversation = db.query(Conversation).filter(Conversation.id == conv_id).first()
+            return can_access_conversation(db, conversation, user_id)
+        finally:
+            db.close()
+
+    if not await asyncio.get_event_loop().run_in_executor(None, _can_access):
+        return
+
     event_type = "typing" if is_typing else "stop_typing"
     await ws_manager.broadcast_to_conversation(
         conv_id,
@@ -836,7 +1138,32 @@ async def _handle_typing(websocket: WebSocket, user_id: int, data: dict, is_typi
             "data": {"conversation_id": conv_id, "user_id": user_id}
         }},
         exclude=user_id,
+        actor_user_id=user_id,
     )
+
+
+async def _send_failed_ack(
+    user_id: int,
+    request_id: str,
+    client_msg_id: str,
+    *,
+    status: int,
+    code: str,
+    retryable: bool,
+    message: str,
+):
+    """发送终态失败 ACK（仅在 async 上下文中调用）"""
+    await ws_manager.send_raw(user_id, {
+        "type": "ack",
+        "request_id": request_id,
+        "client_msg_id": client_msg_id,
+        "clientMsgId": client_msg_id,
+        "status": status,
+        "code": code,
+        "retryable": retryable,
+        "msg": message,
+        "message": message,
+    })
 
 
 async def _send_error(user_id: int, request_id: str, code: int, msg: str):
@@ -857,8 +1184,7 @@ async def websocket_endpoint(websocket: WebSocket):
     3. 服务端验证 → 推 session_list → 推 auth_result
     4. 进入正常收发
     """
-    headers = dict(websocket.headers)
-    print(f"[WS-DEBUG] incoming: headers={headers}, client={websocket.client}")
+    logger.debug("[WS] incoming client=%s", websocket.client)
     await websocket.accept()
     user_id = None
     conn_id = None
@@ -894,8 +1220,14 @@ async def websocket_endpoint(websocket: WebSocket):
             return
 
         from app.core.auth_core import verify_token, AuthError
+        from app.services.moderation_errors import AppContractError
         try:
             user = verify_token(token)
+        except AppContractError as e:
+            await websocket.send_json(_make_response("auth_result", request_id,
+                success=False, code=e.error_code.value, msg=e.public_message))
+            await websocket.close(code=4001, reason=e.error_code.value)
+            return
         except AuthError as e:
             await websocket.send_json(_make_response("auth_result", request_id,
                 success=False, code=4001, msg=e.message))
@@ -914,7 +1246,16 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type", "")
-            logger.debug(f"[WS RECV] uid={user_id} {msg_type} {json.dumps(data, ensure_ascii=False)}")
+            logger.debug(
+                "[WS RECV] uid=%s type=%s has_payload=%s",
+                user_id,
+                msg_type,
+                isinstance(data.get("payload"), dict),
+            )
+
+            if msg_type == "auth":
+                logger.debug(f"[WS AUTH] duplicate auth ignored uid={user_id}")
+                continue
 
             if msg_type == "ping":
                 ws_manager.heartbeat(conn_id)
@@ -972,6 +1313,11 @@ async def websocket_endpoint(websocket: WebSocket):
             await ws_manager.disconnect(user_id, conn_id)
             logger.info(f"[WS -] uid={user_id} cid={conn_id[:8] if conn_id else '?'} kicked_by_dup")
     except Exception as e:
-        logger.error(f"[WS ERROR] uid={user_id} cid={conn_id[:8] if conn_id else '?'} {e}", exc_info=True)
+        logger.error(
+            "[WS ERROR] uid=%s cid=%s error_type=%s",
+            user_id,
+            conn_id[:8] if conn_id else "?",
+            type(e).__name__,
+        )
         if user_id is not None and conn_id:
             await ws_manager.disconnect(user_id, conn_id)

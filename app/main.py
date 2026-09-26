@@ -8,16 +8,20 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import os
 import time
 
 from app.core.config import Config
 from app.database import init_db
+from app.services.local_text_moderator import LocalTextModerator
+from app.services.moderation_service import moderation_service
+from app.services.moderation_snapshot import poll_snapshots, snapshot_store
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
-from app.routers import push
-from app.routers import communities
+from app.routers import communities, push, admin_panel, app_updates, deployments, admin_bots, open_api
+import app.models.deployment  # Register deployment tables with the shared Base.
 
 # 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
 # 通过 LOG_LEVEL 环境变量覆盖（DEBUG/INFO/WARNING）。
@@ -39,6 +43,10 @@ for _ws_logger_name in ['app.routers.ws', 'app.ws_manager']:
 
 logger = logging.getLogger(__name__)
 
+moderation_service.local_moderator = LocalTextModerator(
+    snapshot_store.current_snapshot
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,8 +56,47 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables initialized")
     logger.info("WS endpoint: ws://0.0.0.0:5000/ws")
     logger.info("WS logging: enabled (CONNECT/DISCONNECT/RECV/SEND_SEQ/SEND_RAW)")
-    yield
-    logger.info("Shutting down NanTuPy server...")
+    stop = asyncio.Event()
+    initial_refresh = asyncio.create_task(
+        asyncio.to_thread(snapshot_store.refresh, True)
+    )
+    startup_cancellation = None
+    while not initial_refresh.done():
+        try:
+            await asyncio.wait({initial_refresh})
+        except asyncio.CancelledError as error:
+            if startup_cancellation is None:
+                startup_cancellation = error
+    try:
+        initial_refresh.result()
+    except Exception:
+        logger.error("moderation_snapshot_initial_load_failed")
+    if startup_cancellation is not None:
+        raise startup_cancellation
+
+    poller = asyncio.create_task(poll_snapshots(snapshot_store, stop))
+    body_error = None
+    try:
+        yield
+    except BaseException as error:
+        body_error = error
+        raise
+    finally:
+        stop.set()
+        shutdown_cancellation = None
+        while not poller.done():
+            try:
+                await asyncio.wait({poller})
+            except asyncio.CancelledError as error:
+                if shutdown_cancellation is None:
+                    shutdown_cancellation = error
+        try:
+            poller.result()
+        except BaseException:
+            logger.error("moderation_snapshot_poller_failed")
+        logger.info("Shutting down NanTuPy server...")
+        if body_error is None and shutdown_cancellation is not None:
+            raise shutdown_cancellation
 
 
 # 安全：生产环境通过 HIDE_API_DOCS=1 关闭 openapi.json / docs / redoc，
@@ -102,7 +149,7 @@ async def log_request_timing(request, call_next):
     finally:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         path = request.url.path
-        if path.startswith('/api/'):
+        if path.startswith('/api/') or path.startswith('/nontoOpenApi'):
             log_payload = {
                 'method': request.method,
                 'path': path,
@@ -121,7 +168,12 @@ async def add_security_headers(request, call_next):
     response = await call_next(request)
     # 跳过 API 路由和 OPTIONS 预检
     path = request.url.path
-    if request.method == "OPTIONS" or path.startswith("/api/") or path.startswith("/ws"):
+    if (
+        request.method == "OPTIONS"
+        or path.startswith("/api/")
+        or path.startswith("/nontoOpenApi")
+        or path.startswith("/ws")
+    ):
         return response
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
@@ -144,10 +196,17 @@ app.include_router(blocks.router, prefix="/api/blocks", tags=["Blocks"])
 app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
 app.include_router(health.router, prefix="", tags=["Health"])
 app.include_router(admin.router, prefix="", tags=["Admin"])
+app.include_router(admin.moderation_router)
+app.include_router(admin_panel.router)
 app.include_router(comic.router, prefix="/api/comic", tags=["Comic"])
 app.include_router(roles.router, tags=["Roles"])
-app.include_router(push.router, prefix="/api/push", tags=["Push"])
 app.include_router(communities.router, prefix="/api/communities", tags=["Communities"])
+app.include_router(push.router, prefix="/api/push", tags=["Push"])
+app.include_router(app_updates.public_router)
+app.include_router(app_updates.admin_router)
+app.include_router(deployments.router)
+app.include_router(admin_bots.router)
+app.include_router(open_api.router, prefix="/nontoOpenApi", tags=["OpenAPI"])
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 
@@ -162,6 +221,7 @@ async def root():
             "posts": "/api/posts",
             "friends": "/api/friends",
             "chat": "/api/chat",
+            "open_api": "/nontoOpenApi",
         }
     }
 

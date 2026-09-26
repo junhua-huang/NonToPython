@@ -4,6 +4,20 @@ NanTuPy - FastAPI 应用配置
 import os
 from datetime import timedelta
 
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw_value = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
 class Config:
     # 安全密钥 - 从环境变量读取
     SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
@@ -53,6 +67,15 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
     POSTS_PER_PAGE = 20
 
+    # 机器人/测试账号批量供应：管理员通过 /api/admin/bots 生成受控机器人身份的上限。
+    # 仅用于自运营测试/课程作业场景，机器人由平台生成合成邮箱，不读取第三方凭据。
+    @classmethod
+    def get_max_bot_accounts(cls) -> int:
+        try:
+            return int(os.environ.get('MAX_BOT_ACCOUNTS', '5000'))
+        except (TypeError, ValueError):
+            return 5000
+
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
     UPLOAD_FOLDER = os.path.join(BASE_DIR, '..', 'uploads')
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024
@@ -67,12 +90,19 @@ class Config:
     COS_BUCKET = os.environ.get('COS_BUCKET', '')
     COS_BUCKET_NAME = os.environ.get('COS_BUCKET_NAME', os.environ.get('COS_BUCKET', ''))
     COS_DOMAIN = os.environ.get('COS_DOMAIN', '')
+    COS_CI_IMAGE_AUDIT_ENABLED = os.environ.get('COS_CI_IMAGE_AUDIT_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+    COS_CI_IMAGE_AUDIT_BIZ_TYPE = os.environ.get('COS_CI_IMAGE_AUDIT_BIZ_TYPE', '')
+    COS_CI_IMAGE_AUDIT_TIMEOUT_SECONDS = _env_float('COS_CI_IMAGE_AUDIT_TIMEOUT_SECONDS', 8.0, minimum=1.0, maximum=30.0)
+    COS_CI_IMAGE_AUDIT_LARGE_IMAGE_DETECT = os.environ.get('COS_CI_IMAGE_AUDIT_LARGE_IMAGE_DETECT', '0')
 
-    # 极光推送 (JPush) 配置 - Master Secret 仅服务端使用，不可下发到客户端
-    JPUSH_APP_KEY = os.environ.get('JPUSH_APP_KEY', '')
-    JPUSH_MASTER_SECRET = os.environ.get('JPUSH_MASTER_SECRET', '')
-    # iOS: true=生产环境 APNs，false=开发环境；Android 忽略此参数
-    JPUSH_PRODUCTION = os.environ.get('JPUSH_PRODUCTION', 'false').lower() == 'true'
+    # 阿里云移动推送配置 - 仅从环境变量读取，禁止在代码中写入真实密钥
+    ALIYUN_ACCESS_KEY_ID = os.environ.get('ALIYUN_ACCESS_KEY_ID', '')
+    ALIYUN_ACCESS_KEY_SECRET = os.environ.get('ALIYUN_ACCESS_KEY_SECRET', '')
+    ALIYUN_PUSH_APP_KEY_ANDROID = os.environ.get('ALIYUN_PUSH_APP_KEY_ANDROID', '')
+    ALIYUN_PUSH_ENDPOINT = os.environ.get('ALIYUN_PUSH_ENDPOINT', 'https://cloudpush.aliyuncs.com')
+    ALIYUN_PUSH_REGION_ID = os.environ.get('ALIYUN_PUSH_REGION_ID', 'cn-hangzhou')
+    ALIYUN_PUSH_ANDROID_ACTIVITY = os.environ.get('ALIYUN_PUSH_ANDROID_ACTIVITY', 'com.nonto.nonto.MainActivity')
+    ALIYUN_PUSH_ANDROID_CHANNEL_ID = os.environ.get('ALIYUN_PUSH_ANDROID_CHANNEL_ID', 'nonto_message_alerts')
 
     # 邮件 (SMTP) 配置 - 用于发送邮箱验证码
     # QQ 邮箱用 SSL 465 端口，授权码非登录密码
@@ -90,6 +120,6 @@ class Config:
     OTP_EXPIRE_MINUTES = 10               # 验证码有效期 10 分钟
     LOGIN_FAIL_THRESHOLD = 5              # 登录失败 N 次后要求邮箱验证码
 
-    DEBUG = True
+    DEBUG = os.environ.get('DEBUG', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
     TESTING = False
     CORS_HEADERS = 'Content-Type'

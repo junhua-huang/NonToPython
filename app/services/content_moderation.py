@@ -11,7 +11,6 @@
 import re
 import logging
 from typing import Dict, List
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +97,11 @@ class ContentModeration:
             reasons.append("inappropriate")
             passed, filtered_text, hit_words = content_filter.filter_content(text)
             if hit_words:
-                logger.debug("ContentModeration: sensitive words found: %s", hit_words)
+                rule_count = len(hit_words)
+                logger.debug(
+                    "content_moderation_legacy_filter_hit rule_count=%s",
+                    rule_count,
+                )
 
         # 2. 垃圾信息检测
         if cls.contains_spam(text):
@@ -238,14 +241,13 @@ class ContentModeration:
             original_text: 原始文本内容
             reasons: 拦截原因列表
         """
+        del original_text
+        rule_count = len(reasons)
         logger.warning(
-            "CONTENT_MODERATION_BLOCKED | time=%s | user_id=%s | content_type=%s | "
-            "reasons=%s | text_preview=%s",
-            datetime.utcnow().isoformat(),
+            "content_moderation_rejected user_id=%s content_type=%s rule_count=%s",
             user_id or 'anonymous',
             content_type,
-            reasons,
-            original_text[:200]
+            rule_count,
         )
 
 

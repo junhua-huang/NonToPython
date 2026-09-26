@@ -1,6 +1,8 @@
 """
 话题路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 
@@ -8,8 +10,57 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_content_manager
 from app.models.models import User, Topic, topic_followers
 from app.services.topic_service import TopicService
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
+from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_TOPIC_MODERATION_TARGETS = {
+    "POST /api/topics": "topic",
+    "PUT /api/topics/{topic_id}": "topic_edit",
+}
+
+
+def _moderate_topic_fields(
+    route_key: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if route_key not in _TOPIC_MODERATION_TARGETS or route_key not in MODERATED_TEXT_FIELDS:
+        raise to_http_exception(ModerationUnavailable(ValueError("unknown moderation route")))
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    fields = {}
+    for field in MODERATED_TEXT_FIELDS[route_key]:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=_TOPIC_MODERATION_TARGETS[route_key],
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 @router.get("/")
@@ -32,7 +83,7 @@ def get_trending_topics(
     db: Session = Depends(get_db),
 ):
     """获取热门话题"""
-    trending = TopicService.get_trending_topics(db, limit=limit)
+    trending = TopicService.get_trending_topics(db, limit=limit, current_user_id=user.id)
     topic_ids = [topic["id"] for topic in trending]
     followed_topic_ids = set()
     if topic_ids:
@@ -177,7 +228,13 @@ def get_topic_posts(
     db: Session = Depends(get_db),
 ):
     """获取话题下的帖子"""
-    results = TopicService.get_topic_posts(db, topic_id=topic_id, page=page, per_page=per_page)
+    results = TopicService.get_topic_posts(
+        db,
+        topic_id=topic_id,
+        page=page,
+        per_page=per_page,
+        current_user_id=user.id,
+    )
     return results
 
 
@@ -195,6 +252,12 @@ def create_topic(
 
     if not name:
         raise HTTPException(status_code=400, detail="Topic name is required")
+    _moderate_topic_fields(
+        "POST /api/topics",
+        {"name": name, "description": description},
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     existing = TopicService.get_topic_by_name(db, name)
     if existing:
@@ -254,6 +317,12 @@ def update_topic(
     topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
+    _moderate_topic_fields(
+        "PUT /api/topics/{topic_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+    )
 
     if "description" in payload:
         topic.description = payload["description"]
@@ -267,7 +336,13 @@ def update_topic(
         return {"message": "Topic updated successfully", "topic": topic.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update topic failed topic_id=%s user_id=%s error_type=%s",
+            topic_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the topic")
 
 
 @router.delete("/{topic_id}")
@@ -290,5 +365,11 @@ def delete_topic(
         return {"message": "Topic deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete topic failed topic_id=%s user_id=%s error_type=%s",
+            topic_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the topic")
 

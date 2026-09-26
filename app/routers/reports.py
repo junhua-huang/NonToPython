@@ -1,17 +1,55 @@
 """
 举报路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Report
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_REPORT_MODERATION_ROUTES = (
+    "POST /api/reports",
+    "POST /api/reports/post",
+    "POST /api/reports/comment",
+    "POST /api/reports/user",
+)
+
+
+def _moderate_report_reason(route_key: str, reason: object, *, actor_user_id: int):
+    if route_key not in _REPORT_MODERATION_ROUTES:
+        raise to_http_exception(ModerationUnavailable(ValueError("unknown moderation route")))
+    if reason is None:
+        return
+    if not isinstance(reason, str):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+    if not reason.strip():
+        return
+    try:
+        moderation_service.moderate_fields(
+            {"reason": reason},
+            ModerationContext(
+                target_type="report_reason",
+                actor_user_id=actor_user_id,
+                is_public=False,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
 
 
 def _handle_report(
+    route_key: str,
     report_type: str,
     target_id: int,
     reason: str,
@@ -25,6 +63,7 @@ def _handle_report(
         raise HTTPException(status_code=400, detail="Invalid report type")
     if not target_id:
         raise HTTPException(status_code=400, detail="Target ID is required")
+    _moderate_report_reason(route_key, reason, actor_user_id=user.id)
 
     existing = db.query(Report).filter(
         Report.reporter_id == user.id,
@@ -46,7 +85,13 @@ def _handle_report(
         return {"message": "Report submitted successfully", "report": report.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Submit report failed user_id=%s target_type=%s error_type=%s",
+            user.id,
+            report_type,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while submitting the report")
 
 
 @router.post("")
@@ -57,6 +102,7 @@ def submit_report(
 ):
     """提交举报（统一入口：{type, target_id, reason}）"""
     return _handle_report(
+        route_key="POST /api/reports",
         report_type=payload.get("type", ""),
         target_id=payload.get("target_id"),
         reason=payload.get("reason", ""),
@@ -73,6 +119,7 @@ def report_post(
 ):
     """举报帖子（别名：前端 POST /reports/post {post_id, reason}）"""
     return _handle_report(
+        route_key="POST /api/reports/post",
         report_type="post",
         target_id=payload.get("post_id"),
         reason=payload.get("reason", ""),
@@ -89,6 +136,7 @@ def report_comment(
 ):
     """举报评论（别名：前端 POST /reports/comment {comment_id, reason}）"""
     return _handle_report(
+        route_key="POST /api/reports/comment",
         report_type="comment",
         target_id=payload.get("comment_id"),
         reason=payload.get("reason", ""),
@@ -105,6 +153,7 @@ def report_user(
 ):
     """举报用户（别名：前端 POST /reports/user {user_id, reason}）"""
     return _handle_report(
+        route_key="POST /api/reports/user",
         report_type="user",
         target_id=payload.get("user_id"),
         reason=payload.get("reason", ""),

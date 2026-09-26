@@ -11,9 +11,14 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Friendship, Conversation, ConversationParticipant, Message
 from app.services.notification_service import NotificationService
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
 from app.ws_manager import ws_manager
 
 router = APIRouter()
+
+
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/request")
@@ -32,7 +37,7 @@ def send_friend_request(
         raise HTTPException(status_code=400, detail="Cannot add yourself as a friend")
 
     receiver = db.query(User).filter(User.id == receiver_id).first()
-    if not receiver:
+    if not receiver or has_block_between(db, current_user_id, receiver_id):
         raise HTTPException(status_code=404, detail="User not found")
 
     if receiver.allow_friend_requests == "none":
@@ -118,7 +123,7 @@ def send_friend_request(
         return {"message": "Friend request sent successfully", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.post("/request/{request_id}/accept")
@@ -129,7 +134,7 @@ def accept_friend_request(
 ):
     """接受好友请求"""
     friendship = db.query(Friendship).filter(Friendship.id == request_id).first()
-    if not friendship:
+    if not friendship or has_block_between(db, friendship.sender_id, friendship.receiver_id):
         raise HTTPException(status_code=404, detail="Friend request not found")
     if friendship.receiver_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -178,7 +183,7 @@ def accept_friend_request(
         return {"message": "Friend request accepted", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.post("/request/{request_id}/reject")
@@ -189,7 +194,7 @@ def reject_friend_request(
 ):
     """拒绝好友请求"""
     friendship = db.query(Friendship).filter(Friendship.id == request_id).first()
-    if not friendship:
+    if not friendship or has_block_between(db, friendship.sender_id, friendship.receiver_id):
         raise HTTPException(status_code=404, detail="Friend request not found")
     if friendship.receiver_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -202,7 +207,7 @@ def reject_friend_request(
         return {"message": "Friend request rejected", "friendship": friendship.to_dict()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.delete("/request/{request_id}")
@@ -213,7 +218,7 @@ def cancel_friend_request(
 ):
     """取消好友请求"""
     friendship = db.query(Friendship).filter(Friendship.id == request_id).first()
-    if not friendship:
+    if not friendship or has_block_between(db, friendship.sender_id, friendship.receiver_id):
         raise HTTPException(status_code=404, detail="Friend request not found")
     if friendship.sender_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -226,7 +231,7 @@ def cancel_friend_request(
         return {"message": "Friend request cancelled"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/")
@@ -235,10 +240,17 @@ def get_friends(
     db: Session = Depends(get_db),
 ):
     """获取好友列表"""
+    blocked_ids = excluded_user_ids(db, user.id)
     friendships = db.query(Friendship).filter(
         ((Friendship.sender_id == user.id) | (Friendship.receiver_id == user.id))
         & (Friendship.status == "accepted")
-    ).all()
+    )
+    if blocked_ids:
+        friendships = friendships.filter(
+            ~Friendship.sender_id.in_(blocked_ids),
+            ~Friendship.receiver_id.in_(blocked_ids),
+        )
+    friendships = friendships.all()
 
     friends = []
     for f in friendships:
@@ -253,12 +265,18 @@ def get_pending_requests(
     db: Session = Depends(get_db),
 ):
     """获取待处理的好友请求"""
-    received = db.query(Friendship).filter(
+    blocked_ids = excluded_user_ids(db, user.id)
+    received_query = db.query(Friendship).filter(
         Friendship.receiver_id == user.id, Friendship.status == "pending"
-    ).all()
-    sent = db.query(Friendship).filter(
+    )
+    sent_query = db.query(Friendship).filter(
         Friendship.sender_id == user.id, Friendship.status == "pending"
-    ).all()
+    )
+    if blocked_ids:
+        received_query = received_query.filter(~Friendship.sender_id.in_(blocked_ids))
+        sent_query = sent_query.filter(~Friendship.receiver_id.in_(blocked_ids))
+    received = received_query.all()
+    sent = sent_query.all()
 
     return {
         "received": [r.to_dict() for r in received],
@@ -275,7 +293,9 @@ def get_sent_requests(
 ):
     """获取我发起的好友申请列表（含对方用户信息）"""
     sent = db.query(Friendship).filter(
-        Friendship.sender_id == user.id, Friendship.status == "pending"
+        Friendship.sender_id == user.id,
+        Friendship.status == "pending",
+        visible_user_predicate(user.id, Friendship.receiver_id),
     ).order_by(Friendship.created_at.desc()).all()
 
     results = []
@@ -297,7 +317,9 @@ def get_received_requests(
 ):
     """获取向我发起的好友申请列表（含对方用户信息）"""
     received = db.query(Friendship).filter(
-        Friendship.receiver_id == user.id, Friendship.status == "pending"
+        Friendship.receiver_id == user.id,
+        Friendship.status == "pending",
+        visible_user_predicate(user.id, Friendship.sender_id),
     ).order_by(Friendship.created_at.desc()).all()
 
     results = []
@@ -333,7 +355,7 @@ def remove_friend(
         return {"message": "Friend removed successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/status/{user_id}")
@@ -343,6 +365,8 @@ def check_friendship_status(
     db: Session = Depends(get_db),
 ):
     """检查与某用户的好友关系状态"""
+    if has_block_between(db, user.id, user_id):
+        return {"status": "none"}
     friendship = db.query(Friendship).filter(
         ((Friendship.sender_id == user.id) & (Friendship.receiver_id == user_id))
         | ((Friendship.sender_id == user_id) & (Friendship.receiver_id == user.id))
@@ -360,7 +384,7 @@ def get_user_friend_count(
 ):
     """获取指定用户的好友数量"""
     target = db.query(User).filter(User.id == user_id).first()
-    if not target:
+    if not target or has_block_between(db, user.id, user_id):
         raise HTTPException(status_code=404, detail="User not found")
 
     count = db.query(Friendship).filter(
@@ -386,7 +410,9 @@ def get_friend_recommendations(
     related_ids.add(user.id)
 
     candidates = db.query(User).filter(
-        User.id.notin_(related_ids), User.is_active == True
+        User.id.notin_(related_ids),
+        User.is_active == True,
+        visible_user_predicate(user.id, User.id),
     ).all()
 
     if not candidates:

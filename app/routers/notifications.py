@@ -1,16 +1,26 @@
 """
 通知路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import User, Notification
+from app.services.notification_query_service import (
+    visible_notification_query,
+    visible_unread_count,
+)
 from app.ws_manager import ws_manager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _internal_error() -> HTTPException:
+    return HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/")
@@ -22,16 +32,7 @@ def get_notifications(
     db: Session = Depends(get_db),
 ):
     """获取当前用户的通知列表"""
-    # 屏蔽检查：过滤已屏蔽用户发送的通知
-    from app.ws_manager import ws_manager
-    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
-
-    query = db.query(Notification).filter(Notification.user_id == user.id)
-    if blocked_ids:
-        query = query.filter(or_(
-            Notification.sender_id == None,
-            ~Notification.sender_id.in_(blocked_ids),
-        ))
+    query = visible_notification_query(db, user.id)
     if unread_only:
         query = query.filter(Notification.is_read == False)
     query = query.order_by(Notification.created_at.desc())
@@ -53,11 +54,7 @@ def get_notifications(
             for u in sender_users
         }
 
-    unread_count = (
-        db.query(Notification)
-        .filter(Notification.user_id == user.id, Notification.is_read == False)
-        .count()
-    )
+    unread_count = visible_unread_count(db, user.id)
 
     return {
         "notifications": [
@@ -79,16 +76,7 @@ def get_unread_count(
     db: Session = Depends(get_db),
 ):
     """获取未读通知数量"""
-    from app.ws_manager import ws_manager
-    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
-    query = db.query(Notification).filter(Notification.user_id == user.id, Notification.is_read == False)
-    if blocked_ids:
-        query = query.filter(or_(
-            Notification.sender_id == None,
-            ~Notification.sender_id.in_(blocked_ids),
-        ))
-    count = query.count()
-    return {"unread_count": count}
+    return {"unread_count": visible_unread_count(db, user.id)}
 
 
 @router.post("/{notification_id}/read")
@@ -98,31 +86,40 @@ async def mark_as_read(
     db: Session = Depends(get_db),
 ):
     """标记单个通知为已读"""
-    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    notification = visible_notification_query(db, user.id).filter(
+        Notification.id == notification_id
+    ).first()
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
-    if notification.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
     notification.is_read = True
     try:
+        db.flush()
+        unread_count = visible_unread_count(db, user.id)
+        notification_payload = notification.to_dict()
         db.commit()
+    except Exception as e:
+        db.rollback()
+        raise _internal_error()
 
-        # --- WebSocket 实时推送 ---
-        unread_count = (
-            db.query(Notification)
-            .filter(Notification.user_id == user.id, Notification.is_read == False)
-            .count()
-        )
+    try:
         await ws_manager.send_with_seq(user.id, "notifications_read", {
             "notification_ids": [notification_id],
             "unread_count": unread_count,
         })
+    except Exception:
+        logger.warning(
+            "Failed to deliver notifications_read event uid=%s notification_id=%s",
+            user.id,
+            notification_id,
+            exc_info=True,
+        )
 
-        return {"message": "Notification marked as read", "notification": notification.to_dict(), "unread_count": unread_count}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "message": "Notification marked as read",
+        "notification": notification_payload,
+        "unread_count": unread_count,
+    }
 
 
 @router.post("/mark-all-read")
@@ -132,20 +129,42 @@ async def mark_all_as_read(
 ):
     """标记所有通知为已读"""
     try:
-        db.query(Notification).filter(
-            Notification.user_id == user.id, Notification.is_read == False
-        ).update({"is_read": True})
+        visible_notification_query(db, user.id).filter(
+            Notification.is_read == False
+        ).update({"is_read": True}, synchronize_session=False)
+        unread_count = visible_unread_count(db, user.id)
         db.commit()
-
-        # --- WebSocket 实时推送 ---
-        await ws_manager.send_with_seq(user.id, "notifications_read", {
-            "unread_count": 0,
-        })
-
-        return {"message": "All notifications marked as read", "unread_count": 0}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
+
+    try:
+        await ws_manager.send_with_seq(user.id, "notifications_read", {
+            "unread_count": unread_count,
+        })
+    except Exception:
+        logger.warning(
+            "Failed to deliver notifications_read event uid=%s after mark-all",
+            user.id,
+            exc_info=True,
+        )
+
+    return {"message": "All notifications marked as read", "unread_count": unread_count}
+
+
+@router.delete("/clear-all")
+def clear_all_notifications(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """清空当前可见通知，保留被屏蔽发送者的隐藏通知。"""
+    try:
+        visible_notification_query(db, user.id).delete(synchronize_session=False)
+        db.commit()
+        return {"message": "All notifications cleared"}
+    except Exception as e:
+        db.rollback()
+        raise _internal_error()
 
 
 @router.delete("/{notification_id}")
@@ -154,12 +173,12 @@ def delete_notification(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """删除通知"""
-    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    """删除当前可见通知。"""
+    notification = visible_notification_query(db, user.id).filter(
+        Notification.id == notification_id
+    ).first()
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
-    if notification.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
     try:
         db.delete(notification)
@@ -167,22 +186,7 @@ def delete_notification(
         return {"message": "Notification deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/clear-all")
-def clear_all_notifications(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """清空所有通知"""
-    try:
-        db.query(Notification).filter(Notification.user_id == user.id).delete()
-        db.commit()
-        return {"message": "All notifications cleared"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()
 
 
 @router.get("/settings")
@@ -233,4 +237,4 @@ def update_notification_settings(
         }
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error()

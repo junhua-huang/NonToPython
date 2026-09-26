@@ -5,7 +5,6 @@
 import re
 import logging
 from typing import Tuple, List, Set
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +145,12 @@ class ContentFilter:
     # ============================================================
     def log_block(self, user_id, original_text: str, hit_words: list):
         """记录拦截日志"""
+        del original_text
+        rule_count = len(hit_words)
         logger.warning(
-            "CONTENT_BLOCKED | time=%s | user_id=%s | hit_words=%s | text_preview=%s",
-            datetime.utcnow().isoformat(),
+            "content_moderation_rejected user_id=%s content_type=legacy_filter rule_count=%s",
             user_id or 'anonymous',
-            hit_words,
-            original_text[:200]
+            rule_count,
         )
 
     # ============================================================
@@ -170,7 +169,7 @@ class ContentFilter:
             return False
         self._sensitive_words.add(word)
         self._rebuild_pattern()
-        logger.info("SENSITIVE_WORD_ADDED | word=%s | total=%d", word, len(self._sensitive_words))
+        logger.info("sensitive_word_cache_updated action=add total=%d", len(self._sensitive_words))
         return True
 
     def remove_word(self, word: str) -> bool:
@@ -180,7 +179,7 @@ class ContentFilter:
             return False
         self._sensitive_words.discard(word)
         self._rebuild_pattern()
-        logger.info("SENSITIVE_WORD_REMOVED | word=%s | total=%d", word, len(self._sensitive_words))
+        logger.info("sensitive_word_cache_updated action=remove total=%d", len(self._sensitive_words))
         return True
 
     def get_count(self) -> int:

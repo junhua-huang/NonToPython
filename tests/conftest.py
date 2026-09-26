@@ -20,6 +20,24 @@ from app.database import SessionLocal
 BASE_URL = "http://127.0.0.1:8898"
 
 
+if os.getenv("NONTO_RUN_LIVE_API_TESTS") != "1":
+    collect_ignore = [
+        "full_api_test.py",
+        "test_batch_messages.py",
+        "test_complete_api.py",
+        "test_email_search.py",
+        "test_empty_search.py",
+        "test_profile_upload.py",
+        "test_search_api.py",
+        "test_search_fix.py",
+        "test_upload.py",
+        "test_ws_connect.py",
+        "test_ws_simple.py",
+    ]
+else:
+    collect_ignore = []
+
+
 @pytest.fixture(scope='session')
 def fastapi_app():
     """FastAPI 应用实例（session 级别）"""

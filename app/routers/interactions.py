@@ -1,6 +1,8 @@
 """
 互动路由 - FastAPI 重构版
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -10,7 +12,12 @@ from app.dependencies import get_current_user
 from app.models.models import User, Post, Comment, Like
 from app.services.notification_service import NotificationService
 from app.services.mention_service import MentionService
+from app.services.post_visibility_service import can_view_post, load_visible_post
+from app.services.block_service import excluded_user_ids, has_block_between, visible_user_predicate
+from app.services.moderation_route_helpers import moderate_route_fields
+from app.services.moderation_service import moderation_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -21,6 +28,21 @@ def _enrich_comment_dict(comment: Comment, db: Session, current_user_id: int) ->
         Like.user_id == current_user_id, Like.comment_id == comment.id
     ).first() is not None
     return d
+
+
+def _load_visible_comment(comment_id: int, db: Session, viewer_user_id: int) -> Comment:
+    """Load a comment and fail closed when its parent post is not visible."""
+    comment = db.query(Comment).filter(
+        Comment.id == comment_id,
+        Comment.hidden_by_admin.is_not(True),
+    ).first()
+    if (
+        not comment
+        or not load_visible_post(db, comment.post_id, viewer_user_id)
+        or has_block_between(db, viewer_user_id, comment.user_id)
+    ):
+        raise HTTPException(status_code=404, detail="Comment not found")
+    return comment
 
 
 def _batch_enrich_comments(db: Session, comments: list, current_user_id: int) -> list:
@@ -59,7 +81,7 @@ def like_post(
 ):
     """点赞帖子"""
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
     existing = db.query(Like).filter(
@@ -78,7 +100,13 @@ def like_post(
         return {"message": "Post liked successfully", "liked": True, "like_count": post.get_like_count()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Like post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while liking the post")
 
 
 @router.delete("/posts/{post_id}/like")
@@ -88,6 +116,10 @@ def unlike_post(
     db: Session = Depends(get_db),
 ):
     """取消点赞"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post or not can_view_post(db, post, user.id):
+        raise HTTPException(status_code=404, detail="Post not found")
+
     like = db.query(Like).filter(
         Like.user_id == user.id,
         Like.post_id == post_id,
@@ -103,7 +135,13 @@ def unlike_post(
         return {"message": "Like removed successfully", "liked": False, "like_count": post.get_like_count()}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Unlike post failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while removing the post like")
 
 
 @router.get("/posts/{post_id}/likes")
@@ -114,12 +152,13 @@ def get_post_likes(
 ):
     """获取帖子的点赞列表"""
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
     likes = db.query(Like).filter(
         Like.post_id == post_id,
         Like.comment_id.is_(None),
+        visible_user_predicate(user.id, Like.user_id),
     ).all()
     return {"likes": [l.to_dict() for l in likes], "total": len(likes)}
 
@@ -134,9 +173,7 @@ def like_comment(
     db: Session = Depends(get_db),
 ):
     """点赞评论"""
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not comment:
-        raise HTTPException(status_code=404, detail="Comment not found")
+    comment = _load_visible_comment(comment_id, db, user.id)
 
     existing = db.query(Like).filter(
         Like.user_id == user.id, Like.comment_id == comment_id
@@ -152,7 +189,13 @@ def like_comment(
         return {"message": "Comment liked successfully", "comment_id": comment_id, "liked": True, "like_count": comment.like_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Like comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while liking the comment")
 
 
 @router.delete("/comments/{comment_id}/like")
@@ -162,6 +205,8 @@ def unlike_comment(
     db: Session = Depends(get_db),
 ):
     """取消评论点赞"""
+    comment = _load_visible_comment(comment_id, db, user.id)
+
     like = db.query(Like).filter(
         Like.user_id == user.id, Like.comment_id == comment_id
     ).first()
@@ -170,14 +215,19 @@ def unlike_comment(
 
     try:
         db.delete(like)
-        comment = db.query(Comment).filter(Comment.id == comment_id).first()
-        if comment and comment.like_count > 0:
+        if comment.like_count > 0:
             comment.like_count -= 1
         db.commit()
-        return {"message": "Like removed successfully", "comment_id": comment_id, "liked": False, "like_count": comment.like_count if comment else 0}
+        return {"message": "Like removed successfully", "comment_id": comment_id, "liked": False, "like_count": comment.like_count}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Unlike comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while removing the comment like")
 
 
 # ==================== 评论功能 ====================
@@ -192,7 +242,7 @@ def create_comment(
 ):
     """创建评论"""
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
     # 屏蔽检查：存在双向屏蔽关系则禁止评论
@@ -206,23 +256,31 @@ def create_comment(
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
 
-    from app.services.content_moderation import ContentModeration
-    moderation_result = ContentModeration.check_content(content)
-    if not moderation_result["approved"]:
-        ContentModeration.log_moderation(
-            user_id=user.id, content_type="comment", original_text=content, reasons=moderation_result["reasons"]
-        )
-        raise HTTPException(status_code=400, detail={"error": "Content rejected by moderation", "reasons": moderation_result["reasons"]})
-
     parent_id = payload.get("parent_id")
     reply_to_user_id = payload.get("reply_to_user_id")
 
     if parent_id:
-        parent_comment = db.query(Comment).filter(Comment.id == parent_id).first()
-        if not parent_comment:
+        parent_comment = db.query(Comment).filter(
+            Comment.id == parent_id,
+            Comment.post_id == post_id,
+        ).first()
+        if not parent_comment or has_block_between(db, user.id, parent_comment.user_id):
             raise HTTPException(status_code=404, detail="Parent comment not found")
         if not reply_to_user_id:
             reply_to_user_id = parent_comment.user_id
+
+    if reply_to_user_id and has_block_between(db, user.id, reply_to_user_id):
+        raise HTTPException(status_code=404, detail="Reply target not found")
+
+    moderate_route_fields(
+        moderation_service,
+        "POST /api/posts/{post_id}/comments",
+        payload,
+        actor_user_id=user.id,
+        is_public=not bool(getattr(post, "community_only", False)),
+        db=db,
+        target_id=post_id,
+    )
 
     comment = Comment(
         content=content,
@@ -240,7 +298,13 @@ def create_comment(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Create comment failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while creating the comment")
 
     # 通知和@提及（失败不影响评论创建，传入 db 复用 Session）
     try:
@@ -249,7 +313,12 @@ def create_comment(
             NotificationService.notify_comment(reply_to_user_id, user.id, post_id, content, db=db)
         MentionService.process_mentions(content=content, author_id=user.id, post_id=post_id, comment_id=comment.id)
     except Exception as e:
-        print(f"[WARNING] 评论通知/@提及处理失败: {e}")
+        logger.warning(
+            "Comment notification processing failed post_id=%s user_id=%s error_type=%s",
+            post_id,
+            user.id,
+            type(e).__name__,
+        )
 
     return {
         "message": "Comment created successfully",
@@ -273,22 +342,30 @@ def get_comments(
     传入 parent_id：返回该父评论的子回复（分页）。
     """
     post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
+    if not post or not can_view_post(db, post, user.id):
         raise HTTPException(status_code=404, detail="Post not found")
 
-    # 获取当前用户屏蔽列表，过滤评论
-    from app.ws_manager import ws_manager
-    blocked_ids = ws_manager.get_blocked_user_ids(user.id)
+    # One DB query covers both directions and all comment/reply filters below.
+    blocked_ids = excluded_user_ids(db, user.id)
 
     if parent_id is not None:
         # ========== 获取指定父评论的回复（分页） ==========
-        parent_comment = db.query(Comment).filter(Comment.id == parent_id).first()
+        parent_comment = db.query(Comment).filter(
+            Comment.id == parent_id,
+            Comment.post_id == post_id,
+            Comment.hidden_by_admin.is_not(True),
+            visible_user_predicate(user.id, Comment.user_id),
+        ).first()
         if not parent_comment:
             raise HTTPException(status_code=404, detail="Parent comment not found")
 
         replies_query = (
             db.query(Comment)
-            .filter(Comment.parent_id == parent_id)
+            .filter(
+                Comment.parent_id == parent_id,
+                Comment.post_id == post_id,
+                Comment.hidden_by_admin.is_not(True),
+            )
             .order_by(Comment.created_at.asc())
         )
         if blocked_ids:
@@ -307,7 +384,11 @@ def get_comments(
 
     comments_query = (
         db.query(Comment)
-        .filter(Comment.post_id == post_id, Comment.parent_id == None)
+        .filter(
+                Comment.post_id == post_id,
+                Comment.parent_id == None,
+                Comment.hidden_by_admin.is_not(True),
+            )
         .order_by(Comment.created_at.desc())
     )
     if blocked_ids:
@@ -321,7 +402,11 @@ def get_comments(
     if parent_ids:
         all_replies = (
             db.query(Comment)
-            .filter(Comment.parent_id.in_(parent_ids))
+            .filter(
+                    Comment.parent_id.in_(parent_ids),
+                    Comment.post_id == post_id,
+                    Comment.hidden_by_admin.is_not(True),
+                )
             .order_by(Comment.parent_id, Comment.created_at.asc())
             .all()
         )
@@ -378,16 +463,21 @@ def get_comment_detail(
     db: Session = Depends(get_db),
 ):
     """获取单个评论详情（含自身信息 + 回复列表）"""
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not comment:
-        raise HTTPException(status_code=404, detail="Comment not found")
+    comment = _load_visible_comment(comment_id, db, user.id)
 
     # 查询该评论的回复
+    blocked_ids = excluded_user_ids(db, user.id)
     replies_query = (
         db.query(Comment)
-        .filter(Comment.parent_id == comment_id)
+        .filter(
+            Comment.parent_id == comment_id,
+            Comment.post_id == comment.post_id,
+            Comment.hidden_by_admin.is_not(True),
+        )
         .order_by(Comment.created_at.asc())
     )
+    if blocked_ids:
+        replies_query = replies_query.filter(~Comment.user_id.in_(blocked_ids))
     total = replies_query.count()
     replies = replies_query.offset((page - 1) * per_page).limit(per_page).all()
     pages = (total + per_page - 1) // per_page if total > 0 else 0
@@ -414,15 +504,22 @@ def update_comment(
     db: Session = Depends(get_db),
 ):
     """更新评论"""
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not comment:
-        raise HTTPException(status_code=404, detail="Comment not found")
+    comment = _load_visible_comment(comment_id, db, user.id)
     if comment.user_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     content = payload.get("content")
     if not content:
         raise HTTPException(status_code=400, detail="Content is required")
+    moderate_route_fields(
+        moderation_service,
+        "PUT /api/comments/{comment_id}",
+        payload,
+        actor_user_id=user.id,
+        is_public=True,
+        db=db,
+        target_id=comment.id,
+    )
 
     comment.content = content
     try:
@@ -430,7 +527,13 @@ def update_comment(
         return {"message": "Comment updated successfully", "comment": _enrich_comment_dict(comment, db, user.id)}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the comment")
 
 
 @router.delete("/comments/{comment_id}")
@@ -440,9 +543,7 @@ def delete_comment(
     db: Session = Depends(get_db),
 ):
     """删除评论"""
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not comment:
-        raise HTTPException(status_code=404, detail="Comment not found")
+    comment = _load_visible_comment(comment_id, db, user.id)
     if comment.user_id != user.id and comment.post.user_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
@@ -458,4 +559,10 @@ def delete_comment(
         return {"message": "Comment deleted successfully", "comment_count": post.get_comment_count() if post else 0}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete comment failed comment_id=%s user_id=%s error_type=%s",
+            comment_id,
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the comment")

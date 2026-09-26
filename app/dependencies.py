@@ -1,16 +1,29 @@
 """
-FastAPI 依赖注入 — 统一 Query 参数鉴权
+FastAPI 依赖注入 — Bearer 优先，兼容 Query 参数鉴权
 
-Token 传参方式: ?access_token=<jwt>
+Token: Authorization: Bearer <jwt> 或 ?access_token=<jwt>
 
 核心校验逻辑统一走 app.core.auth_core.verify_token()，
 HTTP / WebSocket 完全复用同一套规则。
 """
 from fastapi import Depends, HTTPException, Request, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
-from app.core.auth_core import verify_token, AuthError
+from app.core.auth_core import verify_local_deployment_session, verify_token, AuthError
 from app.models.models import User
+from app.services.moderation_errors import AccountDisabled, AppContractError, to_http_exception
+
+
+def _request_token(request, access_token):
+    """Explicit Authorization always wins; malformed headers never fall back."""
+    headers = getattr(request, "headers", {})
+    authorization = headers.get("authorization")
+    if authorization is None:
+        return access_token
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    return parts[1]
 
 
 def get_current_user(
@@ -20,7 +33,9 @@ def get_current_user(
 ) -> User:
     """从 Query 参数 access_token 获取当前登录用户"""
     try:
-        return verify_token(access_token)
+        return verify_token(_request_token(request, access_token))
+    except AppContractError as e:
+        raise to_http_exception(e) from None
     except AuthError as e:
         raise HTTPException(status_code=e.code, detail=e.message)
 
@@ -31,11 +46,17 @@ def get_optional_user(
     db: Session = Depends(get_db),
 ):
     """可选认证 — 未传 access_token 返回 None"""
+    explicit_header = getattr(request, "headers", {}).get("authorization") is not None
+    access_token = _request_token(request, access_token)
     if not access_token:
         return None
     try:
-        return verify_token(access_token)
-    except AuthError:
+        return verify_token(_request_token(request, access_token))
+    except AppContractError as e:
+        raise to_http_exception(e) from None
+    except AuthError as e:
+        if explicit_header:
+            raise HTTPException(status_code=e.code, detail=e.message) from None
         return None
 
 
@@ -59,32 +80,47 @@ def require_role(*role_names: str):
         db: Session = Depends(get_db),
     ) -> User:
         try:
-            user = verify_token(access_token)
+            headers = getattr(request, "headers", {})
+            authorization = headers.get("authorization")
+            local_token = headers.get("x-deployment-local-token")
+            path = getattr(getattr(request, "url", None), "path", "")
+            if (not authorization and local_token and
+                    (path == "/api/admin/deployments" or
+                     path.startswith("/api/admin/deployments/"))):
+                user = verify_local_deployment_session(request)
+            else:
+                user = verify_token(_request_token(request, access_token))
+        except AppContractError as e:
+            raise to_http_exception(e) from None
         except AuthError as e:
             raise HTTPException(status_code=e.code, detail=e.message)
 
-        # 从 JWT payload 中读取角色（快速路径），不在则查库
-        from jose import jwt
-        from app.core.config import Config
-        try:
-            payload = jwt.decode(access_token, Config.JWT_SECRET_KEY, algorithms=["HS256"])
-            token_roles = set(payload.get("roles", []))
-        except Exception:
-            token_roles = set()
+        # 权限以数据库为准，避免 JWT 内旧 roles 在撤销/暂停后继续生效。
+        from app.models.models import UserRole, Role
+        current_user = (
+            db.query(User)
+            .options(joinedload(User.user_roles).joinedload(UserRole.role))
+            .filter(User.id == user.id)
+            .first()
+        )
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        if current_user.is_active is not True:
+            raise to_http_exception(AccountDisabled())
 
-        if token_roles:
-            user_roles = token_roles
-        else:
-            from app.models.models import UserRole, Role
-            ur_rows = db.query(UserRole).filter(UserRole.user_id == user.id).all()
-            role_ids = [ur.role_id for ur in ur_rows]
-            roles = db.query(Role).filter(Role.id.in_(role_ids)).all()
-            user_roles = {r.name for r in roles}
+        user_role_rows = (
+            db.query(UserRole)
+            .options(joinedload(UserRole.role))
+            .join(Role, UserRole.role_id == Role.id)
+            .filter(UserRole.user_id == current_user.id)
+            .all()
+        )
+        user_roles = {row.role.name for row in user_role_rows if row.role}
 
         if not any(r in user_roles for r in role_names):
             raise HTTPException(status_code=403, detail=f"Required role(s): {', '.join(role_names)}")
 
-        return user
+        return current_user
 
     return dependency
 
@@ -94,15 +130,15 @@ def require_role(*role_names: str):
 # ============================================================
 
 require_admin     = require_role("admin")
-require_organizer = require_role("organizer")
+require_organizer = require_role("event_organizer")
 require_coser     = require_role("coser")
 
 require_service_provider = require_role(
     "coser", "wig_stylist", "makeup_artist",
-    "photographer", "editor", "ticket_agent"
+    "photographer", "retoucher", "ticket_agent", "prop_maker", "costume_maker"
 )
 
-require_content_manager = require_role("admin", "organizer")
+require_content_manager = require_role("admin", "event_organizer")
 
 
 def admin_required(user: User = Depends(require_admin)):

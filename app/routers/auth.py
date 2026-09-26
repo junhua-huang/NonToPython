@@ -5,10 +5,11 @@
 import re
 import logging
 import html
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Body, Query, Request
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy.orm import Session
@@ -22,10 +23,46 @@ from werkzeug.security import check_password_hash
 from app.dependencies import get_current_user, get_optional_user
 from app.services.email_service import EmailService
 from app.services.otp_service import OtpService
+from app.services.block_service import has_block_between
+from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
+from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
+from app.services.moderation_service import moderation_service
+from app.services.moderation_types import ModerationContext
+from app.serializers.user import serialize_user_profile, serialize_user_self
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Auth"])
 security = HTTPBearer()
+
+_ALLOWED_REGISTRATION_EMAIL_DOMAINS = {"qq.com", "foxmail.com", "vip.qq.com"}
+_FORBIDDEN_USERNAME_CHARS = set('/\\?#@:\r\n\t')
+
+
+async def _send_otp_email_background(email: str, code: str, purpose: str) -> None:
+    sent = await EmailService.send_otp_email(email, code, purpose)
+    if not sent and Config.DEBUG:
+        # 开发模式：邮件发不出时把验证码打到日志，方便本地测试
+        logger.info("[OTP DEV] email=%s purpose=%s code=%s", email, purpose, code)
+
+
+def is_allowed_registration_email(email: str) -> bool:
+    if not isinstance(email, str) or "@" not in email:
+        return False
+    domain = email.strip().lower().rsplit("@", 1)[-1]
+    return domain in _ALLOWED_REGISTRATION_EMAIL_DOMAINS
+
+
+def normalize_username(value: str) -> str:
+    username = value.strip() if isinstance(value, str) else ""
+    if not (2 <= len(username) <= 30):
+        raise ValueError("Username must be 2-30 characters long")
+    if any(char in _FORBIDDEN_USERNAME_CHARS for char in username):
+        raise ValueError("Username contains unsupported characters")
+    if any(unicodedata.category(char)[0] == "C" or char.isspace() for char in username):
+        raise ValueError("Username contains unsupported characters")
+    if not any(unicodedata.category(char)[0] in {"L", "N"} for char in username):
+        raise ValueError("Username must contain a letter or number")
+    return username
 
 
 def _validate_avatar_url(url: str) -> str:
@@ -71,6 +108,44 @@ def _sanitize_bio(bio: str) -> str:
     return html.escape(bio, quote=True)
 
 
+def _moderate_auth_fields(
+    route_key: str,
+    target_type: str,
+    payload: object,
+    *,
+    actor_user_id: int | None,
+    is_public: bool,
+):
+    if not isinstance(payload, dict):
+        raise to_http_exception(ModerationUnavailable(TypeError("moderation payload must be a mapping")))
+    fields = {}
+    for field in MODERATED_TEXT_FIELDS[route_key]:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise to_http_exception(ModerationUnavailable(TypeError("moderation field must be a string")))
+        if value.strip():
+            fields[field] = value
+    if not fields:
+        return
+    try:
+        moderation_service.moderate_fields(
+            fields,
+            ModerationContext(
+                target_type=target_type,
+                actor_user_id=actor_user_id,
+                is_public=is_public,
+            ),
+        )
+    except AppContractError as error:
+        raise to_http_exception(error) from None
+    except Exception as exc:
+        raise to_http_exception(ModerationUnavailable(exc)) from None
+
+
 # ============================================================
 # Pydantic Schemas
 # ============================================================
@@ -85,13 +160,7 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def validate_username(cls, v: str) -> str:
-        v = v.strip()
-        if not (3 <= len(v) <= 30):
-            raise ValueError("Username must be 3-30 characters long")
-        # 允许中文、英文、数字、下划线、点号
-        if not re.match(r'^[\u4e00-\u9fff a-zA-Z0-9_.]+$', v):
-            raise ValueError("Username can only contain Chinese, English letters, numbers, underscores, and dots")
-        return v
+        return normalize_username(v)
 
     @field_validator("email")
     @classmethod
@@ -99,6 +168,8 @@ class RegisterRequest(BaseModel):
         v = v.strip().lower()
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', v):
             raise ValueError("Invalid email format")
+        if not is_allowed_registration_email(v):
+            raise ValueError("目前仅支持 QQ 邮箱注册")
         return v
 
     @field_validator("password")
@@ -229,32 +300,11 @@ class PrivacySettingsUpdateRequest(BaseModel):
 # ============================================================
 
 def _build_user_response(user: User) -> dict:
-    roles = user.get_role_names() if hasattr(user, 'get_role_names') else []
-    role_labels = user.get_role_labels() if hasattr(user, 'get_role_labels') else []
-    return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "display_name": user.username,
-        "bio": user.bio,
-        "avatar_url": user.avatar_url,
-        "cover_photo_url": user.cover_photo_url,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "roles": roles,
-        "role_labels": role_labels,
-    }
+    return serialize_user_self(user)
 
 
-def _build_public_user_response(user: User) -> dict:
-    return {
-        "id": user.id,
-        "username": user.username,
-        "display_name": user.username,
-        "bio": user.bio,
-        "avatar_url": user.avatar_url,
-        "cover_photo_url": user.cover_photo_url,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-    }
+def _build_public_user_response(user: User, viewer_user_id: int | None = None) -> dict:
+    return serialize_user_profile(user, viewer_user_id=viewer_user_id)
 
 
 # ============================================================
@@ -262,7 +312,12 @@ def _build_public_user_response(user: User) -> dict:
 # ============================================================
 
 @router.post("/send-otp")
-async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends(get_db)):
+async def send_otp(
+    data: SendOtpRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     发送邮箱验证码。
 
@@ -276,6 +331,10 @@ async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends
     email = data.email
     purpose = data.purpose
     ip = request.client.host if request.client else None
+
+    # 注册场景：只允许 QQ 邮箱体系注册。
+    if purpose == "register" and not is_allowed_registration_email(email):
+        raise HTTPException(status_code=400, detail="目前仅支持 QQ 邮箱注册")
 
     # 注册场景：邮箱已被占用 → 直接拒绝（其它 purpose 不暴露邮箱是否存在）
     if purpose == "register":
@@ -292,11 +351,7 @@ async def send_otp(data: SendOtpRequest, request: Request, db: Session = Depends
         raise HTTPException(status_code=429, detail=reason)
 
     code = OtpService.generate_and_store(email, purpose, ip, db)
-    # 异步发邮件，不阻塞响应；失败仅记日志
-    sent = await EmailService.send_otp_email(email, code, purpose)
-    if not sent and Config.DEBUG:
-        # 开发模式：邮件发不出时把验证码打到日志，方便本地测试
-        logger.info("[OTP DEV] email=%s purpose=%s code=%s", email, purpose, code)
+    background_tasks.add_task(_send_otp_email_background, email, code, purpose)
 
     return {"message": "验证码已发送，请查收邮箱"}
 
@@ -332,6 +387,13 @@ def verify_otp(data: VerifyOtpRequest, db: Session = Depends(get_db)):
 @router.post("/register", response_model=AuthResponse)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
     """用户注册（必须先通过 /auth/send-otp purpose=register 拿到邮箱验证码）"""
+    _moderate_auth_fields(
+        "POST /api/auth/register",
+        "user_registration",
+        data.model_dump(),
+        actor_user_id=None,
+        is_public=True,
+    )
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
     if db.query(User).filter(User.email == data.email).first():
@@ -465,10 +527,26 @@ def update_profile(
     db: Session = Depends(get_db),
 ):
     """修改当前用户个人资料"""
+    _moderate_auth_fields(
+        "PUT /api/auth/profile",
+        "user_profile",
+        data.model_dump(exclude_none=True),
+        actor_user_id=user.id,
+        is_public=True,
+    )
     current = db.query(User).filter(User.id == user.id).first()
     if data.display_name is not None:
-        # display_name 映射为 username（如业务允许）
-        pass
+        try:
+            display_name = RegisterRequest.validate_username(data.display_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        duplicate = db.query(User).filter(
+            User.username == display_name,
+            User.id != user.id,
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="Username already exists")
+        current.username = display_name
     if data.bio is not None:
         current.bio = _sanitize_bio(data.bio)
     if data.avatar_url is not None:
@@ -480,7 +558,12 @@ def update_profile(
         return {"message": "Profile updated", "user": _build_user_response(current)}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update profile failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating the profile")
 
 
 # ============================================================
@@ -509,7 +592,12 @@ def change_password(
         return {"message": "Password changed successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Change password failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while changing the password")
 
 
 # ============================================================
@@ -524,9 +612,9 @@ def get_user_info(
 ):
     """获取用户公开信息（需登录，防止未授权枚举用户）"""
     target = db.query(User).filter(User.id == user_id).first()
-    if not target:
+    if not target or has_block_between(db, current_user.id, user_id):
         raise HTTPException(status_code=404, detail="User not found")
-    return _build_public_user_response(target)
+    return _build_public_user_response(target, viewer_user_id=current_user.id)
 
 
 # ============================================================
@@ -543,11 +631,16 @@ def delete_account(
     try:
         db.delete(current)
         db.commit()
-        logger.info(f"User account deleted: {user.username} (ID: {user.id})")
+        logger.info("User account deleted user_id=%s", user.id)
         return {"message": "Account deleted successfully"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Delete account failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the account")
 
 
 # ============================================================
@@ -558,6 +651,7 @@ def delete_account(
 async def forgot_password(
     data: ForgotPasswordRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
@@ -574,9 +668,7 @@ async def forgot_password(
         if not ok:
             raise HTTPException(status_code=429, detail=reason)
         code = OtpService.generate_and_store(email, "reset_password", ip, db)
-        sent = await EmailService.send_otp_email(email, code, "reset_password")
-        if not sent and Config.DEBUG:
-            logger.info("[OTP DEV] email=%s purpose=reset_password code=%s", email, code)
+        background_tasks.add_task(_send_otp_email_background, email, code, "reset_password")
     return {"message": "若该邮箱已注册，验证码已发送"}
 
 
@@ -660,7 +752,12 @@ def update_privacy_settings(
         return {"message": "Privacy settings updated"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Update privacy settings failed user_id=%s error_type=%s",
+            user.id,
+            type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="An error occurred while updating privacy settings")
 
 
 # ============================================================

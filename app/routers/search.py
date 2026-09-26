@@ -4,7 +4,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import case, or_, func, text, bindparam
-import json
 from datetime import datetime, timedelta
 
 from app.database import get_db
@@ -14,7 +13,9 @@ from app.models.models import (
     Like, Comment, post_topics,
     ComicEvent, ComicCity, ComicEventImage, ComicEventTagRel, ComicTag, ComicEventFollow,
 )
+from app.services.block_service import visible_user_predicate
 from app.services.search_service import SearchService
+from app.services.post_visibility_service import post_visibility_predicate
 from app.routers.comic import _recalc_status_text
 
 router = APIRouter()
@@ -32,10 +33,10 @@ def _handle_special_query(db: Session, query: str, page: int, per_page: int, use
     """检测特殊搜索关键词，返回对应数据；不匹配则返回 None"""
 
     if query in ("热门帖子", "热门贴子"):
-        return _hot_posts(db, page, per_page)
+        return _hot_posts(db, page, per_page, user_id)
 
     if query in ("话题趋势", "热门话题"):
-        return _trending_topics(db, page, per_page)
+        return _trending_topics(db, page, per_page, user_id)
 
     if query in ("近期漫展", "最近漫展"):
         return _comic_events(db, page, per_page, user_id)
@@ -43,61 +44,51 @@ def _handle_special_query(db: Session, query: str, page: int, per_page: int, use
     return None
 
 
-def _hot_posts(db: Session, page: int, per_page: int):
-    """7天内热度最高的帖子 Top 10
-    热度 = 浏览量 + 点赞数×3 + 评论数×2
-    """
+def _hot_posts(db: Session, page: int, per_page: int, current_user_id: int | None):
+    """Return visible posts from the last seven days ordered by engagement."""
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    rows = db.execute(text("""
-        SELECT p.id, p.content, p.images, p.video_url, p.post_type,
-               p.user_id, p.created_at, p.updated_at, p.visibility,
-               p.is_public, p.view_count,
-               COALESCE(l.like_count, 0) AS like_count,
-               COALESCE(c.comment_count, 0) AS comment_count,
-               (p.view_count + COALESCE(l.like_count, 0) * 3 + COALESCE(c.comment_count, 0) * 2) AS hot_score
-        FROM posts p
-        LEFT JOIN (
-            SELECT post_id, COUNT(*) AS like_count FROM likes GROUP BY post_id
-        ) l ON p.id = l.post_id
-        LEFT JOIN (
-            SELECT post_id, COUNT(*) AS comment_count FROM comments GROUP BY post_id
-        ) c ON p.id = c.post_id
-        WHERE p.created_at >= :since AND p.is_public = 1
-        ORDER BY hot_score DESC
-        LIMIT :limit
-    """), {"since": seven_days_ago, "limit": per_page}).fetchall()
-
-    # 批量取用户信息
-    user_ids = {r.user_id for r in rows}
-    users_map = {}
-    if user_ids:
-        users_map = {u.id: u.to_dict() for u in db.query(User).filter(User.id.in_(user_ids)).all()}
+    like_counts = (
+        db.query(Like.post_id.label("post_id"), func.count(Like.id).label("like_count"))
+        .filter(Like.comment_id.is_(None))
+        .group_by(Like.post_id)
+        .subquery()
+    )
+    comment_counts = (
+        db.query(Comment.post_id.label("post_id"), func.count(Comment.id).label("comment_count"))
+        .group_by(Comment.post_id)
+        .subquery()
+    )
+    hot_score = (
+        func.coalesce(Post.view_count, 0)
+        + func.coalesce(like_counts.c.like_count, 0) * 3
+        + func.coalesce(comment_counts.c.comment_count, 0) * 2
+    ).label("hot_score")
+    rows = (
+        db.query(
+            Post,
+            func.coalesce(like_counts.c.like_count, 0),
+            func.coalesce(comment_counts.c.comment_count, 0),
+            hot_score,
+        )
+        .outerjoin(like_counts, like_counts.c.post_id == Post.id)
+        .outerjoin(comment_counts, comment_counts.c.post_id == Post.id)
+        .filter(Post.created_at >= seven_days_ago, post_visibility_predicate(current_user_id))
+        .order_by(hot_score.desc(), Post.created_at.desc())
+        .limit(per_page)
+        .all()
+    )
 
     posts = []
-    for r in rows:
-        images = r.images
-        if isinstance(images, str):
-            try:
-                images = json.loads(images)
-            except (json.JSONDecodeError, TypeError):
-                images = []
-        posts.append({
-            "id": r.id,
-            "content": r.content,
-            "images": images,
-            "video_url": r.video_url,
-            "post_type": r.post_type,
-            "user_id": r.user_id,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
-            "visibility": r.visibility,
-            "is_public": r.is_public,
-            "view_count": r.view_count,
-            "like_count": r.like_count,
-            "comment_count": r.comment_count,
-            "hot_score": int(r.hot_score) if r.hot_score else 0,
-            "author": users_map.get(r.user_id),
-        })
+    for post, like_count, comment_count, score in rows:
+        data = post.to_dict(
+            current_user_id=current_user_id,
+            like_count=like_count,
+            comment_count=comment_count,
+            topics=[],
+            is_liked=False,
+        )
+        data["hot_score"] = int(score or 0)
+        posts.append(data)
 
     return {
         "query": "热门帖子",
@@ -110,42 +101,25 @@ def _hot_posts(db: Session, page: int, per_page: int):
     }
 
 
-def _trending_topics(db: Session, page: int, per_page: int):
-    """7天内热门话题 Top 10
-    按话题在近7天帖子中出现次数排序
-    """
+def _trending_topics(db: Session, page: int, per_page: int, current_user_id: int | None):
+    """Rank topics using only posts visible to the current viewer."""
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    rows = db.execute(text("""
-        SELECT t.id, t.name, t.description, t.icon_url, t.color,
-               t.post_count, t.follower_count, t.is_trending,
-               t.created_at, t.updated_at,
-               COUNT(pt.post_id) AS recent_post_count
-        FROM topics t
-        JOIN post_topics pt ON t.id = pt.topic_id
-        JOIN posts p ON pt.post_id = p.id
-        WHERE p.created_at >= :since AND p.is_public = 1
-        GROUP BY t.id, t.name, t.description, t.icon_url, t.color,
-                 t.post_count, t.follower_count, t.is_trending,
-                 t.created_at, t.updated_at
-        ORDER BY recent_post_count DESC
-        LIMIT :limit
-    """), {"since": seven_days_ago, "limit": per_page}).fetchall()
+    rows = (
+        db.query(Topic, func.count(post_topics.c.post_id).label("recent_post_count"))
+        .join(post_topics, Topic.id == post_topics.c.topic_id)
+        .join(Post, Post.id == post_topics.c.post_id)
+        .filter(Post.created_at >= seven_days_ago, post_visibility_predicate(current_user_id))
+        .group_by(Topic.id)
+        .order_by(func.count(post_topics.c.post_id).desc())
+        .limit(per_page)
+        .all()
+    )
 
     topics = []
-    for r in rows:
-        topics.append({
-            "id": r.id,
-            "name": r.name,
-            "description": r.description,
-            "icon_url": r.icon_url,
-            "color": r.color,
-            "post_count": r.post_count,
-            "follower_count": r.follower_count,
-            "is_trending": r.is_trending,
-            "recent_post_count": r.recent_post_count,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
-        })
+    for topic, recent_post_count in rows:
+        data = topic.to_dict()
+        data["recent_post_count"] = recent_post_count
+        topics.append(data)
 
     return {
         "query": "话题趋势",
@@ -299,7 +273,15 @@ def search_posts(
     if _is_short_query(q):
         return {"posts": [], "total": 0, "pages": 0, "current_page": page, "per_page": per_page}
 
-    results = SearchService.search_posts(db, query=q.strip(), page=page, per_page=per_page, user_id=user_id, is_public=True)
+    results = SearchService.search_posts(
+        db,
+        query=q.strip(),
+        page=page,
+        per_page=per_page,
+        user_id=user_id,
+        is_public=True,
+        current_user_id=user.id,
+    )
     return results
 
 
@@ -338,7 +320,13 @@ def search_by_hashtag(
     db: Session = Depends(get_db),
 ):
     """按标签搜索帖子"""
-    results = SearchService.search_posts_by_hashtag(db, hashtag=hashtag, page=page, per_page=per_page)
+    results = SearchService.search_posts_by_hashtag(
+        db,
+        hashtag=hashtag,
+        page=page,
+        per_page=per_page,
+        current_user_id=user.id,
+    )
     return results
 
 
@@ -349,7 +337,7 @@ def get_trending_hashtags(
     db: Session = Depends(get_db),
 ):
     """获取热门标签"""
-    hashtags = SearchService.get_trending_hashtags(db, limit=limit)
+    hashtags = SearchService.get_trending_hashtags(db, limit=limit, current_user_id=user.id)
     return {"hashtags": hashtags, "total": len(hashtags)}
 
 
@@ -506,6 +494,7 @@ def get_mention_suggestions(
             User.is_active == True,
             User.allow_search == True,
             User.id != user.id,
+            visible_user_predicate(user.id, User.id),
         )
         .order_by(
             User.id.in_(friend_ids_query).desc(),

@@ -7,6 +7,8 @@ import json
 import logging
 
 from app.models.models import Post, User, Like, Comment, Friendship, Block, PostFeedSeen
+from app.services.block_service import excluded_user_ids, visible_user_predicate
+from app.services.post_visibility_service import post_visibility_predicate
 from sqlalchemy import func, case, or_, and_, exists
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -107,17 +109,18 @@ class RecommendationService:
         }
 
     @staticmethod
-    def _serialize_posts(posts: list, batch_data: dict) -> list:
+    def _serialize_posts(posts: list, batch_data: dict, current_user_id: int | None = None, db: Session | None = None) -> list:
         """使用批量数据序列化帖子列表"""
         result = []
         for post in posts:
             data = batch_data.get(post.id, {})
             result.append(post.to_dict(
-                current_user_id=None,  # 不再让 to_dict 内部查询
+                current_user_id=current_user_id,
                 like_count=data.get('like_count'),
                 comment_count=data.get('comment_count'),
                 topics=data.get('topics'),
                 is_liked=data.get('is_liked'),
+                db=db,
             ))
         return result
 
@@ -290,17 +293,8 @@ class RecommendationService:
 
     @staticmethod
     def _get_blocked_feed_author_ids(db: Session, user_id: int) -> set[int]:
-        """Return authors hidden by either side of a block relationship."""
-        from app.ws_manager import ws_manager
-
-        blocked_ids = set(ws_manager.get_blocked_user_ids(user_id))
-        blocked_by_rows = (
-            db.query(Block.blocker_id)
-            .filter(Block.blocked_id == user_id)
-            .all()
-        )
-        blocked_ids.update(row[0] for row in blocked_by_rows)
-        return blocked_ids
+        """Return DB-authoritative authors hidden by either block direction."""
+        return excluded_user_ids(db, user_id)
 
     @staticmethod
     def _build_home_feed_query(
@@ -365,7 +359,7 @@ class RecommendationService:
         ).label('feed_score')
 
         candidate_filters = [
-            Post.is_public == True,
+            post_visibility_predicate(user_id),
             Post.created_at >= window_start,
             or_(Post.community_only == False, Post.community_only == None),
             or_(Post.hidden_by_admin == False, Post.hidden_by_admin == None),
@@ -534,7 +528,7 @@ class RecommendationService:
 
         # 批量加载聚合数据，消除 N+1
         batch_data = RecommendationService._batch_load_post_data(db, diversified_posts, user_id)
-        serialized_posts = RecommendationService._serialize_posts(diversified_posts, batch_data)
+        serialized_posts = RecommendationService._serialize_posts(diversified_posts, batch_data, current_user_id=user_id, db=db)
         RecommendationService._record_feed_seen(db, user_id, diversified_posts, now=now)
 
         return {
@@ -550,7 +544,12 @@ class RecommendationService:
         }
 
     @staticmethod
-    def get_trending_posts(db: Session, limit: int = 10, hours: int = 24):
+    def get_trending_posts(
+        db: Session,
+        limit: int = 10,
+        hours: int = 24,
+        current_user_id: int | None = None,
+    ):
         time_threshold = datetime.utcnow() - timedelta(hours=hours)
         now = datetime.utcnow()
 
@@ -561,7 +560,7 @@ class RecommendationService:
                 (func.unix_timestamp(now) - func.unix_timestamp(Post.created_at)) / 3600.0 + 1, 0.7
             )).label('time_decay')
         ).outerjoin(Like, Post.id == Like.post_id).outerjoin(Comment, Post.id == Comment.post_id).filter(
-            Post.is_public == True,
+            post_visibility_predicate(current_user_id),
             Post.created_at >= time_threshold
         ).group_by(Post.id).order_by(
             ((func.count(func.distinct(Like.id)) + func.count(func.distinct(Comment.id)) * 2) *
@@ -586,7 +585,7 @@ class RecommendationService:
                 break
 
         # 批量加载聚合数据
-        batch_data = RecommendationService._batch_load_post_data(db, post_objects, None)
+        batch_data = RecommendationService._batch_load_post_data(db, post_objects, current_user_id)
 
         # 重新构建，保持 engagement/decay 信息
         idx = 0
@@ -595,7 +594,7 @@ class RecommendationService:
                 break
             data = batch_data.get(post.id, {})
             post_dict = post.to_dict(
-                current_user_id=None,
+                current_user_id=current_user_id,
                 like_count=data.get('like_count'),
                 comment_count=data.get('comment_count'),
                 topics=data.get('topics'),
@@ -656,6 +655,7 @@ class RecommendationService:
             User.is_active == True,
             User.id != current_user_id,
             ~User.id.in_(friend_ids + [current_user_id]),
+            visible_user_predicate(current_user_id, User.id),
             or_(friends_of_friends.c.user_id.isnot(None), common_topic_users.c.user_id.isnot(None))
         ).order_by(
             (func.coalesce(friends_of_friends.c.mutual_friends, 0) * 2 +
@@ -686,15 +686,24 @@ class RecommendationService:
             ((Friendship.sender_id == current_user_id) | (Friendship.receiver_id == current_user_id)) &
             (Friendship.status == 'accepted')
         ).all()
-        friend_ids = [f.sender_id if f.receiver_id == current_user_id else f.receiver_id for f in friendships]
+        blocked_ids = excluded_user_ids(db, current_user_id)
+        friend_ids = [
+            f.sender_id if f.receiver_id == current_user_id else f.receiver_id
+            for f in friendships
+            if (f.sender_id if f.receiver_id == current_user_id else f.receiver_id) not in blocked_ids
+        ]
 
         pending_requests = db.query(Friendship).filter(
             ((Friendship.sender_id == current_user_id) | (Friendship.receiver_id == current_user_id)) &
             (Friendship.status == 'pending')
         ).all()
-        pending_ids = [f.sender_id if f.receiver_id == current_user_id else f.receiver_id for f in pending_requests]
+        pending_ids = [
+            f.sender_id if f.receiver_id == current_user_id else f.receiver_id
+            for f in pending_requests
+            if (f.sender_id if f.receiver_id == current_user_id else f.receiver_id) not in blocked_ids
+        ]
 
-        exclude_ids = friend_ids + pending_ids + [current_user_id]
+        exclude_ids = friend_ids + pending_ids + list(blocked_ids) + [current_user_id]
 
         candidates = {}
 
@@ -813,10 +822,18 @@ class RecommendationService:
         }
 
     @staticmethod
-    def get_related_posts(db: Session, post_id: int, limit: int = 5):
+    def get_related_posts(
+        db: Session,
+        post_id: int,
+        limit: int = 5,
+        current_user_id: int | None = None,
+    ):
         from app.models.models import Topic, post_topics
 
-        post = db.query(Post).filter(Post.id == post_id).first()
+        post = db.query(Post).filter(
+            Post.id == post_id,
+            post_visibility_predicate(current_user_id),
+        ).first()
         if not post:
             return {'posts': [], 'algorithm': 'related_v1'}
 
@@ -827,7 +844,7 @@ class RecommendationService:
             post_topics, Post.id == post_topics.c.post_id
         ).filter(
             Post.id != post_id,
-            Post.is_public == True,
+            post_visibility_predicate(current_user_id),
             or_(Post.user_id == post.user_id, post_topics.c.topic_id.in_(topic_ids) if topic_ids else False)
         ).order_by(
             case((post_topics.c.topic_id.in_(topic_ids), 100), else_=0).desc(),
@@ -835,5 +852,5 @@ class RecommendationService:
         ).limit(limit)
 
         posts = related_query.all()
-        batch_data = RecommendationService._batch_load_post_data(db, posts, None)
-        return {'posts': RecommendationService._serialize_posts(posts, batch_data), 'algorithm': 'related_v2'}
+        batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
+        return {'posts': RecommendationService._serialize_posts(posts, batch_data, current_user_id=current_user_id, db=db), 'algorithm': 'related_v2'}
