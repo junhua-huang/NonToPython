@@ -20,7 +20,7 @@ from app.services.moderation_service import moderation_service
 from app.services.moderation_snapshot import poll_snapshots, snapshot_store
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
-from app.routers import communities, push, admin_panel, app_updates, deployments
+from app.routers import communities, push, admin_panel, app_updates, deployments, admin_bots, open_api
 import app.models.deployment  # Register deployment tables with the shared Base.
 
 # 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
@@ -149,7 +149,7 @@ async def log_request_timing(request, call_next):
     finally:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         path = request.url.path
-        if path.startswith('/api/'):
+        if path.startswith('/api/') or path.startswith('/nontoOpenApi'):
             log_payload = {
                 'method': request.method,
                 'path': path,
@@ -168,7 +168,12 @@ async def add_security_headers(request, call_next):
     response = await call_next(request)
     # 跳过 API 路由和 OPTIONS 预检
     path = request.url.path
-    if request.method == "OPTIONS" or path.startswith("/api/") or path.startswith("/ws"):
+    if (
+        request.method == "OPTIONS"
+        or path.startswith("/api/")
+        or path.startswith("/nontoOpenApi")
+        or path.startswith("/ws")
+    ):
         return response
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
@@ -200,6 +205,8 @@ app.include_router(push.router, prefix="/api/push", tags=["Push"])
 app.include_router(app_updates.public_router)
 app.include_router(app_updates.admin_router)
 app.include_router(deployments.router)
+app.include_router(admin_bots.router)
+app.include_router(open_api.router, prefix="/nontoOpenApi", tags=["OpenAPI"])
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 
@@ -214,6 +221,7 @@ async def root():
             "posts": "/api/posts",
             "friends": "/api/friends",
             "chat": "/api/chat",
+            "open_api": "/nontoOpenApi",
         }
     }
 

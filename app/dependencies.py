@@ -9,7 +9,7 @@ HTTP / WebSocket 完全复用同一套规则。
 from fastapi import Depends, HTTPException, Request, Query
 from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
-from app.core.auth_core import verify_token, AuthError
+from app.core.auth_core import verify_local_deployment_session, verify_token, AuthError
 from app.models.models import User
 from app.services.moderation_errors import AccountDisabled, AppContractError, to_http_exception
 
@@ -80,7 +80,16 @@ def require_role(*role_names: str):
         db: Session = Depends(get_db),
     ) -> User:
         try:
-            user = verify_token(_request_token(request, access_token))
+            headers = getattr(request, "headers", {})
+            authorization = headers.get("authorization")
+            local_token = headers.get("x-deployment-local-token")
+            path = getattr(getattr(request, "url", None), "path", "")
+            if (not authorization and local_token and
+                    (path == "/api/admin/deployments" or
+                     path.startswith("/api/admin/deployments/"))):
+                user = verify_local_deployment_session(request)
+            else:
+                user = verify_token(_request_token(request, access_token))
         except AppContractError as e:
             raise to_http_exception(e) from None
         except AuthError as e:

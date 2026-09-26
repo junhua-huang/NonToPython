@@ -101,6 +101,33 @@ def create(client, artifact, operation="deploy", key="request-1", **extra):
                        idempotency_key=key, reason="Release test", **extra))
 
 
+def test_local_deployment_session_is_loopback_only_and_uses_live_user(setup, monkeypatch):
+    client, factory, _ = setup
+    monkeypatch.setenv("DEPLOYMENT_LOCAL_TOKEN", "local-session-secret")
+    monkeypatch.setenv("DEPLOYMENT_LOCAL_USER_ID", "1")
+    monkeypatch.setattr(auth_core, "_is_loopback", lambda request: False)
+    assert client.get(PREFIX + "/capabilities", headers={
+        "X-Deployment-Local-Token": "local-session-secret",
+    }).status_code == 401
+    monkeypatch.setattr(auth_core, "_is_loopback", lambda request: True)
+    response = client.get(PREFIX + "/capabilities", headers={
+        "X-Deployment-Local-Token": "local-session-secret",
+    })
+    assert response.status_code == 200
+    assert client.get("/current", headers={
+        "X-Deployment-Local-Token": "local-session-secret",
+    }).status_code == 401
+    assert client.get(PREFIX + "/capabilities", headers={
+        "X-Deployment-Local-Token": "wrong",
+    }).status_code == 401
+    with factory() as db:
+        db.query(User).filter(User.id == 1).update({"is_active": False})
+        db.commit()
+    assert client.get(PREFIX + "/capabilities", headers={
+        "X-Deployment-Local-Token": "local-session-secret",
+    }).status_code in {401, 403}
+
+
 def test_real_bearer_transport_and_header_precedence(setup):
     client, _, _ = setup
     token = headers()["Authorization"].split()[1]

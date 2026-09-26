@@ -55,12 +55,15 @@ class BoundedRoute(APIRoute):
 router = APIRouter(prefix="/api/admin/deployments", tags=["Deployments"], route_class=BoundedRoute)
 
 
-def operator(user=Depends(require_admin), db: Session = Depends(get_db)):
+def operator(request: Request, user=Depends(require_admin), db: Session = Depends(get_db)):
     try:
         config = get_deployment_config(db)
     except ValueError:
         raise HTTPException(503, "deployment_configuration_invalid") from None
-    if not config.enabled or user.id not in config.operator_ids:
+    if not config.enabled:
+        raise HTTPException(403, "deployment_not_enabled")
+    local_session = bool(request.headers.get("x-deployment-local-token")) and not request.headers.get("authorization")
+    if not local_session and user.id not in config.operator_ids:
         raise HTTPException(403, "deployment_not_authorized")
     return user
 
@@ -132,14 +135,15 @@ def job_dto(db, job):
 
 
 @router.get("/capabilities")
-def capabilities(user=Depends(require_admin), db: Session = Depends(get_db)):
+def capabilities(request: Request, user=Depends(require_admin), db: Session = Depends(get_db)):
     try:
         config = get_deployment_config(db)
     except ValueError:
         raise HTTPException(503, "deployment_configuration_invalid") from None
+    local_session = bool(request.headers.get("x-deployment-local-token")) and not request.headers.get("authorization")
     return {
         "enabled": config.enabled,
-        "can_deploy": config.enabled and user.id in config.operator_ids,
+        "can_deploy": config.enabled and (local_session or user.id in config.operator_ids),
         "can_configure": True,
     }
 

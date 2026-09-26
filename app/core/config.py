@@ -67,6 +67,15 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
     POSTS_PER_PAGE = 20
 
+    # 机器人/测试账号批量供应：管理员通过 /api/admin/bots 生成受控机器人身份的上限。
+    # 仅用于自运营测试/课程作业场景，机器人由平台生成合成邮箱，不读取第三方凭据。
+    @classmethod
+    def get_max_bot_accounts(cls) -> int:
+        try:
+            return int(os.environ.get('MAX_BOT_ACCOUNTS', '5000'))
+        except (TypeError, ValueError):
+            return 5000
+
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
     UPLOAD_FOLDER = os.path.join(BASE_DIR, '..', 'uploads')
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024

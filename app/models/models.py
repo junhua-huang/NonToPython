@@ -111,6 +111,8 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     # 邮箱是否已验证（注册时通过邮箱验证码验证后置 True）
     is_email_verified = Column(Boolean, default=False)
+    # 是否为受控机器人/测试账号（仅管理员通过 bots provisioning 创建，非真实用户）
+    is_bot = Column(Boolean, default=False, nullable=False)
 
     # 隐私设置
     profile_visibility = Column(String(20), default='public')

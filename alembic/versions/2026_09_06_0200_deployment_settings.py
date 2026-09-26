@@ -13,7 +13,8 @@ def upgrade():
         "deployment_settings",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("operator_ids_json", sa.Text(), nullable=False, server_default="[]"),
+        # MySQL rejects defaults on TEXT columns; the application supplies [] when creating the row.
+        sa.Column("operator_ids_json", sa.Text(), nullable=False),
         sa.Column("max_bytes", sa.Integer(), nullable=False, server_default="524288000"),
         sa.Column("max_expanded_bytes", sa.Integer(), nullable=False, server_default="1073741824"),
         sa.Column("max_files", sa.Integer(), nullable=False, server_default="10000"),

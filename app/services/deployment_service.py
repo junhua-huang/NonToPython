@@ -78,7 +78,7 @@ def worker_authorized(db, user_id):
         config = get_deployment_config(db)
     except ValueError:
         return False
-    if not config.enabled or user_id not in config.operator_ids:
+    if not config.enabled:
         return False
     return db.query(User.id).join(UserRole, UserRole.user_id == User.id).join(Role, Role.id == UserRole.role_id).filter(
         User.id == user_id, User.is_active.is_(True), Role.name == "admin"
