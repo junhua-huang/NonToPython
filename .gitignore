@@ -29,3 +29,7 @@ uploads/
 # OS
 .DS_Store
 Thumbs.db
+# Apple server-only signing material
+*.p8
+*.p12
+*.mobileprovision

@@ -104,6 +104,12 @@ class Config:
     ALIYUN_PUSH_ANDROID_ACTIVITY = os.environ.get('ALIYUN_PUSH_ANDROID_ACTIVITY', 'com.nonto.nonto.MainActivity')
     ALIYUN_PUSH_ANDROID_CHANNEL_ID = os.environ.get('ALIYUN_PUSH_ANDROID_CHANNEL_ID', 'nonto_message_alerts')
 
+    # Native APNs provider credentials remain on the server.
+    APNS_KEY_ID = os.environ.get('APNS_KEY_ID', '').strip()
+    APNS_TEAM_ID = os.environ.get('APNS_TEAM_ID', '').strip()
+    APNS_PRIVATE_KEY_PATH = os.environ.get('APNS_PRIVATE_KEY_PATH', '').strip()
+    APNS_BUNDLE_ID = os.environ.get('APNS_BUNDLE_ID', 'online.nonto.native').strip()
+
     # 邮件 (SMTP) 配置 - 用于发送邮箱验证码
     # QQ 邮箱用 SSL 465 端口，授权码非登录密码
     SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.qq.com')

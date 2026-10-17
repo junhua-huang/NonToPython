@@ -238,3 +238,12 @@ def update_notification_settings(
     except Exception as e:
         db.rollback()
         raise _internal_error()
+
+
+@router.get("/{notification_id}")
+def get_notification(notification_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Resolve an authenticated notification deep link using current visibility."""
+    notification = visible_notification_query(db, user.id).filter(Notification.id == notification_id).first()
+    if not notification:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"notification": notification.to_dict()}

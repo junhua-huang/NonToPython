@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.models import Notification, User
 from app.services.aliyun_push_service import AliyunPushService
+from app.services.apns_push_service import APNsPushService
 from app.services.block_service import has_block_between
 from app.services.notification_query_service import (
     is_notification_visible,
@@ -131,6 +132,7 @@ class NotificationService:
             # --- Mobile push (best effort; respects notify_push/block checks internally) ---
             try:
                 AliyunPushService.schedule_notification_push(user_id, notification_dict)
+                APNsPushService.schedule_notification_push(user_id, notification_dict)
             except Exception as push_error:
                 logger.warning(
                     "[NOTIFY PUSH] scheduling failed uid=%s error_code=%s exception_type=%s",
@@ -257,13 +259,15 @@ class NotificationService:
         conversation_id,
     ):
         """Send a chat alert without creating an interaction notification row."""
-        return AliyunPushService.schedule_message_push(
-            receiver_id=receiver_id,
-            sender_id=sender_id,
-            message_id=message_id,
-            conversation_id=conversation_id,
-            message_content=message_content,
+        result = AliyunPushService.schedule_message_push(
+            receiver_id=receiver_id, sender_id=sender_id, message_id=message_id,
+            conversation_id=conversation_id, message_content=message_content,
         )
+        APNsPushService.schedule_message_push(
+            receiver_id=receiver_id, sender_id=sender_id, message_id=message_id,
+            conversation_id=conversation_id, message_content=message_content,
+        )
+        return result
 
     @staticmethod
     def notify_message(

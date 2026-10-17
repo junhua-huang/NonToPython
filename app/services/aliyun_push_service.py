@@ -39,6 +39,8 @@ class ProviderSendResult(NamedTuple):
 class AliyunPushService:
     """Send Android notification pushes through Aliyun CloudPush."""
 
+    NOT_CONFIGURED_CODE = "ALIYUN_PUSH_NOT_CONFIGURED"
+    NOT_CONFIGURED_MESSAGE = "Aliyun push configuration is incomplete"
     ACTION = "PushNoticeToAndroid"
     VERSION = "2016-08-01"
     PENDING_CLAIM_TTL_SECONDS = 120
@@ -210,8 +212,8 @@ class AliyunPushService:
                         user_id,
                         device_id,
                         notification_dict,
-                        "ALIYUN_PUSH_NOT_CONFIGURED",
-                        "Aliyun push configuration is incomplete",
+                        cls.NOT_CONFIGURED_CODE,
+                        cls.NOT_CONFIGURED_MESSAGE,
                     )
                     continue
                 claim_token = cls._claim_delivery(

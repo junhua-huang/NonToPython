@@ -621,6 +621,10 @@ class PushDevice(Base):
     platform = Column(String(20), default='android')
     provider = Column(String(30), default='aliyun')
     device_id = Column(String(128), nullable=False, index=True)
+    apns_token = Column(String(512))
+    apns_environment = Column(String(20))
+    apns_topic = Column(String(255))
+    binding_secret_hash = Column(String(64))
     manufacturer = Column(String(80))
     model = Column(String(120))
     app_version = Column(String(50))
@@ -642,6 +646,8 @@ class PushDevice(Base):
             'platform': self.platform,
             'provider': self.provider,
             'device_id': self.device_id,
+            'apns_environment': self.apns_environment,
+            'apns_topic': self.apns_topic,
             'manufacturer': self.manufacturer,
             'model': self.model,
             'app_version': self.app_version,

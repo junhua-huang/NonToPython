@@ -1,0 +1,6 @@
+services:
+  nantupy-backend:
+    environment:
+      APNS_PRIVATE_KEY_PATH: /run/nonto-apns/AuthKey.p8
+    volumes:
+      - "${APNS_KEY_DIR:?Set APNS_KEY_DIR to the server directory containing AuthKey.p8}:/run/nonto-apns:ro"
