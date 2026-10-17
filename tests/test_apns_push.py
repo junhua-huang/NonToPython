@@ -233,3 +233,13 @@ def test_apns_migration_upgrades_and_downgrades_without_losing_legacy_columns():
         assert {c["name"] for c in inspect(conn).get_columns("push_devices")} == {"id", "device_id"}
         assert conn.execute(text("SELECT device_id FROM push_devices WHERE id=1")).scalar() == "android-existing"
     engine.dispose()
+
+
+
+def test_inert_registration_from_an_old_backend_can_be_upgraded(db_env):
+    db_env.add(PushDevice(device_id=DEVICE, user_id=2, provider="apns", platform="ios", enabled=True))
+    db_env.commit()
+    result = bind(db_env)
+    assert result["registered"]
+    assert db_env.query(PushDevice).one().apns_token == TOKEN
+    assert db_env.query(PushDevice).one().binding_secret_hash is not None

@@ -83,7 +83,10 @@ def register_device(
     device = db.query(PushDevice).filter(PushDevice.device_id == device_id).first()
     if device and device.provider == "apns":
         digest = hashlib.sha256(str(payload.get("binding_secret", "")).encode()).hexdigest()
-        if not apns or not device.binding_secret_hash or not hmac.compare_digest(device.binding_secret_hash, digest):
+        # Older servers accepted provider=apns without storing any APNs token or
+        # secret. Such inert rows can be upgraded; a usable binding always needs its secret.
+        legacy_empty = device.binding_secret_hash is None and device.apns_token is None
+        if not apns or (not legacy_empty and (not device.binding_secret_hash or not hmac.compare_digest(device.binding_secret_hash, digest))):
             raise HTTPException(status_code=403, detail="invalid installation credential")
     if not device:
         device = PushDevice(device_id=device_id, user_id=current_user.id)
