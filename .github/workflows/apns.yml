@@ -22,3 +22,5 @@ jobs:
         run: python -m pytest tests/test_apns_push.py tests/test_aliyun_push_contracts.py tests/test_app_state_push_contracts.py tests/test_push_dedupe_contracts.py tests/test_notification_service_unit.py tests/test_presence_app_state_contracts.py -q
       - name: Verify migration head
         run: python -m alembic heads
+      - name: Verify read-only privacy inventory
+        run: python -m unittest discover -s tests -p test_account_privacy_inventory.py -v
