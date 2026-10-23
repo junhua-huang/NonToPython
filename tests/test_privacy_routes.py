@@ -80,5 +80,5 @@ def test_public_legal_pages_are_exact_bundles_and_keep_unverified_release_state(
         assert response.headers["cache-control"] == "no-cache"
         assert "{{" not in response.text
         assert "<script" not in response.text.lower()
-    assert privacy_client.get("/PrivacyPolicy/", follow_redirects=False).headers["location"] == "/api/legal/privacy.html"
+    assert privacy_client.get("/PrivacyPolicy/", follow_redirects=False).headers["location"] == "/api/legal/privacy"
     assert privacy_client.get("/api/legal/other.env").status_code == 404

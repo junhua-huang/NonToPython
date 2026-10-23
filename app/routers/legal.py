@@ -36,14 +36,15 @@ def legal_document(name: str):
 
 @router.get("/PrivacyPolicy/", include_in_schema=False)
 def legacy_privacy():
-    return RedirectResponse("/api/legal/privacy.html", status_code=307)
+    # Nginx intercepts *.html as static files; canonical public URLs are extensionless.
+    return RedirectResponse("/api/legal/privacy", status_code=307)
 
 
 @router.get("/TermsOfService/", include_in_schema=False)
 def legacy_terms():
-    return RedirectResponse("/api/legal/terms.html", status_code=307)
+    return RedirectResponse("/api/legal/terms", status_code=307)
 
 
 @router.get("/CommunityGuidelines/", include_in_schema=False)
 def legacy_community():
-    return RedirectResponse("/api/legal/community.html", status_code=307)
+    return RedirectResponse("/api/legal/community", status_code=307)
