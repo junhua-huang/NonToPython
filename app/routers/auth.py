@@ -29,6 +29,7 @@ from app.services.moderation_inventory import MODERATED_TEXT_FIELDS
 from app.services.moderation_service import moderation_service
 from app.services.moderation_types import ModerationContext
 from app.serializers.user import serialize_user_profile, serialize_user_self
+from app.services.account_erasure_service import erase_account
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Auth"])
@@ -40,9 +41,8 @@ _FORBIDDEN_USERNAME_CHARS = set('/\\?#@:\r\n\t')
 
 async def _send_otp_email_background(email: str, code: str, purpose: str) -> None:
     sent = await EmailService.send_otp_email(email, code, purpose)
-    if not sent and Config.DEBUG:
-        # 开发模式：邮件发不出时把验证码打到日志，方便本地测试
-        logger.info("[OTP DEV] email=%s purpose=%s code=%s", email, purpose, code)
+    if not sent:
+        logger.warning("otp_email_delivery_failed purpose=%s", purpose)
 
 
 def is_allowed_registration_email(email: str) -> bool:
@@ -627,12 +627,12 @@ def delete_account(
     db: Session = Depends(get_db),
 ):
     """注销当前用户账号及关联数据"""
-    current = db.query(User).filter(User.id == user.id).first()
     try:
-        db.delete(current)
+        erasure_id = erase_account(db, user.id)
         db.commit()
-        logger.info("User account deleted user_id=%s", user.id)
-        return {"message": "Account deleted successfully"}
+    except LookupError:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="User not found") from None
     except Exception as e:
         db.rollback()
         logger.error(
@@ -641,6 +641,16 @@ def delete_account(
             type(e).__name__,
         )
         raise HTTPException(status_code=500, detail="An error occurred while deleting the account")
+    # A post-commit socket failure cannot turn a committed deletion into a 500.
+    try:
+        from app.ws_manager import ws_manager
+        ws_manager.schedule_push(ws_manager.disconnect(user.id))
+        ws_manager.clear_social_caches()
+    except Exception:
+        logger.warning("account_erasure_socket_cleanup_failed erasure_id=%s", erasure_id)
+    logger.info("User account deleted erasure_id=%s", erasure_id)
+    return {"message": "Account deleted successfully", "erasure_id": erasure_id,
+            "account_deleted": True, "media_cleanup": "pending", "backup_cleanup": "unverified"}
 
 
 # ============================================================

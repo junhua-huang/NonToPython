@@ -1245,6 +1245,14 @@ async def websocket_endpoint(websocket: WebSocket):
         # ── 阶段 3: 正常收发 ──
         while True:
             data = await websocket.receive_json()
+            # Another HTTP/app worker may have deleted or disabled the account.
+            # Revalidate before sync/ping/write dispatch; never trust the old socket alone.
+            try:
+                await asyncio.to_thread(verify_token, token)
+            except (AuthError, AppContractError):
+                await websocket.close(code=4001, reason="account_unavailable")
+                await ws_manager.disconnect(user_id, conn_id)
+                return
             msg_type = data.get("type", "")
             logger.debug(
                 "[WS RECV] uid=%s type=%s has_payload=%s",

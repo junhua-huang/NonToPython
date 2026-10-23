@@ -18,9 +18,11 @@ from app.database import init_db
 from app.services.local_text_moderator import LocalTextModerator
 from app.services.moderation_service import moderation_service
 from app.services.moderation_snapshot import poll_snapshots, snapshot_store
+from app.services.privacy_cleanup_service import poll_privacy_cleanup
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
 from app.routers import communities, push, admin_panel, app_updates, deployments, admin_bots, open_api
+from app.routers import legal, privacy_admin
 import app.models.deployment  # Register deployment tables with the shared Base.
 
 # 配置日志：生产环境用 INFO，避免 DEBUG 级别把 SQL/敏感数据写进日志。
@@ -42,6 +44,8 @@ for _ws_logger_name in ['app.routers.ws', 'app.ws_manager']:
     _l.propagate = True
 
 logger = logging.getLogger(__name__)
+# SDK INFO messages include object paths and request headers; do not persist these.
+logging.getLogger("qcloud_cos").setLevel(logging.WARNING)
 
 moderation_service.local_moderator = LocalTextModerator(
     snapshot_store.current_snapshot
@@ -75,6 +79,7 @@ async def lifespan(app: FastAPI):
         raise startup_cancellation
 
     poller = asyncio.create_task(poll_snapshots(snapshot_store, stop))
+    privacy_poller = asyncio.create_task(poll_privacy_cleanup(stop))
     body_error = None
     try:
         yield
@@ -84,9 +89,9 @@ async def lifespan(app: FastAPI):
     finally:
         stop.set()
         shutdown_cancellation = None
-        while not poller.done():
+        while not (poller.done() and privacy_poller.done()):
             try:
-                await asyncio.wait({poller})
+                await asyncio.wait({poller, privacy_poller}, return_when=asyncio.ALL_COMPLETED)
             except asyncio.CancelledError as error:
                 if shutdown_cancellation is None:
                     shutdown_cancellation = error
@@ -94,6 +99,10 @@ async def lifespan(app: FastAPI):
             poller.result()
         except BaseException:
             logger.error("moderation_snapshot_poller_failed")
+        try:
+            privacy_poller.result()
+        except BaseException:
+            logger.error("privacy_cleanup_poller_failed")
         logger.info("Shutting down NanTuPy server...")
         if body_error is None and shutdown_cancellation is not None:
             raise shutdown_cancellation
@@ -207,6 +216,8 @@ app.include_router(app_updates.admin_router)
 app.include_router(deployments.router)
 app.include_router(admin_bots.router)
 app.include_router(open_api.router, prefix="/nontoOpenApi", tags=["OpenAPI"])
+app.include_router(legal.router)
+app.include_router(privacy_admin.router)
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
 
 

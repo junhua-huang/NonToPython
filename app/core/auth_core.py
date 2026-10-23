@@ -10,8 +10,10 @@ import ipaddress
 import os
 from jose import jwt, JWTError
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
 from app.database import SessionLocal
 from app.models.models import User, UserRole
+from app.models.privacy import AccountErasure
 from app.core.config import Config
 from app.services.moderation_errors import AccountDisabled
 
@@ -51,6 +53,8 @@ def verify_local_deployment_session(request) -> User:
             raise AuthError("User not found", 401)
         if user.is_active is not True:
             raise AccountDisabled()
+        if db.execute(select(AccountErasure.id).where(AccountErasure.user_id == user.id)).first():
+            raise AuthError("User not found", 401)
         db.expunge(user)
         return user
     finally:
@@ -98,6 +102,8 @@ def verify_token(token: str) -> User:
             raise AuthError("User not found", 401)
         if user.is_active is not True:
             raise AccountDisabled()
+        if db.execute(select(AccountErasure.id).where(AccountErasure.user_id == user.id)).first():
+            raise AuthError("User not found", 401)
         # 把 user 从 session 中分离，避免调用方闭包 session 问题
         db.expunge(user)
         return user

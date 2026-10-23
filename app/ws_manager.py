@@ -451,6 +451,10 @@ class WSManager:
         conns = self._connections.get(user_id, {})
         if not conns:
             return
+        # A different application worker may have committed account deletion.
+        if not await asyncio.to_thread(self._account_can_receive_sync, user_id):
+            await self.disconnect(user_id)
+            return
         dead = []
         for conn_id, ws in list(conns.items()):
             try:
@@ -459,6 +463,18 @@ class WSManager:
                 dead.append(conn_id)
         for conn_id in dead:
             await self.disconnect(user_id, conn_id)
+
+    def _account_can_receive_sync(self, user_id: int) -> bool:
+        from sqlalchemy import select
+        from app.models.models import User
+        from app.models.privacy import AccountErasure
+        with SessionLocal() as db:
+            try:
+                return bool(db.execute(select(User.id).where(User.id == user_id, User.is_active.is_(True),
+                    ~select(AccountErasure.id).where(AccountErasure.user_id == user_id).exists())).first())
+            except Exception:
+                logger.warning("ws_recipient_revalidation_failed")
+                return False
 
     async def send_with_seq(self, user_id: int, event: str, data: dict):
         """向用户推送一条带序号的消息。覆盖所有设备。
@@ -738,6 +754,11 @@ class WSManager:
         self._session_cache.pop(user_id, None)
         self._conv_ids_cache.pop(user_id, None)
         self._blocked_cache.pop(user_id, None)
+
+    def clear_social_caches(self):
+        self._session_cache.clear()
+        self._conv_ids_cache.clear()
+        self._blocked_cache.clear()
 
     def get_blocked_user_ids(self, user_id: int, ttl: float = 30.0) -> set[int]:
         now = time.time()

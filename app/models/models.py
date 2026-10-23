@@ -950,7 +950,7 @@ class ComicEvent(Base):
     status = Column(Integer, default=0)  # 0=即将开始, 1=进行中, 2=已结束
     like_count = Column(Integer, default=0)
     comment_count = Column(Integer, default=0)
-    creator_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    creator_id = Column(Integer, ForeignKey('users.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1440,7 +1440,7 @@ class AdminAuditLog(Base):
     __tablename__ = 'admin_audit_logs'
 
     id = Column(Integer, primary_key=True)
-    admin_user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    admin_user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     action = Column(String(80), nullable=False, index=True)
     target_type = Column(String(50), nullable=False, index=True)
     target_id = Column(String(80), nullable=True, index=True)

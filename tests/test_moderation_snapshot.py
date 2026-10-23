@@ -17,6 +17,18 @@ from app.services.moderation_snapshot import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_privacy_worker_in_snapshot_tests(monkeypatch):
+    # These lifecycle tests replace the moderation DB; they must not start an
+    # independent cleanup worker against any configured environment database.
+    import app.main as main_module
+
+    async def cooperative_privacy_worker(stop):
+        await stop.wait()
+
+    monkeypatch.setattr(main_module, "poll_privacy_cleanup", cooperative_privacy_worker)
+
+
 class ManualClock:
     def __init__(self, value: float = 100.0):
         self.value = value

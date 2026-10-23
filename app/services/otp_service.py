@@ -90,7 +90,7 @@ class OtpService:
         db.add(otp)
         db.commit()
         db.refresh(otp)
-        logger.info("[OTP] generated email=%s purpose=%s id=%s", email, purpose, otp.id)
+        logger.info("[OTP] generated purpose=%s id=%s", purpose, otp.id)
         return code
 
     @staticmethod

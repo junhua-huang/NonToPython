@@ -14,7 +14,7 @@ class DeploymentArtifact(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     manifest_json = Column(Text().with_variant(MEDIUMTEXT(), "mysql"), nullable=False)
     bundle_sha256 = Column(String(64), nullable=False)
-    uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -27,7 +27,7 @@ class DeploymentJob(Base):
     reason = Column(String(500), nullable=False)
     status = Column(String(32), nullable=False, index=True)
     phase = Column(String(64), nullable=False, default="pending")
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)

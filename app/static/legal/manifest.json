@@ -1,0 +1,10 @@
+{
+  "policyVersion": "2026-10-23.4",
+  "revision": "d9eb8d1c61daff0fc725fea808d7caf36eea274135e2b00f17a322cd56c9d0cd",
+  "releaseReady": false,
+  "documents": [
+    "privacy",
+    "terms",
+    "community"
+  ]
+}

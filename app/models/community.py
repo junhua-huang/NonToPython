@@ -35,7 +35,7 @@ class Community(Base):
     banner_url = Column(String(255))                  # 推特风格封面图
     rules = Column(Text)                              # 社群规则
 
-    owner_id = Column(Integer, ForeignKey('users.id', name='fk_communities_owner'), nullable=False, index=True)
+    owner_id = Column(Integer, ForeignKey('users.id', name='fk_communities_owner'), nullable=True, index=True)
     topic_id = Column(Integer, ForeignKey('topics.id', name='fk_communities_topic'), nullable=True)
 
     visibility = Column(String(20), default='public')     # public（第一版固定）
@@ -223,7 +223,7 @@ class CommunityBan(Base):
     id = Column(Integer, primary_key=True)
     community_id = Column(Integer, ForeignKey('communities.id', ondelete='CASCADE', name='fk_cb_community'), nullable=False)
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE', name='fk_cb_user'), nullable=False)
-    banned_by = Column(Integer, ForeignKey('users.id', name='fk_cb_banned_by'), nullable=False)
+    banned_by = Column(Integer, ForeignKey('users.id', name='fk_cb_banned_by'), nullable=True)
     reason = Column(String(200))
     banned_until = Column(DateTime, nullable=True)     # NULL=永久；有值=临时
     created_at = Column(DateTime, default=datetime.utcnow)
