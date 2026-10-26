@@ -118,33 +118,35 @@ class NotificationService:
                 )
                 return None
 
-            # --- WebSocket push (best effort) ---
-            try:
-                NotificationService._push_new_notification(user_id, notification_dict)
-            except Exception as ws_error:
-                logger.warning(
-                    "[NOTIFY WS] scheduling failed uid=%s error_code=%s exception_type=%s",
-                    user_id,
-                    "WS_SCHEDULING_ERROR",
-                    NotificationService._safe_exception_type(ws_error),
-                )
-
-            # --- Mobile push (best effort; respects notify_push/block checks internally) ---
-            try:
-                AliyunPushService.schedule_notification_push(user_id, notification_dict)
-                APNsPushService.schedule_notification_push(user_id, notification_dict)
-            except Exception as push_error:
-                logger.warning(
-                    "[NOTIFY PUSH] scheduling failed uid=%s error_code=%s exception_type=%s",
-                    user_id,
-                    "PUSH_SCHEDULING_ERROR",
-                    NotificationService._safe_exception_type(push_error),
-                )
-
+            NotificationService.dispatch_notification(user_id, notification_dict)
             return notification
         finally:
             if own_db:
                 db.close()
+
+    @staticmethod
+    def dispatch_notification(user_id: int, notification_dict: dict) -> None:
+        """Deliver an already committed row; scheduling failures cannot undo receipt.
+
+        Callers that own a business transaction can persist its notification in
+        that transaction and dispatch only after commit. Each channel is isolated
+        so an unavailable provider cannot suppress the other delivery paths.
+        """
+        channels = (
+            ("WS", NotificationService._push_new_notification),
+            ("ALIYUN", AliyunPushService.schedule_notification_push),
+            ("APNS", APNsPushService.schedule_notification_push),
+        )
+        for channel, schedule in channels:
+            try:
+                schedule(user_id, notification_dict)
+            except Exception as exc:
+                logger.warning(
+                    "[NOTIFY %s] scheduling failed uid=%s error_code=%s exception_type=%s",
+                    channel, user_id,
+                    "WS_SCHEDULING_ERROR" if channel == "WS" else "PUSH_SCHEDULING_ERROR",
+                    NotificationService._safe_exception_type(exc),
+                )
 
     @staticmethod
     def notify_like(post_owner_id, liker_id, post_id, db=None):

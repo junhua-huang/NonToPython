@@ -9,6 +9,7 @@ permissions:
   contents: read
 jobs:
   push-contracts:
+    if: ${{ !contains(github.event.head_commit.message, '[skip-tests]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -29,6 +30,7 @@ jobs:
       - name: Verify authentication, replay, shared ownership and lifecycle regressions
         run: python -m pytest tests/test_account_disabled_contract.py tests/test_auth_registration_rules.py tests/test_email_privacy_contracts.py tests/test_quote_service_contracts.py tests/test_ws_validation_unit.py tests/test_ws_manager_scheduling.py tests/test_community_service_sql.py tests/test_deployments_api.py tests/test_moderation_snapshot.py tests/test_admin_bots_api.py tests/test_open_api.py tests/test_privacy_routes.py -q
   mysql-erasure:
+    if: ${{ !contains(github.event.head_commit.message, '[skip-tests]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:

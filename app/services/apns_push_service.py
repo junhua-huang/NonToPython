@@ -12,6 +12,7 @@ from jose import jwt
 from app.core.config import Config
 from app.models.models import PushDevice, PushLog, User
 from app.services.aliyun_push_service import AliyunPushService, ProviderSendResult
+from app.services.notification_messages import REPORT_RECEIVED_TITLE, REPORT_RECEIVED_PUSH_BODY
 
 
 class APNsPushService(AliyunPushService):
@@ -84,6 +85,9 @@ class APNsPushService(AliyunPushService):
         kind = notification.get("notification_type")
         # Private chat text and sender names never enter the lock-screen preview.
         aps = {"alert": {"title": "南图", "body": "你收到了一条新消息" if kind == "message" else "你有一条新通知"}}
+        if kind == "report_received" and notification.get("sender_id") is None and notification.get("related_type") == "report":
+            # Only fixed, platform-authored receipt copy is safe on the lock screen.
+            aps["alert"] = {"title": REPORT_RECEIVED_TITLE, "body": REPORT_RECEIVED_PUSH_BODY}
         if user and user.notify_sound is not False:
             aps["sound"] = "default"
         return {
