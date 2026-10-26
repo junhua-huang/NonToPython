@@ -22,6 +22,7 @@ from app.services.privacy_cleanup_service import poll_privacy_cleanup
 from app.routers import auth, posts, friends, interactions, chat, notifications, ws
 from app.routers import search, topics, upload, recommendations, blocks, reports, health, admin, comic, roles
 from app.routers import communities, push, admin_panel, app_updates, deployments, admin_bots, open_api
+from app.routers import mcp
 from app.routers import legal, privacy_admin
 import app.models.deployment  # Register deployment tables with the shared Base.
 
@@ -216,6 +217,7 @@ app.include_router(app_updates.admin_router)
 app.include_router(deployments.router)
 app.include_router(admin_bots.router)
 app.include_router(open_api.router, prefix="/nontoOpenApi", tags=["OpenAPI"])
+app.include_router(mcp.router)
 app.include_router(legal.router)
 app.include_router(privacy_admin.router)
 app.add_api_websocket_route("/ws", ws.websocket_endpoint)
