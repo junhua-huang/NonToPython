@@ -70,7 +70,7 @@ def test_erasure_operations_are_admin_only_and_object_keys_are_opt_in(privacy_cl
 
 def test_public_legal_pages_are_exact_bundles_and_keep_unverified_release_state(privacy_client):
     manifest = privacy_client.get("/api/legal/manifest.json").json()
-    assert manifest["policyVersion"] == "2026-10-23.4"
+    assert manifest["policyVersion"] == "2026-10-28.1"
     assert manifest["releaseReady"] is False
     for name in ("privacy.html", "terms.html", "community.html"):
         response = privacy_client.get("/api/legal/"+name)
@@ -80,5 +80,5 @@ def test_public_legal_pages_are_exact_bundles_and_keep_unverified_release_state(
         assert response.headers["cache-control"] == "no-cache"
         assert "{{" not in response.text
         assert "<script" not in response.text.lower()
-    assert privacy_client.get("/PrivacyPolicy/", follow_redirects=False).headers["location"] == "/api/legal/privacy"
+    assert privacy_client.get("/PrivacyPolicy/", follow_redirects=False).headers["location"] == "/api/legal/privacy.html"
     assert privacy_client.get("/api/legal/other.env").status_code == 404

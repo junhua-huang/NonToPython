@@ -30,6 +30,8 @@ from app.services.moderation_service import moderation_service
 from app.services.moderation_types import ModerationContext
 from app.serializers.user import serialize_user_profile, serialize_user_self
 from app.services.account_erasure_service import erase_account
+from app.services.profile_access_service import require_profile_access
+from app.services.session_security_service import revoke_account_sessions, disconnect_revoked_sessions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Auth"])
@@ -293,6 +295,18 @@ class PrivacySettingsUpdateRequest(BaseModel):
     show_email: bool | None = None
     allow_search: bool | None = None
     allow_friend_requests: str | None = None
+
+    @field_validator("profile_visibility", "post_default_visibility", "allow_friend_requests")
+    @classmethod
+    def validate_audience(cls, value, info):
+        allowed = {
+            "profile_visibility": {"public", "friends_only", "private"},
+            "post_default_visibility": {"public", "friends", "friends_only"},
+            "allow_friend_requests": {"everyone", "friends_of_friends", "none"},
+        }
+        if value is not None and value not in allowed[info.field_name]:
+            raise ValueError("不支持的隐私范围")
+        return value
 
 
 # ============================================================
@@ -577,7 +591,9 @@ def change_password(
     db: Session = Depends(get_db),
 ):
     """修改当前用户密码"""
-    current = db.query(User).filter(User.id == user.id).first()
+    current = db.query(User).filter(User.id == user.id).with_for_update().first()
+    if current is None or current.auth_version != user.auth_version:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
     # 兼容 scrypt (Flask 旧版) 和 bcrypt (FastAPI 新版) 两种哈希格式
     if current.password_hash.startswith("scrypt:"):
         if not check_password_hash(current.password_hash, data.old_password):
@@ -588,8 +604,8 @@ def change_password(
 
     current.password_hash = bcrypt_lib.hashpw(data.new_password.encode('utf-8'), bcrypt_lib.gensalt()).decode('utf-8')
     try:
+        revoke_account_sessions(db, current)
         db.commit()
-        return {"message": "Password changed successfully"}
     except Exception as e:
         db.rollback()
         logger.error(
@@ -598,6 +614,8 @@ def change_password(
             type(e).__name__,
         )
         raise HTTPException(status_code=500, detail="An error occurred while changing the password")
+    disconnect_revoked_sessions(user.id)
+    return {"message": "密码已修改，请重新登录", "reauthentication_required": True}
 
 
 # ============================================================
@@ -611,9 +629,7 @@ def get_user_info(
     current_user: User = Depends(get_current_user),
 ):
     """获取用户公开信息（需登录，防止未授权枚举用户）"""
-    target = db.query(User).filter(User.id == user_id).first()
-    if not target or has_block_between(db, current_user.id, user_id):
-        raise HTTPException(status_code=404, detail="User not found")
+    target = require_profile_access(db, user_id, current_user.id)
     return _build_public_user_response(target, viewer_user_id=current_user.id)
 
 
@@ -709,9 +725,20 @@ def reset_password(
     if not valid:
         raise HTTPException(status_code=400, detail=reason)
 
-    user.password_hash = bcrypt_lib.hashpw(data.new_password.encode('utf-8'), bcrypt_lib.gensalt()).decode('utf-8')
-    db.commit()
-    logger.info(f"Password reset by OTP: user_id={user.id} email={user.email}")
+    user = db.query(User).filter(User.email == email).populate_existing().with_for_update().first()
+    if user is None:
+        raise HTTPException(status_code=400, detail="验证码无效或已过期")
+    user_id = user.id
+    try:
+        user.password_hash = bcrypt_lib.hashpw(data.new_password.encode('utf-8'), bcrypt_lib.gensalt()).decode('utf-8')
+        revoke_account_sessions(db, user)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.error("password_reset_failed user_id=%s", user_id)
+        raise HTTPException(status_code=500, detail="密码重设失败，请稍后重试") from None
+    disconnect_revoked_sessions(user_id)
+    logger.info("Password reset by OTP user_id=%s", user_id)
     return {"message": "Password reset successfully"}
 
 
@@ -802,6 +829,7 @@ def _create_token(user: User, db: Session = None) -> str:
         "username": user.username,
         "roles": role_names,
         "iat": datetime.utcnow(),
+        "auth_version": user.auth_version or 0,
         "exp": datetime.utcnow() + expires,
     }
     return jwt.encode(payload, Config.JWT_SECRET_KEY, algorithm="HS256")

@@ -11,6 +11,7 @@ from app.dependencies import get_current_user
 from app.models.models import BUSINESS_IDENTITY_ROLES, User, Post, Like, Comment, PostView, Notification, Role, UserRole
 from sqlalchemy import or_, select
 from app.services.block_service import has_block_between
+from app.services.profile_access_service import require_profile_access
 from app.services.post_visibility_service import (
     can_view_post,
     load_visible_post,
@@ -295,13 +296,12 @@ async def create_post(
     try:
         db.add(post)
         db.flush()
-        db.commit()
-
         if post.content:
             TopicService.auto_link_topics(db, post.id, post.content)
-            MentionService.process_mentions(content=post.content, author_id=current_user_id, post_id=post.id)
-
-        return {"message": "Post created successfully", "post": _serialize_created_post(post, current_user_id, db)}
+        db.flush()
+        post_data = _serialize_created_post(post, current_user_id, db)
+        content_to_notify, created_id = post.content, post.id
+        db.commit()
     except Exception as e:
         db.rollback()
         logger.error(
@@ -310,6 +310,8 @@ async def create_post(
             type(e).__name__,
         )
         raise HTTPException(status_code=500, detail="An error occurred while creating the post")
+    MentionService.process_mentions(content=content_to_notify, author_id=current_user_id, post_id=created_id)
+    return {"message": "Post created successfully", "post": post_data}
 
 
 @router.get("/")
@@ -415,8 +417,8 @@ def get_related_to_me_posts(
     offset = (page - 1) * per_page
     posts = (
         db.query(Post)
-        .filter(Post.id.in_(candidate_ids), Post.hidden_by_admin == False)
-        .order_by(Post.created_at.desc())
+        .filter(Post.id.in_(candidate_ids), post_visibility_predicate(current_user_id))
+        .order_by(Post.created_at.desc(), Post.id.desc())
         .offset(offset)
         .limit(per_page + 1)
         .all()
@@ -424,7 +426,6 @@ def get_related_to_me_posts(
     has_more = len(posts) > per_page
     if has_more:
         posts = posts[:per_page]
-    posts = [post for post in posts if can_view_post(db, post, current_user_id)]
 
     from app.services.recommendation_service import RecommendationService
     batch_data = RecommendationService._batch_load_post_data(db, posts, current_user_id)
@@ -445,6 +446,7 @@ def get_user_posts(
     db: Session = Depends(get_db),
 ):
     """获取指定用户的帖子"""
+    require_profile_access(db, user_id, user.id)
     if user.id != user_id and has_block_between(db, user.id, user_id):
         return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}
 
@@ -537,12 +539,12 @@ def update_post(
         post.community_only = next_community_only
 
     try:
-        db.commit()
         if "content" in payload and payload["content"]:
             TopicService.auto_link_topics(db, post.id, payload["content"])
-            MentionService.process_mentions(payload["content"], post.user_id, post_id=post.id)
+        db.flush()
         is_liked = db.query(Like).filter(Like.user_id == user.id, Like.post_id == post_id).first() is not None
-        return {"message": "Post updated successfully", "post": post.to_dict(current_user_id=user.id, is_liked=is_liked, db=db)}
+        post_data = post.to_dict(current_user_id=user.id, is_liked=is_liked, db=db)
+        db.commit()
     except Exception as e:
         db.rollback()
         logger.error(
@@ -552,6 +554,9 @@ def update_post(
             type(e).__name__,
         )
         raise HTTPException(status_code=500, detail="An error occurred while updating the post")
+    if payload.get("content"):
+        MentionService.process_mentions(payload["content"], user.id, post_id=post_id)
+    return {"message": "Post updated successfully", "post": post_data}
 
 
 @router.delete("/{post_id}")
@@ -621,9 +626,7 @@ def get_user_liked_posts(
     db: Session = Depends(get_db),
 ):
     """获取用户点赞过的帖子"""
-    target_user = db.query(User).filter(User.id == user_id).first()
-    if not target_user:
-        raise HTTPException(status_code=404, detail="User not found")
+    require_profile_access(db, user_id, user.id)
 
     if user.id != user_id and has_block_between(db, user.id, user_id):
         return {"posts": [], "has_more": False, "current_page": page, "per_page": per_page}

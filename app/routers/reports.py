@@ -8,10 +8,12 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, Report
+from app.models.models import User, Report, Notification
 from app.services.moderation_errors import AppContractError, ModerationUnavailable, to_http_exception
 from app.services.moderation_service import moderation_service
 from app.services.moderation_types import ModerationContext
+from app.services.notification_messages import REPORT_RECEIVED_TITLE, REPORT_RECEIVED_CONTENT
+from app.services.notification_service import NotificationService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,33 +67,68 @@ def _handle_report(
         raise HTTPException(status_code=400, detail="Target ID is required")
     _moderate_report_reason(route_key, reason, actor_user_id=user.id)
 
-    existing = db.query(Report).filter(
-        Report.reporter_id == user.id,
-        Report.target_type == report_type,
-        Report.target_id == target_id,
-    ).first()
-    if existing:
-        return {"message": "You have already reported this target", "report": existing.to_dict()}
-
-    report = Report(
-        reporter_id=user.id,
-        target_type=report_type,
-        target_id=target_id,
-        reason=reason,
-    )
+    reporter_id = user.id
     try:
+        # Serialize submissions from the same reporter. Locking reads also see
+        # a concurrent commit under MySQL REPEATABLE READ, avoiding duplicate
+        # reports/receipts when a client retries an in-flight request.
+        reporter = db.query(User).filter(User.id == reporter_id).with_for_update().first()
+        if reporter is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        existing = db.query(Report).filter(
+            Report.reporter_id == reporter_id,
+            Report.target_type == report_type,
+            Report.target_id == target_id,
+        ).with_for_update().first()
+        if existing:
+            result = {"message": "You have already reported this target", "report": existing.to_dict()}
+            db.rollback()  # Release the read locks without creating another receipt.
+            return result
+
+        report = Report(
+            reporter_id=reporter_id,
+            target_type=report_type,
+            target_id=target_id,
+            reason=reason,
+        )
         db.add(report)
+        db.flush()
+        notification = Notification(
+            user_id=reporter_id,
+            sender_id=None,
+            notification_type="report_received",
+            title=REPORT_RECEIVED_TITLE,
+            content=REPORT_RECEIVED_CONTENT,
+            related_id=report.id,
+            related_type="report",
+        )
+        db.add(notification)
+        db.flush()
+        # Capture public response data before commit expires ORM attributes.
+        report_dict = report.to_dict()
+        notification_dict = notification.to_dict()
         db.commit()
-        return {"message": "Report submitted successfully", "report": report.to_dict()}
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.error(
             "Submit report failed user_id=%s target_type=%s error_type=%s",
-            user.id,
+            reporter_id,
             report_type,
             type(e).__name__,
         )
         raise HTTPException(status_code=500, detail="An error occurred while submitting the report")
+
+    # The in-app receipt is durable regardless of push preferences/provider
+    # availability. Never alert the reported user or expose the report reason.
+    NotificationService.dispatch_notification(reporter_id, notification_dict)
+    return {
+        "message": "Report submitted successfully",
+        "report": report_dict,
+        "notification": notification_dict,
+    }
 
 
 @router.post("")

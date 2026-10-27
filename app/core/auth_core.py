@@ -102,6 +102,9 @@ def verify_token(token: str) -> User:
             raise AuthError("User not found", 401)
         if user.is_active is not True:
             raise AccountDisabled()
+        version = payload.get("auth_version", 0)
+        if type(version) is not int or version != (user.auth_version or 0):
+            raise AuthError("登录状态已失效，请重新登录", 401)
         if db.execute(select(AccountErasure.id).where(AccountErasure.user_id == user.id)).first():
             raise AuthError("User not found", 401)
         # 把 user 从 session 中分离，避免调用方闭包 session 问题

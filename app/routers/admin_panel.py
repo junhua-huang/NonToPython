@@ -29,6 +29,7 @@ from app.services.admin_governance_notification_service import (
     create_governance_notification,
     dispatch_governance_notifications,
     dispatch_in_app_and_push,
+    sanitize_user_notice,
 )
 from app.services.admin_settings_service import (
     serialize_moderation_settings,
@@ -213,7 +214,7 @@ def _serialize_comment_detail_admin(comment: Comment, db: Session) -> dict:
 
 
 def _serialize_report_admin(report: Report, db: Session | None = None) -> dict:
-    payload = report.to_dict()
+    payload = report.to_dict(include_internal=True)
     if db is not None:
         reporter = db.query(User).filter(User.id == report.reporter_id).first()
         payload["reporter"] = _serialize_user_admin(reporter, db) if reporter else None
@@ -754,6 +755,7 @@ def resolve_report(report_id: int, payload: dict = Body(...), request: Request =
     report.status = "resolved"
     report.resolution = "resolved"
     report.resolution_note = reason
+    report.reporter_notice = sanitize_user_notice(reporter_notice, "report_resolved")
     report.action_taken = action_taken
     report.resolved_by = admin.id
     report.resolved_at = datetime.utcnow()
@@ -775,6 +777,7 @@ def reject_report(report_id: int, payload: dict = Body(...), request: Request = 
     report.status = "rejected"
     report.resolution = "rejected"
     report.resolution_note = reason
+    report.reporter_notice = sanitize_user_notice(reporter_notice, "report_rejected")
     report.action_taken = "none"
     report.resolved_by = admin.id
     report.resolved_at = datetime.utcnow()
