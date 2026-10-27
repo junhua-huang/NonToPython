@@ -71,6 +71,8 @@ jobs:
           spec.loader.exec_module(migration)
           with engine.begin() as connection:
               connection.execute(text('DROP TABLE account_erasures'))
+              connection.execute(text('ALTER TABLE users DROP COLUMN auth_version'))
+              connection.execute(text('ALTER TABLE reports DROP COLUMN reporter_notice'))
               for table, column in migration.ATTRIBUTIONS:
                   connection.execute(text(f'ALTER TABLE {table} MODIFY {column} INTEGER NOT NULL'))
           PY

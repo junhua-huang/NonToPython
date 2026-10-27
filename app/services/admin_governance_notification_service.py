@@ -9,7 +9,6 @@ from typing import Iterable
 from sqlalchemy.orm import Session
 
 from app.models.models import Notification, NotificationDelivery, User
-from app.services.aliyun_push_service import AliyunPushService
 from app.services.email_service import EmailService
 from app.services.notification_service import NotificationService
 
@@ -204,12 +203,4 @@ def dispatch_governance_notifications(deliveries: Iterable[NotificationDelivery]
 def dispatch_in_app_and_push(user_id: int, notification: Notification | None) -> None:
     if notification is None:
         return
-    payload = notification.to_dict()
-    try:
-        NotificationService._push_new_notification(user_id, payload)
-    except Exception as exc:
-        logger.warning("[ADMIN NOTICE WS] scheduling failed uid=%s error_type=%s", user_id, exc.__class__.__name__)
-    try:
-        AliyunPushService.schedule_notification_push(user_id, payload)
-    except Exception as exc:
-        logger.warning("[ADMIN NOTICE PUSH] scheduling failed uid=%s error_type=%s", user_id, exc.__class__.__name__)
+    NotificationService.dispatch_notification(user_id, notification.to_dict())

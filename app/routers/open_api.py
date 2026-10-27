@@ -366,15 +366,11 @@ def open_create_post(
     try:
         db.add(post)
         db.flush()
-        db.commit()
         TopicService.auto_link_topics(db, post.id, post.content)
-        MentionService.process_mentions(
-            content=post.content, author_id=user.id, post_id=post.id
-        )
-        return {
-            "message": "Post created successfully",
-            "post": _serialize_created_post(post, user.id, db),
-        }
+        db.flush()
+        post_data = _serialize_created_post(post, user.id, db)
+        created_id, content_to_notify = post.id, post.content
+        db.commit()
     except HTTPException:
         raise
     except Exception as exc:
@@ -387,6 +383,8 @@ def open_create_post(
         raise HTTPException(
             status_code=500, detail="An error occurred while creating the post"
         ) from None
+    MentionService.process_mentions(content=content_to_notify, author_id=user.id, post_id=created_id)
+    return {"message": "Post created successfully", "post": post_data}
 
 
 @router.post("/posts/{post_id}/repost")

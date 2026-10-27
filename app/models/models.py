@@ -102,6 +102,7 @@ class User(Base):
     username = Column(String(80), unique=True, nullable=False, index=True)
     email = Column(String(120), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
+    auth_version = Column(Integer, nullable=False, default=0, server_default='0')
     bio = Column(Text)
     avatar_url = Column(String(255))
     cover_photo_url = Column(String(255))
@@ -766,6 +767,7 @@ class Report(Base):
     status = Column(String(20), default='pending')
     resolution = Column(String(50), nullable=True)
     resolution_note = Column(String(500), nullable=True)
+    reporter_notice = Column(String(500), nullable=True)
     action_taken = Column(String(50), nullable=True)
     resolved_by = Column(Integer, ForeignKey('users.id', name='fk_reports_resolved_by'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -774,8 +776,11 @@ class Report(Base):
     reporter = relationship('User', foreign_keys=[reporter_id])
     resolver = relationship('User', foreign_keys=[resolved_by])
     
-    def to_dict(self):
-        return {
+    def to_dict(self, *, include_internal=False):
+        from app.services.admin_governance_notification_service import sanitize_user_notice
+        event = 'report_resolved' if self.status == 'resolved' else 'report_rejected'
+        public_note = sanitize_user_notice(self.reporter_notice, event) if self.status in ('resolved', 'rejected', 'dismissed') else None
+        payload = {
             'id': self.id,
             'reporter_id': self.reporter_id,
             'target_type': self.target_type,
@@ -784,12 +789,15 @@ class Report(Base):
             'description': self.description,
             'status': self.status,
             'resolution': self.resolution,
-            'resolution_note': self.resolution_note,
+            'resolution_note': public_note,
+            'reporter_notice': public_note,
             'action_taken': self.action_taken,
-            'resolved_by': self.resolved_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
         }
+        if include_internal:
+            payload.update(resolution_note=self.resolution_note, resolved_by=self.resolved_by)
+        return payload
 
 
 class PostView(Base):
